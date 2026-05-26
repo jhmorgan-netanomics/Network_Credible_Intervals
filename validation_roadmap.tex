@@ -130,7 +130,7 @@ The framework's ability to handle unweighted networks is one of its distinctive 
 
 \subsection{Corpus Summary}
 
-The corpus has been assembled and verified through round-trip integrity testing on all fourteen GraphML files. Edge counts and centralization values for the synthetic networks have been computed from the generated files; centralization values for empirical networks marked ``TBD'' will be characterized in Phase~0 (Section~\ref{sec:phase0}).
+The corpus brings together six empirical networks and two parameterized synthetic families spanning four substantive structural conditions. \textbf{Moreno High School} is a friendship network among 70 adolescents collected via standard sociometric instrument, representing the small-but-densely-connected case characteristic of school-based peer studies and providing reciprocity structure with which to test directed-graph measures. \textbf{Balikatan~2022} is a counter-insurgency interaction network derived from joint US–Philippines military exercise records ($N = 1{,}347$, $\lvert E \rvert = 3{,}146$), representing the large-and-sparse case that arises in operational social-network analysis where ties are recorded across many actors but at low density per actor. \textbf{Toledo Crime} is a co-offending network among 77 individuals appearing together in police records, representing the small-and-undirected case typical of administrative-data social networks where tie direction is unavailable or ill-defined. \textbf{Scotland Interlock} is a corporate-board interlock projection on 108 directors with ground-truth community structure available from the original bipartite affiliation data, providing a network where the validation framework's recovered partition can be compared against a known true partition. Each empirical network is included with both its native edge weights and a binary version where weights are stripped; the validation interprets these as separate networks rather than as paired observations. The two synthetic families — a stochastic block model (Synthetic~1) and a preferential attachment generator (Synthetic~2), each emitted in directed and undirected variants — anchor controlled low- and high-centralization endpoints (Gini $0.10$--$0.14$ and $0.37$--$0.38$ respectively), bracketing the empirical centralization range of $0.24$--$0.70$. Together the corpus covers the four cells of the weighted$\times$directed design and the full range of low-to-high degree centralization, plus extreme cases at both the large-sparse (Balikatan) and small-tree-like (Toledo, bicomponent fraction $0.27$) ends of the topology space.
 
 \begin{table}[h]
 \centering
@@ -139,23 +139,23 @@ The corpus has been assembled and verified through round-trip integrity testing 
 \toprule
 \textbf{Network} & \textbf{Source} & \textbf{$N$} & \textbf{Direction} & \textbf{Weights} & \textbf{$\lvert E \rvert$} & \textbf{Gini} & \textbf{Role} \\
 \midrule
-Moreno High School & Empirical & 70 & Directed & Weighted & 366 & 0.24 & Small directed dense \\
-Moreno (unweighted) & Threshold & 70 & Directed & Unweighted & 366 & 0.24 & Unweighted directed \\
-Toledo Crime (collapsed) & Empirical & 77 & Undirected & Weighted & 106 & 0.46 & Small undirected real \\
-Toledo (unweighted) & Threshold & 77 & Undirected & Unweighted & 106 & 0.46 & Unweighted undirected \\
-Scotland Interlock (proj.) & Empirical & 108 & Undirected & Weighted & 276 & 0.48 & Comm.\ truth available \\
-Balikatan 2022 & Empirical & 1{,}347 & Directed & Weighted & 3{,}146 & 0.70 & Large directed sparse \\
-Synthetic 1 (directed) & SBM & 600 & Directed & Weighted & 8{,}277 & 0.10 & Large directed controlled \\
-Synthetic 1 (undirected) & SBM sym. & 600 & Undirected & Weighted & 4{,}138 & 0.14 & Large undirected controlled \\
-Synthetic 1 (dir., unwt.) & SBM bin. & 600 & Directed & Unweighted & 8{,}253 & 0.10 & Unwt.\ dir.\ at scale \\
-Synthetic 1 (undir., unwt.) & SBM bin.\ sym. & 600 & Undirected & Unweighted & 4{,}228 & 0.14 & Unwt.\ undir.\ at scale \\
-Synthetic 2 (directed) & PA & 250 & Directed & Weighted & 497 & 0.38 & Mid directed extreme \\
-Synthetic 2 (undirected) & PA sym. & 250 & Undirected & Weighted & 497 & 0.38 & Mid undirected extreme \\
-Synthetic 2 (dir., unwt.) & PA bin. & 250 & Directed & Unweighted & 497 & 0.37 & Unwt.\ high-cent.\ dir. \\
-Synthetic 2 (undir., unwt.) & PA bin.\ sym. & 250 & Undirected & Unweighted & 497 & 0.37 & Unwt.\ high-cent.\ undir. \\
+Moreno High School         & Empirical       & 70       & Directed   & Weighted   & 366     & 0.24 & Small directed dense \\
+Moreno (unweighted)        & Threshold       & 70       & Directed   & Unweighted & 366     & 0.24 & Unweighted directed \\
+Toledo Crime (collapsed)   & Empirical       & 77       & Undirected & Weighted   & 106     & 0.46 & Small undirected real \\
+Toledo (unweighted)        & Threshold       & 77       & Undirected & Unweighted & 106     & 0.46 & Unweighted undirected \\
+Scotland Interlock (proj.) & Empirical       & 108      & Undirected & Weighted   & 276     & 0.48 & Comm.\ truth available \\
+Balikatan 2022             & Empirical       & 1{,}347  & Directed   & Weighted   & 3{,}146 & 0.70 & Large directed sparse \\
+Synthetic 1 (directed)     & SBM             & 600      & Directed   & Weighted   & 8{,}277 & 0.10 & Large directed controlled \\
+Synthetic 1 (undirected)   & SBM sym.        & 600      & Undirected & Weighted   & 4{,}138 & 0.14 & Large undirected controlled \\
+Synthetic 1 (dir., unwt.)  & SBM bin.        & 600      & Directed   & Unweighted & 8{,}253 & 0.10 & Unwt.\ dir.\ at scale \\
+Synthetic 1 (undir., unwt.) & SBM bin.\ sym. & 600      & Undirected & Unweighted & 4{,}228 & 0.14 & Unwt.\ undir.\ at scale \\
+Synthetic 2 (directed)     & PA              & 250      & Directed   & Weighted   & 497     & 0.38 & Mid directed extreme \\
+Synthetic 2 (undirected)   & PA sym.         & 250      & Undirected & Weighted   & 497     & 0.38 & Mid undirected extreme \\
+Synthetic 2 (dir., unwt.)  & PA bin.         & 250      & Directed   & Unweighted & 497     & 0.37 & Unwt.\ high-cent.\ dir. \\
+Synthetic 2 (undir., unwt.) & PA bin.\ sym.  & 250      & Undirected & Unweighted & 497     & 0.37 & Unwt.\ high-cent.\ undir. \\
 \bottomrule
 \end{tabular}
-\caption{Validation network corpus, 14 networks across the four weighted~$\times$~directed cells. Edge counts ($\lvert E \rvert$) are computed from the assembled GraphML files. Centralization is reported as the Gini coefficient of the unweighted-degree distribution: $<0.20$ indicates low centralization (uniform degree); $>0.35$ indicates high centralization (hub-skewed degree). Synthetic~1 confirms the low-centralization design target; Synthetic~2 confirms the high-centralization design target.}
+\caption{Validation network corpus, 14 networks across the four weighted~$\times$~directed cells. Edge counts ($\lvert E \rvert$) and Gini coefficients are computed from the assembled GraphML files. Gini coefficient of the unweighted-degree distribution: $<0.20$ indicates low centralization (uniform degree); $>0.35$ indicates high centralization (hub-skewed degree). The empirical corpus spans 0.24--0.70, covering the full range from uniform to highly hub-skewed. Synthetic~1 anchors the low-centralization endpoint (Gini $0.10$--$0.14$); Synthetic~2 anchors the high-centralization endpoint (Gini $0.37$--$0.38$). Together the corpus tests the validation framework across a broad swath of the structural-coverage space.}
 \label{tab:corpus}
 \end{table}
 
@@ -164,45 +164,47 @@ The fourteen GraphML files reside in the project's processed-data directory and 
 \subsection{Phase 0: Preliminary Corpus Characterization}
 \label{sec:phase0}
 
-As a preliminary step before the main validation runs, Phase~0 computes descriptive statistics for all networks in the corpus using the measures from \citet{SmithMorganMoody2022}: in/out/symmetric degree centralization, closeness centralization, betweenness centralization, Bonacich centralization, transitivity, modularity, mean and SD of node-level centralities, and component structure. Phase~0 produces an empirical analog of \citet{SmithMorganMoody2022}'s Table~1 for the validation corpus.
+As a preliminary step before the main validation runs, Phase~0 computes descriptive statistics for all networks in the corpus using the measures from \citet{SmithMorganMoody2022}: in/out/symmetric degree centrality, closeness, betweenness, Bonacich power, the corresponding centralizations, transitivity, mean inverse distance, component and bicomponent structure, and the ranked-cluster tau statistic. Phase~0 produces an empirical analog of \citet{SmithMorganMoody2022}'s Table~1 for the validation corpus.
 
-Phase~0 results inform the final synthetic network design. The empirical corpus spans a wide centralization range (Gini $0.24$--$0.70$; see Table~\ref{tab:corpus}), with Balikatan~2022 well above the high-centralization threshold and Moreno High School at the low end. Synthetic~1 and Synthetic~2 retain their specified low- and high-centralization designs, anchoring the controlled endpoints of the range covered by the empirical networks. The flexibility built into the corpus design ensures the validation tests the framework on structural conditions of interest rather than on a fixed grid that may turn out to be unbalanced.
+Tables~\ref{tab:phase0-directed} and \ref{tab:phase0-undirected} present the completed Phase~0 statistics, split by directedness because several measures (most notably tau, which depends on the mutual-asymmetric dyad distinction) are only well-defined for directed graphs. Within each table, the empirical networks appear in the leftmost columns and the synthetic networks in the rightmost columns, separated by a vertical rule. This grouping makes the design argument legible at a glance: the empirical networks span a wide range of structural conditions (degree centralization, density, transitivity, component fragmentation), and the synthetic networks anchor controlled low- and high-centralization endpoints of that range. Reading horizontally across an empirical-then-synthetic row shows whether the empirical variation lies within, outside, or astride the synthetic controls --- important context for interpreting the validation results in later sections.
 
-Tables~\ref{tab:phase0-directed} and \ref{tab:phase0-undirected} present the completed Phase~0 descriptive statistics for the directed and undirected networks respectively, computed using the validated \texttt{network\_statistics} module of the framework. The tables follow the layout of \citet{SmithMorganMoody2022}'s Table~1, with measures organized into centrality, centralization, and topology blocks. Weighted and unweighted variants of each empirical network appear as separate columns because the validation interprets them as distinct networks rather than as paired observations of a single underlying structure (see the note on thresholded versus natively-unweighted networks above). For the synthetic networks the weighted and unweighted GraphML files are independent realizations of the same generator and therefore differ slightly in their cell values. The full validation framework will be evaluated across all permutations of this set; the split presentation here clarifies which measures are well-defined for each network type.
+All Phase~0 measures are computed on the binarized adjacency matrix to match the convention of \citet{SmithMorganMoody2022}'s Table~1 and to ensure cross-network comparability. As a consequence, the weighted and unweighted variants of each empirical network produce identical Phase~0 statistics and are reported as a single column per network. The validation runs in later sections will use both variants as distinct inputs (since edge weights can affect imputation behavior even when post-binarization summaries agree), and the synthetic generators emit two independent realizations per design specification --- shown here as draws~1 and 2 --- to capture generator-level sampling variability.
 
 \begin{table}[!htbp]
 \centering
 \footnotesize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{l r r r r r r r r}
+\begin{tabular}{l r r | r r r r}
 \toprule
-Measure & Moreno U & Moreno W & Bali U & Bali W & SBM-d U & SBM-d W & PA-d U & PA-d W \\
+& \multicolumn{2}{c|}{\textit{Empirical}} & \multicolumn{4}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-7}
+Measure & Moreno & Bali & SBM-d.1 & SBM-d.2 & PA-d.1 & PA-d.2 \\
 \midrule
-\multicolumn{9}{l}{\textit{Centrality}} \\
-In-Degree        & 5.23 (3.64) & 5.23 (3.64) & 2.34 (2.70)  & 2.34 (2.70)  & 13.76 (3.52) & 13.79 (3.59) & 1.99 (4.65) & 1.99 (4.28) \\
-Out-Degree       & 5.23 (2.04) & 5.23 (2.04) & 2.34 (18.55) & 2.34 (18.55) & 13.76 (3.36) & 13.79 (3.64) & 1.99 (0.14) & 1.99 (0.14) \\
-Symmetric Degree & 10.46 (4.56)& 10.46 (4.56)& 4.64 (19.11) & 4.64 (19.11) & 27.51 (4.98) & 27.59 (5.12) & 3.98 (4.55) & 3.98 (4.20) \\
-Closeness        & 0.45 (0.06) & 0.45 (0.06) & 0.23 (0.12)  & 0.23 (0.12)  & 0.45 (0.02)  & 0.45 (0.02)  & 0.32 (0.05) & 0.31 (0.04) \\
-Betweenness      & 0.04 (0.05) & 0.04 (0.05) & 0.00 (0.00)  & 0.00 (0.00)  & 0.00 (0.00)  & 0.00 (0.00)  & 0.00 (0.00) & 0.00 (0.00) \\
-Bonacich Power   & 0.39 (0.19) & 0.39 (0.19) & 0.02 (0.04)  & 0.02 (0.04)  & 0.58 (0.11)  & 0.60 (0.11)  & 0.10 (0.11) & 0.11 (0.11) \\
+\multicolumn{7}{l}{\textit{Centrality}} \\
+In-Degree        & 5.23 (3.64)  & 2.34 (2.70)  & 13.76 (3.52) & 13.79 (3.59) & 1.99 (4.65) & 1.99 (4.28) \\
+Out-Degree       & 5.23 (2.04)  & 2.34 (18.55) & 13.76 (3.36) & 13.79 (3.64) & 1.99 (0.14) & 1.99 (0.14) \\
+Symmetric Degree & 10.46 (4.56) & 4.64 (19.11) & 27.51 (4.98) & 27.59 (5.12) & 3.98 (4.55) & 3.98 (4.20) \\
+Closeness        & 0.45 (0.06)  & 0.23 (0.12)  & 0.45 (0.02)  & 0.45 (0.02)  & 0.32 (0.05) & 0.31 (0.04) \\
+Betweenness      & 0.04 (0.05)  & 0.00 (0.00)  & 0.00 (0.00)  & 0.00 (0.00)  & 0.00 (0.00) & 0.00 (0.00) \\
+Bonacich Power   & 0.39 (0.19)  & 0.02 (0.04)  & 0.58 (0.11)  & 0.60 (0.11)  & 0.10 (0.11) & 0.11 (0.11) \\
 \addlinespace
-\multicolumn{9}{l}{\textit{Centralization}} \\
-In-Degree        & 3.64 & 3.64 & 2.70  & 2.70  & 3.52 & 3.59 & 4.65 & 4.28 \\
-Out-Degree       & 2.04 & 2.04 & 18.55 & 18.55 & 3.36 & 3.64 & 0.14 & 0.14 \\
-Symmetric Degree & 4.56 & 4.56 & 19.11 & 19.11 & 4.98 & 5.12 & 4.55 & 4.20 \\
-Closeness        & 0.06 & 0.06 & 0.12  & 0.12  & 0.02 & 0.02 & 0.05 & 0.04 \\
-Betweenness      & 0.05 & 0.05 & 0.00  & 0.00  & 0.00 & 0.00 & 0.00 & 0.00 \\
-Bonacich Power   & 0.19 & 0.19 & 0.04  & 0.04  & 0.11 & 0.11 & 0.11 & 0.11 \\
+\multicolumn{7}{l}{\textit{Centralization}} \\
+In-Degree        & 3.64 & 2.70  & 3.52 & 3.59 & 4.65 & 4.28 \\
+Out-Degree       & 2.04 & 18.55 & 3.36 & 3.64 & 0.14 & 0.14 \\
+Symmetric Degree & 4.56 & 19.11 & 4.98 & 5.12 & 4.55 & 4.20 \\
+Closeness        & 0.06 & 0.12  & 0.02 & 0.02 & 0.05 & 0.04 \\
+Betweenness      & 0.05 & 0.00  & 0.00 & 0.00 & 0.00 & 0.00 \\
+Bonacich Power   & 0.19 & 0.04  & 0.11 & 0.11 & 0.11 & 0.11 \\
 \addlinespace
-\multicolumn{9}{l}{\textit{Topology}} \\
-Component Size   & 70    & 70    & 1087    & 1087    & 600    & 600    & 250    & 250    \\
-Bicomponent Size & 70    & 70    & 662     & 662     & 600    & 600    & 250    & 250    \\
-Distance         & 0.45  & 0.45  & 0.23    & 0.23    & 0.45   & 0.45   & 0.32   & 0.31   \\
-Transitivity     & 0.40  & 0.40  & 0.23    & 0.23    & 0.05   & 0.05   & 0.06   & 0.05   \\
-Tau$_{RC}$       & 8.73  & 8.73  & 2535.93 & 2535.93 & $-6.82$ & $-4.41$ & 63.03  & 52.05  \\
+\multicolumn{7}{l}{\textit{Topology}} \\
+Component Size   & 70   & 1087    & 600    & 600    & 250    & 250    \\
+Bicomponent Size & 70   & 662     & 600    & 600    & 250    & 250    \\
+Distance         & 0.45 & 0.23    & 0.45   & 0.45   & 0.32   & 0.31   \\
+Transitivity     & 0.40 & 0.23    & 0.05   & 0.05   & 0.06   & 0.05   \\
+Tau$_{RC}$       & 8.73 & 2535.93 & $-6.82$ & $-4.41$ & 63.03  & 52.05  \\
 \bottomrule
 \end{tabular}
-\caption{Phase~0 descriptive statistics for the directed networks in the validation corpus. Each network appears with its unweighted (U) and weighted (W) variants. Cells in the centrality block show mean (SD) of the node-level scores; centralization is the standard deviation of the node-level scores, expressed at the network level, following the convention of \citet{SmithMorganMoody2022}. Component and bicomponent sizes are reported as raw counts of nodes in the largest (bi)component. Distance is mean inverse geodesic distance. Tau$_{RC}$ is the standardized deviation of the observed ranked-cluster-weighted triad count from its U$\mid$MAN null expectation, computed by Monte Carlo with 500 samples. The four network types are: Moreno High School (small-dense, $N=70$), Balikatan 2022 (large-sparse, $N=1{,}347$), Synthetic~1 SBM directed (large-controlled, $N=600$), and Synthetic~2 PA directed (mid-extreme, $N=250$). For the synthetic networks the unweighted and weighted GraphML files are independent draws from the same generator; observed differences between paired columns reflect different random realizations rather than the same network with and without weight labels. The validation framework is evaluated across all permutations of this set.}
+\caption{Phase~0 descriptive statistics for the directed networks in the validation corpus, split into empirical (left) and synthetic (right) groups. Each column is a single network; weighted and unweighted variants of an empirical network are not shown separately because the Phase~0 measures are binarization-invariant by construction. For each synthetic generator, two independent draws (.1 and .2) are reported. Cells in the centrality block show mean (SD) of the node-level scores; centralization is the standard deviation of the node-level scores, expressed at the network level, following \citet{SmithMorganMoody2022}. Component and bicomponent sizes are reported as raw counts of nodes in the largest (bi)component. Distance is mean inverse geodesic distance. Tau$_{RC}$ is the standardized deviation of the observed ranked-cluster-weighted triad count from its U$\mid$MAN null expectation, computed by Monte Carlo with 500 samples; its magnitude scales with $\sqrt{N}$ for very-sparse networks, which explains the large Balikatan value. The validation framework is evaluated on all 14~networks in the corpus, including the U/W variants suppressed here.}
 \label{tab:phase0-directed}
 \end{table}
 
@@ -210,30 +212,32 @@ Tau$_{RC}$       & 8.73  & 8.73  & 2535.93 & 2535.93 & $-6.82$ & $-4.41$ & 63.03
 \centering
 \footnotesize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{l r r r r r r r r}
+\begin{tabular}{l r r | r r r r}
 \toprule
-Measure & Scot U & Scot W & Toledo U & Toledo W & SBM-u U & SBM-u W & PA-u U & PA-u W \\
+& \multicolumn{2}{c|}{\textit{Empirical}} & \multicolumn{4}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-7}
+Measure & Scot & Toledo & SBM-u.1 & SBM-u.2 & PA-u.1 & PA-u.2 \\
 \midrule
-\multicolumn{9}{l}{\textit{Centrality}} \\
-Degree         & 2.56 (2.31) & 2.56 (2.31) & 1.38 (1.70) & 1.38 (1.70) & 7.05 (1.75) & 6.90 (1.73) & 1.99 (2.28) & 1.99 (2.10) \\
-Closeness      & 0.26 (0.14) & 0.26 (0.14) & 0.34 (0.07) & 0.34 (0.07) & 0.38 (0.02) & 0.38 (0.02) & 0.32 (0.05) & 0.31 (0.04) \\
-Betweenness    & 0.01 (0.02) & 0.01 (0.02) & 0.03 (0.10) & 0.03 (0.10) & 0.00 (0.00) & 0.00 (0.00) & 0.01 (0.03) & 0.01 (0.03) \\
-Bonacich Power & 0.19 (0.19) & 0.19 (0.19) & 0.14 (0.14) & 0.14 (0.14) & 0.51 (0.13) & 0.56 (0.14) & 0.10 (0.11) & 0.11 (0.11) \\
+\multicolumn{7}{l}{\textit{Centrality}} \\
+Degree         & 2.56 (2.31) & 1.38 (1.70) & 7.05 (1.75) & 6.90 (1.73) & 1.99 (2.28) & 1.99 (2.10) \\
+Closeness      & 0.26 (0.14) & 0.34 (0.07) & 0.38 (0.02) & 0.38 (0.02) & 0.32 (0.05) & 0.31 (0.04) \\
+Betweenness    & 0.01 (0.02) & 0.03 (0.10) & 0.00 (0.00) & 0.00 (0.00) & 0.01 (0.03) & 0.01 (0.03) \\
+Bonacich Power & 0.19 (0.19) & 0.14 (0.14) & 0.51 (0.13) & 0.56 (0.14) & 0.10 (0.11) & 0.11 (0.11) \\
 \addlinespace
-\multicolumn{9}{l}{\textit{Centralization}} \\
-Degree         & 2.31 & 2.31 & 1.70 & 1.70 & 1.75 & 1.73 & 2.28 & 2.10 \\
-Closeness      & 0.14 & 0.14 & 0.07 & 0.07 & 0.02 & 0.02 & 0.05 & 0.04 \\
-Betweenness    & 0.02 & 0.02 & 0.10 & 0.10 & 0.00 & 0.00 & 0.03 & 0.03 \\
-Bonacich Power & 0.19 & 0.19 & 0.14 & 0.14 & 0.13 & 0.14 & 0.11 & 0.11 \\
+\multicolumn{7}{l}{\textit{Centralization}} \\
+Degree         & 2.31 & 1.70 & 1.75 & 1.73 & 2.28 & 2.10 \\
+Closeness      & 0.14 & 0.07 & 0.02 & 0.02 & 0.05 & 0.04 \\
+Betweenness    & 0.02 & 0.10 & 0.00 & 0.00 & 0.03 & 0.03 \\
+Bonacich Power & 0.19 & 0.14 & 0.13 & 0.14 & 0.11 & 0.11 \\
 \addlinespace
-\multicolumn{9}{l}{\textit{Topology}} \\
-Component Size   & 86   & 86   & 77   & 77   & 600  & 600  & 250  & 250  \\
-Bicomponent Size & 79   & 79   & 21   & 21   & 600  & 600  & 250  & 250  \\
-Distance         & 0.05 & 0.05 & 0.05 & 0.05 & 0.13 & 0.13 & 0.02 & 0.02 \\
-Transitivity     & 0.46 & 0.46 & 0.42 & 0.42 & 0.06 & 0.06 & 0.09 & 0.07 \\
+\multicolumn{7}{l}{\textit{Topology}} \\
+Component Size   & 86   & 77   & 600  & 600  & 250  & 250  \\
+Bicomponent Size & 79   & 21   & 600  & 600  & 250  & 250  \\
+Distance         & 0.05 & 0.05 & 0.13 & 0.13 & 0.02 & 0.02 \\
+Transitivity     & 0.46 & 0.42 & 0.06 & 0.06 & 0.09 & 0.07 \\
 \bottomrule
 \end{tabular}
-\caption{Phase~0 descriptive statistics for the undirected networks in the validation corpus. Each network appears with its unweighted (U) and weighted (W) variants. For undirected graphs in-degree, out-degree, and symmetric degree are identical by construction and are reported as a single Degree row. Tau$_{RC}$ is omitted because the U$\mid$MAN null model requires the distinction between mutual and asymmetric dyads, which is undefined for undirected graphs. Cells in the centrality block show mean (SD) of the node-level scores; centralization is the standard deviation of the node-level scores. The four network types are: Scotland Interlock (community-truth available, $N=108$), Toledo Crime (small-real, $N=77$), Synthetic~1 SBM undirected (large-controlled, $N=600$), and Synthetic~2 PA undirected (mid-extreme, $N=250$). As with the directed table, paired weighted and unweighted synthetic columns reflect independent generator draws. The validation framework is evaluated across all permutations of this set.}
+\caption{Phase~0 descriptive statistics for the undirected networks in the validation corpus, split into empirical (left) and synthetic (right) groups. Each column is a single network; weighted and unweighted variants of an empirical network are not shown separately because the Phase~0 measures are binarization-invariant by construction. For each synthetic generator, two independent draws (.1 and .2) are reported. For undirected graphs in-degree, out-degree, and symmetric degree are identical by construction and are reported as a single Degree row. Tau$_{RC}$ is omitted because the U$\mid$MAN null model requires the distinction between mutual and asymmetric dyads, which is undefined for undirected graphs. Cells in the centrality block show mean (SD) of the node-level scores; centralization is the standard deviation of the node-level scores. The validation framework is evaluated on all 14~networks in the corpus, including the U/W variants suppressed here.}
 \label{tab:phase0-undirected}
 \end{table}
 
