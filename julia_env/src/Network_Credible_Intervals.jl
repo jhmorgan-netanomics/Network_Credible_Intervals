@@ -26,19 +26,46 @@ THE SOFTWARE.
 
 module Network_Credible_Intervals
 
-#   Load the network_community_detection submodule
+#   Load submodules
+    include("graphml_io.jl")
     include("network_community_detection.jl")
+    include("network_statistics.jl")
 
-#   Pull its exports into the parent namespace
+#   Pull their exports into the parent namespace
+    using .graphml_io
     using .network_community_detection
+    using .network_statistics
 
 #   Re-export to users of Network_Credible_Intervals
-    export calculate_modularity,
+    export write_graphml,
+           load_graphml,
+           calculate_modularity,
            delta_modularity_undirected_best!,
            delta_modularity_directed_best!,
            delta_modularity_best!,
            _leiden_single_run_preprocessed,
            leiden_community_detection,
-           champ_community_detection
+           champ_community_detection,
+           gini_coefficient,
+           centralization,
+           rand_index,
+           in_degree,
+           out_degree,
+           total_degree,
+           freeman_degree_normalization,
+           freeman_degree_centralization,
+           closeness_centrality,
+           betweenness_centrality,
+           mean_inverse_distance,
+           bonacich_centrality,
+           largest_component_proportion,
+           reciprocity,
+           local_weighted_reciprocity,
+           local_clustering_coefficient,
+           global_clustering_coefficient,
+           triad_census,
+           largest_bicomponent_proportion,
+           tau_statistic,
+           structural_equivalence_blockmodel
 
 end # module Network_Credible_Intervals
