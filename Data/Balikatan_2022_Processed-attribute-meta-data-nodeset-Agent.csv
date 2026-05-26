@@ -1,0 +1,19 @@
+Name,Type,IsSingleValue
+Role,categoryNumber,1
+Is_SuperFriend,categoryNumber,1
+Is_SuperSpreader,categoryNumber,1
+Forces,categoryText,1
+"Component Members, Weak",categoryNumber,1
+IS_NEWS_AGENCY,categoryNumber,1
+IS_VERIFIED,categoryNumber,1
+Language,categoryText,0
+LOCATION,categoryText,1
+Node Label,text,1
+NUMBER_FOLLOWERS,number,1
+TWEET_COUNT,number,1
+Is_Bot,categoryText,1
+Bot_Probability,number,1
+stance,categoryNumber,1
+stance-confidence,categoryNumber,1
+Super Friends: Agent x Agent - Reciprocal,number,1
+"Super Spreaders: Agent x Agent - All Propagation, Agent x Tweet - Sender",number,1

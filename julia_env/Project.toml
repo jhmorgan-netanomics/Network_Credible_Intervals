@@ -1,0 +1,30 @@
+name = "Network_Credible_Intervals"
+uuid = "57213481-195d-49e7-a58c-0688ab86f4f0"
+authors = ["jhm18 <jonathan.h.morgan@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+GraphMakie = "1ecd5474-83a3-4783-bb4f-06765db800d2"
+Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
+LFRBenchmarkGraphs = "e2d0dd93-c6be-4a4f-9a61-2b35d7242bb2"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+
+[compat]
+BenchmarkTools = "1.8.0"
+CairoMakie = "0.15.10"
+DataFrames = "1.8.2"
+Distributions = "0.25.125"
+GraphMakie = "0.6.3"
+Graphs = "1.14.0"
+LFRBenchmarkGraphs = "1.0.2"
+LinearAlgebra = "1.11.0"
+ProgressMeter = "1.11.0"
+Random = "1.11.0"
+SparseArrays = "1.11.0"

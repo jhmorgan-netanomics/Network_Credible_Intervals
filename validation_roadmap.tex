@@ -1,0 +1,473 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{parskip}
+\usepackage{xcolor}
+\usepackage[round, authoryear]{natbib}
+
+% XeLaTeX font setup with local Times fonts.
+% Compile with: xelatex validation_roadmap.tex
+\usepackage{fontspec}
+\defaultfontfeatures{Path = fonts/}
+\setmainfont{times.ttf}[
+  BoldFont       = timesbd.ttf,
+  ItalicFont     = timesi.ttf,
+  BoldItalicFont = timesbi.ttf
+]
+
+% Math font: Latin/Digits from Times body, Greek from sasgts symbol fonts.
+\usepackage{mathspec}
+\setmathsfont(Latin,Digits)[
+  Path           = fonts/,
+  UprightFont    = times.ttf,
+  ItalicFont     = timesi.ttf,
+  BoldFont       = timesbd.ttf,
+  BoldItalicFont = timesbi.ttf
+]{times.ttf}
+\setmathsfont(Greek)[
+  Path           = fonts/,
+  UprightFont    = sasgtsr.ttf,
+  ItalicFont     = sasgtsi.ttf,
+  BoldFont       = sasgtsb.ttf,
+  BoldItalicFont = sasgtsbi.ttf
+]{sasgtsi.ttf}
+
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black
+}
+
+\newcommand{\Gobs}{G_{\text{obs}}}
+\newcommand{\pinode}{\pi_{\text{node}}}
+\newcommand{\piedge}{\pi_{\text{edge}}}
+\newcommand{\Pmat}{P}
+\newcommand{\Rmat}{R}
+\newcommand{\EI}{\text{E/I}}
+
+\title{Validation Roadmap for the Prior-Informed Bootstrap Framework}
+\author{Jonathan H. Morgan, Ph.D.\\
+\small Companion document to the Framework Specification\\
+\small For developer and collaborator review}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This document specifies the validation strategy for the prior-informed bootstrap framework introduced in the companion specification. It defines the network corpus on which the framework will be tested, the missingness mechanisms used to degrade fully observed networks into incomplete observations, the comparison baselines, the evaluation criteria, and the success conditions that determine whether the framework is ready for publication and broader use. The validation design draws methodologically from \citet{SmithMorganMoody2022}, adapting their Monte Carlo protocol for the framework's distinctive credible-interval output. The document is intended as a commitment device: the conditions and criteria specified here are the ones the framework will be evaluated against, settled before implementation begins.
+\end{abstract}
+
+\section{Introduction and Scope}
+
+The framework specified in the companion document introduces several methodological innovations relative to prior bootstrap approaches for network credible intervals~--- explicit node-level missingness, a user-supplied prior on centrality-missingness correlation, structural-role binning via the E/I~index, and rank-conditional reciprocity imputation for nominated non-respondents. Each of these innovations expands the framework's applicability beyond what existing methods can handle, but also introduces additional design choices and assumptions that must be validated empirically before the framework can be recommended for general use.
+
+This document specifies how that validation will be conducted. It defines:
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item A network corpus combining empirical and synthetic networks spanning size, directedness, and centralization;
+  \item Procedures for degrading fully observed networks into incomplete observations under controlled missingness mechanisms;
+  \item Comparison baselines selected to represent the realistic alternatives a practitioner would consider;
+  \item Evaluation criteria that capture both the framework's Bayesian credible-interval output and its compatibility with point-estimate comparisons established in prior work;
+  \item Concrete success conditions against which the framework's performance will be judged.
+\end{itemize}
+
+The validation explicitly does not aim to dominate every existing imputation method in every setting. Prior work \citep{SmithMorganMoody2022} has established that no single imputation approach is uniformly best across networks, measures, and missingness mechanisms. The framework's value proposition is providing well-calibrated credible intervals under non-random missingness, a capability that prior simple-imputation methods do not offer at all. The validation is therefore structured to demonstrate three claims: (1)~the framework provides credible intervals with reasonable coverage and useful width across a range of realistic conditions; (2)~the framework's point estimates are competitive with simple imputation methods on the metrics those methods were designed to optimize; and (3)~the framework's calibration degrades gracefully when the user's supplied prior departs from the true missingness mechanism.
+
+\section{Validation Philosophy}
+
+The validation rests on three principles.
+
+\paragraph{Treat empirical networks as ground truth.} For each empirical network in the corpus, the network as collected is treated as the ``true'' network for evaluation purposes. We do not attempt to correct for any measurement error or missingness present in the original data collection; rather, we induce additional, controlled missingness on top of the original data and measure how well the framework recovers the original. This is the standard Monte Carlo paradigm in the network sampling literature \citep[see][]{SmithMorganMoody2022} and produces results that are interpretable as ``how well does the framework recover the network the analyst would have if they had complete data?''
+
+\paragraph{Use synthetic networks for controlled conditions.} The empirical networks span specific structural cells but cannot be modified to test how performance varies along a single structural axis. Synthetic networks let us hold most properties constant and vary one at a time~--- size, centralization, density, community structure. The synthetic networks are not meant to replace the empirical ones; they complement them by providing controlled stress tests.
+
+\paragraph{Match the methodological precedent where possible.} Where \citet{SmithMorganMoody2022} established procedures for inducing missingness and evaluating bias, this validation follows those procedures. This produces results directly comparable to that prior work and avoids re-litigating methodological choices that have already been validated in the literature. Where the framework's distinctive features require new evaluation procedures (e.g., for credible-interval coverage), this document specifies those new procedures explicitly.
+
+\section{Network Corpus}
+
+The corpus comprises fourteen networks spanning the four cells of the weighted~$\times$~directed design: four empirical, four synthetic at base specification, two thresholded unweighted variants of empirical networks, and four unweighted synthetic networks. The empirical networks cover real-world structural complexity at sizes ranging from 70 to 1{,}347 nodes. The synthetic networks fill structural cells the empirical corpus does not cover and provide controlled-condition baselines. The unweighted variants ensure the framework's distinctive ability to handle unweighted networks~--- absent in \citet{Bellutta2026}'s Chapter~4 framework~--- is exercised across both directed and undirected settings.
+
+\subsection{Empirical Networks}
+
+\paragraph{Moreno High School (directed, $N = 70$).} Friendship nominations among boys in an Illinois high school, aggregated across fall 1957 and spring 1958 surveys. Edge weights range 1--2 indicating whether each boy was nominated in one or both surveys. Density 7.6\%, mean degree 10.5, reciprocity 0.50, clustering coefficient 0.40. The network is small, dense, and highly reciprocated, with moderate clustering. It represents the canonical case where simple probabilistic imputation (using reciprocity as the imputation signal) is expected to work well, and serves as a natural test case for the framework's rank-conditional reciprocity matrix~$\Rmat$.
+
+\paragraph{Toledo Crime Networks (undirected, $N = 77$).} Multiplex criminal cooperation network covering seven crime types: drug trafficking, theft, weapon carrying, homicide, kidnapping, arms trafficking, and ideological falsehood \citep{Toledo2023}. For this validation, the seven layers are collapsed to a single weighted summary network via sum-across-layers, following the procedure used in \citet{Bellutta2026} for evaluating single-layer methods on multiplex data. The collapsed network has 223 weighted edges and density approximately 7--8\%. Provides a small undirected empirical case with multiplex structural origin.
+
+\paragraph{Scotland Interlock (undirected, $N = 108$).} Bipartite director-company affiliation network for Scottish joint stock companies in 1904--1905, derived from \citet{ScottHughes1980}. For this validation, the bipartite network is projected to a one-mode company network: two companies are connected if they share one or more directors, weighted by the number of shared directors. The projection produces 108 nodes with company-level attributes (industry category, total capital). Provides an empirical case with known community structure (industry categories) that can serve as ground truth for Louvain community detection validation.
+
+\paragraph{Balikatan 2022 (directed, $N = 1{,}347$).} Twitter communication network from the Balikatan 2022 US-Philippines military exercise. Edges aggregate mentions, retweets, replies, and quotes between accounts; edge weights are integer interaction counts. Density approximately 0.17\% (sparse), transitivity 0.23, modularity (Leiden) 0.56. Provides the corpus's only large, sparse empirical case with strong community structure. Most relevant for testing the framework's scalability and the value of E/I~binning in a setting where community structure is strong but the network is too large for model-based imputation.
+
+\subsection{Synthetic Networks}
+
+The synthetic networks are designed in pairs, with each pair sharing an underlying structure but generated in both directed and undirected variants. This produces a clean experimental contrast between directionality holding other properties constant. Synthetic networks are generated with controlled parameters but realistic structural properties; specific parameter values may be refined after preliminary analysis of the empirical corpus (see Section~\ref{sec:phase0}).
+
+\paragraph{Synthetic 1 (low centralization, $N = 600$).} Stochastic block model with 4--6 communities of approximately equal size and moderate inter-community connectivity. Target density 5--7\%, target clustering coefficient 0.30--0.40, target in-degree centralization 0.05--0.10. Edge weights drawn from Poisson($\lambda = 2$). Generated as a directed network; the undirected variant is produced by symmetrizing (union of forward and reverse edges, with weights summed). Provides a controlled large network where community structure is known by construction (allowing direct validation of Louvain recovery) and centralization is low (testing the framework where bin-exchangeability should hold most cleanly).
+
+\paragraph{Synthetic 2 (high centralization, $N = 250$).} Directed preferential attachment with attachment proportional to in-degree only, producing extreme in-degree concentration with uniform out-degree. Target density 2--3\%, target in-degree centralization 0.25--0.30, target Bonacich centralization 0.35--0.45, target reciprocity 0.10--0.20 (low). Edge weights drawn from Poisson($\lambda = 2$). Undirected variant produced by symmetrization. Provides the corpus's controlled high-centralization case~--- the structural opposite of Moreno~--- and a stress test for bin-exchangeability when degree distribution is highly skewed.
+
+\subsection{Unweighted Variants}
+
+The framework's ability to handle unweighted networks is one of its distinctive capabilities relative to \citet{Bellutta2026}'s Chapter~4 framework. To validate this capability across the four cells of the weighted~$\times$~directed design, unweighted variants of four networks are added to the corpus, providing at least three networks in each cell.
+
+\paragraph{Moreno (unweighted directed).} Produced by thresholding the weighted Moreno network: any directed pair with weight~$\geq 1$ becomes an unweighted edge. The resulting network has the same edge presence pattern as the weighted version but loses the distinction between single and double nominations.
+
+\paragraph{Toledo (unweighted undirected).} Produced by thresholding the collapsed weighted summary: any unordered pair with at least one observed cooperation across the seven crime layers becomes an unweighted edge. The unweighted variant arguably aligns more closely with the underlying data semantics, since the original layer files record presence/absence of cooperation rather than intensity.
+
+\paragraph{Synthetic 1 (unweighted directed and undirected).} Generated using the same SBM specification as the weighted variants but with binary edges (Bernoulli draws on the block probability matrix, no Poisson weight assignment). The unweighted directed and undirected variants are generated as a pair through the same symmetrization procedure as the weighted versions. Provides controlled unweighted networks at scale ($N = 600$).
+
+\paragraph{Synthetic 2 (unweighted directed and undirected).} Generated using the same preferential attachment specification as the weighted variants but with binary edges. Provides controlled high-centralization unweighted networks at medium scale ($N = 250$).
+
+\paragraph{A note on thresholded vs.\ natively-unweighted networks.} Thresholding a weighted network produces a structurally different network than one that was unweighted by construction: edge density tends to be higher (any non-zero weight becomes an edge), reciprocity is computed on edge presence rather than weight, and degree distributions reflect edge counts rather than weight sums. The validation interprets unweighted variants as their own networks rather than as representations of the weighted versions, and reports results separately rather than treating them as paired observations of the same underlying structure.
+
+\subsection{Corpus Summary}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{3.8cm} p{1.5cm} p{0.8cm} p{1.2cm} p{1.2cm} p{1.3cm} p{2.4cm}}
+\toprule
+\textbf{Network} & \textbf{Source} & \textbf{$N$} & \textbf{Direction} & \textbf{Weights} & \textbf{Central.} & \textbf{Role} \\
+\midrule
+Moreno High School & Empirical & 70 & Directed & Weighted & Moderate & Small directed dense \\
+Moreno (unweighted) & Threshold & 70 & Directed & Unweighted & Moderate & Unweighted directed \\
+Toledo Crime (collapsed) & Empirical & 77 & Undirected & Weighted & TBD & Small undirected real \\
+Toledo (unweighted) & Threshold & 77 & Undirected & Unweighted & TBD & Unweighted undirected \\
+Scotland Interlock (proj.) & Empirical & 108 & Undirected & Weighted & TBD & Comm.\ truth available \\
+Balikatan 2022 & Empirical & 1{,}347 & Directed & Weighted & TBD & Large directed sparse \\
+Synthetic 1 (directed) & SBM & 600 & Directed & Weighted & Low & Large directed controlled \\
+Synthetic 1 (undirected) & SBM sym. & 600 & Undirected & Weighted & Low & Large undirected controlled \\
+Synthetic 1 (directed, unwt.) & SBM bin. & 600 & Directed & Unweighted & Low & Unweighted directed at scale \\
+Synthetic 1 (undirected, unwt.) & SBM bin. sym. & 600 & Undirected & Unweighted & Low & Unweighted undirected at scale \\
+Synthetic 2 (directed) & PA & 250 & Directed & Weighted & High & Mid directed extreme \\
+Synthetic 2 (undirected) & PA sym. & 250 & Undirected & Weighted & High & Mid undirected extreme \\
+Synthetic 2 (directed, unwt.) & PA bin. & 250 & Directed & Unweighted & High & Unweighted high-cent.\ directed \\
+Synthetic 2 (undirected, unwt.) & PA bin. sym. & 250 & Undirected & Unweighted & High & Unweighted high-cent.\ undirected \\
+\bottomrule
+\end{tabular}
+\caption{Validation network corpus, 14 networks across the four weighted~$\times$~directed cells. Centralization values marked TBD will be computed in Phase~0 (see Section~\ref{sec:phase0}); synthetic parameters may be refined based on Phase~0 results. The four unweighted variants (Moreno, Toledo, and both synthetics) ensure the unweighted classes are exercised across both directed and undirected settings.}
+\label{tab:corpus}
+\end{table}
+
+\subsection{Phase 0: Preliminary Corpus Characterization}
+\label{sec:phase0}
+
+Before the main validation runs, a preliminary analysis (Phase~0) will compute descriptive statistics for all four empirical networks using the measures from \citet{SmithMorganMoody2022}: in/out/symmetric degree centralization, closeness centralization, betweenness centralization, Bonacich centralization, transitivity, modularity, mean and SD of node-level centralities, and component structure. Phase~0 produces an empirical analog of \citet{SmithMorganMoody2022}'s Table~1 for the validation corpus.
+
+Phase~0 results inform the final synthetic network design. If the empirical corpus turns out to cover the high-centralization cell adequately (e.g., if Balikatan or Scotland is highly centralized), Synthetic~2 may be repurposed to fill a different structural gap. If the empirical corpus is uniformly moderate-centralization, Synthetic~2 retains its specified high-centralization design. The flexibility built into the corpus design ensures the validation tests the framework on structural conditions of interest rather than on a fixed grid that may turn out to be unbalanced.
+
+\section{Degeneration Strategy}
+
+For each network in the corpus, the validation proceeds by treating the network as the true network~$T$ and generating degraded observed networks~$\Gobs$ by removing nodes under controlled missingness mechanisms. The framework is then run on~$\Gobs$ and its output compared against the known true measures computed on~$T$.
+
+\subsection{Missingness Mechanism}
+
+Missingness is induced at the node level following the protocol of \citet{SmithMorganMoody2022}. For each network, the probability of node~$i$ being selected for removal is a weighted combination of node centrality (proxied by in-degree) and uniform noise:
+\[
+\text{prob}_i = b \cdot \text{centrality}_i + (1 - b) \cdot u_i,
+\]
+where $u_i \sim \text{Uniform}(0, 1)$ and the scalar~$b$ is tuned to produce a target correlation~$\rho_{\text{induced}}$ between centrality and missingness probability across the network's nodes. The induced correlation is set at five levels: $-0.75$, $-0.25$, $0.00$, $+0.25$, $+0.75$, corresponding to strong negative, weak negative, MCAR, weak positive, and strong positive centrality-missingness relationships respectively. The $\pm 0.75$ and $\pm 0.25$ values match the four levels used in \citet{SmithMorganMoody2022}; the additional $0.00$ level provides an MCAR baseline.
+
+\subsection{Missingness Rates}
+
+For the main validation, six missingness rates are used: 5\%, 10\%, 15\%, 25\%, 40\%, and 50\% of nodes. This covers the realistic range of missingness an analyst is likely to face and matches a subset of the rates explored in \citet{SmithMorganMoody2022}. Lower rates (1--5\%) are excluded because differences between methods are too small to reliably detect at very low missingness. Higher rates (60--70\%) are excluded because they represent extreme conditions where any method's reliability is suspect.
+
+\subsection{Reconstruction Procedure}
+
+Once nodes are selected for removal, they are removed from the network entirely~--- including all edges incident to them. This is the listwise deletion procedure standard in the network sampling literature \citep[see][]{SmithMorganMoody2022, Galaskiewicz1991, CostenbaderValente2003, Borgatti2006}. The resulting reduced network is~$\Gobs$, which is passed to the framework and the comparison baselines.
+
+Note that this means the framework is not given any information about which specific nodes were removed (i.e., no list of partially observed nodes is provided in the basic protocol). This represents the most general case where the analyst knows missingness has occurred but does not know which specific nodes are missing. A supplementary set of conditions will also be run where the framework is given the list of nominated non-respondents (those who appear in observed edges but were removed), to evaluate the contribution of Stage~0.5 imputation.
+
+\paragraph{Weighted versus unweighted networks.} For weighted networks, both node-level ($\pinode$) and edge-weight-level ($\piedge$) missingness are in principle modelable; the validation focuses on node-level missingness following the protocol above, with $\piedge = 0$ throughout to keep the design tractable. For unweighted networks, $\piedge$ is structurally inapplicable as specified in the framework specification, and only $\pinode$ varies. The same induced-$\rho$ levels and missingness rates apply to both weighted and unweighted networks; the framework's internal behavior differs (Stage~2 is skipped for unweighted networks) but the validation conditions are uniform.
+
+\subsection{User-Supplied Prior}
+
+For each combination of network, induced~$\rho$, and missingness rate, the framework is run with three different user-supplied~$\rho$ values to evaluate calibration sensitivity:
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item \textbf{Correct prior:} the user-supplied~$\rho$ matches the induced~$\rho$. This is the framework's best case and establishes its ceiling performance.
+  \item \textbf{MCAR-assuming prior:} the user-supplied~$\rho = 0$, regardless of the true missingness mechanism. This represents the case where the user has no domain knowledge or assumes the simplest case.
+  \item \textbf{Opposite-sign prior:} the user-supplied~$\rho$ has the opposite sign from the induced value, with the same magnitude. This is the framework's worst case and tests how badly the framework fails when the user is fundamentally wrong about the missingness mechanism.
+\end{itemize}
+
+\subsection{Iterations}
+
+For each combination of conditions, the missingness-induction-and-evaluation cycle is repeated 200 times. This is reduced from the 1{,}000 iterations used in \citet{SmithMorganMoody2022} to accommodate the additional computational cost of the framework's posterior sampling ($B = 1{,}000$ replicates per run). With 200 iterations per condition, the resulting coverage estimates have approximate standard error $\sqrt{0.95 \cdot 0.05 / 200} \approx 0.015$, which is acceptable for the validation's purposes.
+
+\section{Comparison Baselines}
+
+The framework is compared against five baselines representing the realistic alternatives a practitioner would consider.
+
+\paragraph{Listwise deletion (floor baseline).} The reduced network~$\Gobs$ is used directly without imputation. Measures are computed on~$\Gobs$ as-is. This represents the no-method case and establishes the magnitude of the missing-data problem the framework is addressing.
+
+\paragraph{Asymmetric imputation (directed networks only).} Following \citet{SmithMorganMoody2022}: when an observed forward edge points to a removed node, no reverse edge is added. This privileges observed structure at the cost of systematic asymmetry.
+
+\paragraph{Symmetric imputation.} Following \citet{SmithMorganMoody2022}: when an observed forward edge points to a removed node, a reverse edge is assumed to exist. For directed networks, this assumes all ties are reciprocated. For undirected networks, this is the natural reconstruction.
+
+\paragraph{Probabilistic imputation (directed networks only).} Following \citet{SmithMorganMoody2022}: reverse edges to removed nodes are added with probability equal to the global reciprocity rate computed from respondent-respondent dyads in~$\Gobs$. Repeated 100 times per missingness realization, with point estimates summarized as means across the 100 imputations.
+
+\paragraph{Random augmentation bootstrap (Chapter~4 baseline).} Following \citet{Bellutta2026}'s Chapter~4: edge weights are added uniformly at random to~$\Gobs$ until the total weight reaches an estimated true level. Repeated $B = 1{,}000$ times with credible intervals computed from the resulting distribution. This is the simplest bootstrap baseline and represents the prior bootstrap approach the framework is designed to improve upon.
+
+Model-based imputation methods (simple and complex ERGM-based) are deliberately excluded from the comparison. \citet{SmithMorganMoody2022} established their performance characteristics on the same general class of networks; their computational cost scales poorly to networks the size of Balikatan; and the framework's positioning is as a scalable alternative to model-based imputation rather than as a competitor to it.
+
+\section{Measures and Evaluation Criteria}
+
+The validation evaluates each method on the same network measures used in \citet{SmithMorganMoody2022}, allowing direct comparability with that prior work. Evaluation is conducted on two tracks: point-estimate accuracy (comparable to prior imputation studies) and credible-interval calibration (the framework's distinctive contribution).
+
+\subsection{Measures}
+
+\paragraph{Node-level measures (centrality).}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item In-degree centrality
+  \item Out-degree centrality (directed networks only)
+  \item Symmetric degree centrality
+  \item Closeness centrality
+  \item Betweenness centrality
+  \item Bonacich power centrality
+\end{itemize}
+
+\paragraph{Network-level measures (centralization).}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item In-degree centralization
+  \item Out-degree centralization (directed networks only)
+  \item Symmetric degree centralization
+  \item Closeness centralization
+  \item Betweenness centralization
+  \item Bonacich power centralization
+\end{itemize}
+
+\paragraph{Topology measures.}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item Component size (largest connected/weakly connected component)
+  \item Bicomponent size (largest biconnected component)
+  \item Mean geodesic distance
+  \item Transitivity (clustering coefficient)
+  \item Tau-RC (triangle-to-connected-triple ratio)
+\end{itemize}
+
+\subsection{Track A: Point-Estimate Accuracy}
+
+For direct comparability with \citet{SmithMorganMoody2022}, point estimates are evaluated using their established metrics:
+
+\paragraph{Node-level measures.} For each method and each missingness condition, compute the correlation between the true node-level centrality scores (computed on~$T$) and the observed/imputed scores (computed on~$\Gobs$ after each method's reconstruction). High correlation indicates the method preserves the relative ranking of nodes. For the framework, the point estimate is taken as the posterior median across the $B$~replicates.
+
+\paragraph{Network-level measures.} For each method and each condition, compute the standardized absolute bias:
+\[
+\text{Bias} = \left| \frac{m(\Gobs^{\text{reconstructed}}) - m(T)}{m(T)} \right|.
+\]
+For the framework, the point estimate is again the posterior median.
+
+\subsection{Track B: Credible-Interval Calibration}
+
+The framework's distinctive output is a posterior sample, summarized as a credible interval. Two evaluation metrics apply only to the framework (and to random augmentation, which also produces intervals):
+
+\paragraph{Coverage.} For each condition, the proportion of iterations in which the 95\% credible interval contains the true measure value computed on~$T$. Nominal coverage is 0.95. Coverage substantially below 0.95 indicates the framework's intervals are too narrow (overconfident); coverage near 1.00 indicates the intervals are too wide to be informative.
+
+\paragraph{Width.} The mean width of the 95\% credible interval across iterations, normalized by an appropriate scale (the standard deviation of the true measure across nodes for node-level measures; the absolute value of the true measure for network-level measures). Narrower intervals are more useful provided coverage is adequate.
+
+\subsection{Track C: Calibration Sensitivity}
+
+The framework's calibration is also evaluated as the user-supplied~$\rho$ deviates from the induced~$\rho$. Specifically, coverage and width are computed for each of the three prior conditions (correct, MCAR-assuming, opposite-sign) and compared. Graceful degradation~--- where coverage drops modestly and width increases moderately as the prior departs from truth~--- is a desired property. Catastrophic failure~--- where coverage drops to near zero under the wrong prior~--- would be a significant problem.
+
+\section{Success Conditions}
+
+The framework will be considered validated and ready for publication if the following conditions are met across the validation corpus.
+
+\subsection{Primary Conditions (must be met)}
+
+\paragraph{C1: Coverage under correct prior.} Across all networks, induced~$\rho$ values, and missingness rates up to 30\%, the framework's 95\% credible intervals achieve at least 90\% empirical coverage when the user supplies the correct~$\rho$. (The 90\% threshold rather than 95\% acknowledges that the framework is an approximate Bayesian procedure, not a strict one.)
+
+\paragraph{C2: Point estimates competitive with simple imputation.} For directed networks at moderate missingness (10--25\%), the framework's posterior median achieves bias and node-centrality correlation comparable to (within 10\% of) the best-performing simple imputation method (probabilistic or symmetric, as appropriate) on each measure.
+
+\paragraph{C3: Improvement over listwise deletion.} Across all conditions, the framework's coverage and width are strictly better than listwise deletion combined with naive bootstrap (i.e., the random augmentation baseline) when the missingness mechanism is non-MCAR (induced $|\rho| \geq 0.25$).
+
+\paragraph{C4: Scaling to Balikatan.} The framework completes a single validation iteration on Balikatan ($N = 1{,}347$) in under 10 minutes of wall-clock time on a single modern CPU core, making the full validation grid computationally feasible.
+
+\paragraph{C5: Unweighted network support.} The framework operates correctly on all four unweighted classes (unweighted directed, unweighted undirected) across the corpus's unweighted networks. ``Operates correctly'' means: (a)~the framework runs to completion without errors on these networks; (b)~Stage~2 is correctly skipped (no edge-weight reversal attempted); (c)~credible interval coverage under correct prior meets the C1 threshold (90\%) on these networks. This condition formalizes the framework's distinctive ability to handle unweighted networks, which the Chapter~4 framework could not.
+
+\subsection{Secondary Conditions (desired but not strictly required)}
+
+\paragraph{C6: Coverage under MCAR-assuming prior.} When the user supplies $\rho = 0$ but the true induced~$\rho$ is $\pm 0.25$, coverage drops by no more than 10 percentage points relative to the correct-prior case. This indicates the framework is robust to mild prior misspecification.
+
+\paragraph{C7: Graceful degradation under opposite-sign prior.} When the user supplies a prior with the wrong sign, coverage may drop substantially but does not fall below 50\% for any network and missingness rate up to 30\%. This indicates the framework fails gracefully rather than catastrophically.
+
+\paragraph{C8: E/I~binning improves performance on betweenness.} For networks with non-trivial community structure (modularity $> 0.30$), the framework with broker detection enabled achieves better coverage on betweenness centrality measures than a hypothetical degree-only variant.
+
+\subsection{Failure Conditions (would prompt revision)}
+
+\paragraph{F1: Coverage failure under correct prior.} If C1 is not met for more than two networks in the corpus, the framework's coverage mechanism (logistic bin-assignment, Laplace smoothing, or sampling distributions) requires revision before publication.
+
+\paragraph{F2: Catastrophic failure under wrong prior.} If C7 is violated~--- coverage falls below 50\% with an opposite-sign prior at moderate missingness~--- the framework's design is too sensitive to the prior and may not be suitable for general use.
+
+\paragraph{F3: Failure to scale.} If C4 is not met, the framework requires algorithmic optimization before validation can proceed at scale.
+
+\section{Validation Pipeline Architecture}
+
+The validation pipeline will be implemented in Python alongside the framework itself, following the module structure proposed in the accompanying implementation discussions. Key architectural decisions:
+
+\paragraph{Data format.} All networks are stored in a unified Parquet representation: a \texttt{nodes} table with node IDs and attributes, and an \texttt{edges} table with source, target, weight, and (for multiplex sources) layer identifier. This format is efficient for I/O, supports both Python and R/Julia analysis, and accommodates the eventual extension to multidimensional networks.
+
+\paragraph{Reproducibility.} All Monte Carlo iterations use seeded random number generators, with the seed determined deterministically from the condition specification (network, induced~$\rho$, missingness rate, iteration index). This ensures the validation can be reproduced exactly and that individual conditions can be re-run without re-running the full grid.
+
+\paragraph{Output.} Framework runs produce per-iteration outputs in Parquet format: posterior samples for each measure, point estimates, credible interval bounds, and diagnostic information (realized correlation, binning mode used, etc.). Comparison method outputs are stored in parallel structures. Analysis and figure generation are performed in R using the \texttt{arrow} package to read the Parquet output.
+
+\paragraph{Parallelization.} The validation grid is embarrassingly parallel across (network, induced~$\rho$, missingness rate, iteration) combinations. Implementation uses \texttt{joblib} or equivalent to parallelize across available cores. The total computational budget is estimated at approximately $6 \cdot 10^7$ framework runs, requiring a multi-day run on a single machine or a few hours on a small compute cluster.
+
+\section{Reporting Plan}
+
+The final validation report will be a separate document, structured around the success conditions:
+
+\begin{enumerate}[leftmargin=*, itemsep=2pt]
+  \item Corpus characterization (Phase~0 results, descriptive statistics for all eight networks)
+  \item Performance under correct prior (C1, C3): coverage, width, bias, and node-correlation results across the full grid
+  \item Comparison with simple imputation (C2): head-to-head point-estimate comparison
+  \item Calibration sensitivity (C6, C7): performance under MCAR-assuming and opposite-sign priors
+  \item Special analyses (C5, C8): unweighted network support and the value of E/I~binning; the value of Stage~0.5 imputation when nominated non-respondents are identified
+  \item Scaling and computational performance (C4)
+  \item Discussion and limitations
+\end{enumerate}
+
+Figures will follow the visual conventions of \citet{SmithMorganMoody2022}: small-multiples decision-tree style figures showing the best method by condition, supplemented by coverage and width plots across the missingness-rate axis.
+
+\section{Risks and Contingencies}
+
+\paragraph{Risk 1: Framework coverage is too low under correct prior.} If C1 fails systematically, the most likely causes are (a)~the bin-assignment distribution does not produce the intended correlation in practice, (b)~the rank-rank matrix is too smoothed (overly Laplace-regularized), or (c)~the Poisson weight model is wrong for some networks. Diagnostic outputs will help identify which is the issue. Mitigations include refining the $\beta$-solving procedure, reducing smoothing, or adopting weight distributions tuned to the input network.
+
+\paragraph{Risk 2: Computational cost exceeds the budget.} If the full validation grid takes longer than anticipated, the first cut is to reduce iterations per condition from 200 to 100 (doubles standard error on coverage estimates but remains acceptable). The second cut is to reduce missingness rates from six to four (drop 5\% and 50\%, keeping 10\%, 15\%, 25\%, 40\%). The third cut is to reduce posterior samples from $B = 1{,}000$ to $B = 500$.
+
+\paragraph{Risk 3: Balikatan's structure is anomalous.} If Phase~0 reveals that Balikatan has structural properties that make it an outlier in the corpus (e.g., extremely heavy-tailed degree distribution, multiple disconnected components), the validation may need to treat Balikatan as a case study rather than including it in the main factorial. The reporting structure accommodates this contingency.
+
+\paragraph{Risk 4: Empirical centralization values cluster too tightly.} If Phase~0 reveals that all four empirical networks have similar centralization, the synthetic networks become the primary source of centralization variation. The synthetic design has flexibility built in to address this if needed.
+
+\section{Milestones}
+
+The validation is organized into seven milestones. Each milestone is expressed as one or more \emph{necessary conditions for completion}~--- empirical or technical facts that must hold before subsequent work can responsibly proceed. The conditions are deliberately falsifiable: if the supporting evidence does not establish the condition, the milestone is not met, and the work either iterates or halts pending revision.
+
+\subsection*{Milestone 1: Data Infrastructure}
+
+\paragraph{Necessary conditions.}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item All four empirical networks load into the unified Parquet format without loss of information.
+  \item Loaded networks reproduce published descriptive statistics (node count, edge count, density, direction) within rounding tolerance.
+  \item The unified format accommodates all sources (four empirical, plus synthetic networks generated in Milestone~3) without source-specific schema variations.
+\end{itemize}
+
+\paragraph{Artifact.} \texttt{nodes.parquet} and \texttt{edges.parquet} files for each network, plus a loader-validation report comparing loaded statistics against source documentation.
+
+\paragraph{Gates.} No subsequent milestone can proceed until the data is verified loaded; corruption or schema mismatch discovered later contaminates everything downstream.
+
+\subsection*{Milestone 2: Empirical Corpus Characterization (Phase 0)}
+
+\paragraph{Necessary conditions.}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item Descriptive statistics from Section~5.1 (centralization, transitivity, modularity, mean degree, etc.) are computed for all four empirical networks.
+  \item The empirical corpus collectively spans enough structural variation to make the validation meaningful~--- in particular, at least two distinct centralization regimes must be represented across the four networks.
+  \item Any empirical network that turns out to be structurally anomalous (e.g., disconnected, trivially small communities, degenerate degree distribution) is identified and a remediation decision is made (include with caveats, treat as case study, or exclude).
+\end{itemize}
+
+\paragraph{Artifact.} Phase~0 report: an empirical analog of \citet{SmithMorganMoody2022}'s Table~1 for the validation corpus, plus a narrative interpretation of structural coverage and gaps.
+
+\paragraph{Gates.} The Phase~0 report determines whether the synthetic network designs need adjustment (Milestone~3). If the empirical corpus already covers the high-centralization cell well, Synthetic~2 may be redesigned to fill a different gap.
+
+\subsection*{Milestone 3: Synthetic Network Generation and Unweighted Variants}
+
+\paragraph{Necessary conditions.}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item Synthetic~1 and Synthetic~2 are generated in both weighted and unweighted variants, each in directed and undirected forms (eight synthetic networks total).
+  \item Thresholded unweighted variants of Moreno and Toledo are produced from the loaded weighted versions.
+  \item Each synthetic network's actual structural properties (computed post-generation) fall within the target ranges specified in Section~3.2 or are explicitly noted as deviations with justification.
+  \item Together, the empirical and synthetic networks span low, moderate, and high centralization, both small ($N \leq 250$) and larger ($N \geq 600$) sizes, and all four cells of the weighted~$\times$~directed design with at least three networks per cell.
+\end{itemize}
+
+\paragraph{Artifact.} Synthetic and unweighted-variant network files in the unified Parquet format, plus a generation report comparing target and actual structural properties.
+
+\paragraph{Gates.} The full corpus must be finalized before the framework implementation enters validation testing, so that testing covers the network suite that will be used in production validation.
+
+\subsection*{Milestone 4: Framework Implementation}
+
+\paragraph{Necessary conditions.}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item All algorithmic components specified in the framework specification are implemented: bin assignment, $\Pmat$ and $\Rmat$ matrix computation, Louvain community detection with E/I~scoring, $\beta$-solving for $\rho$-conditional bin distributions, Stage~0.5 imputation, Stage~1 node augmentation, Stage~2 edge-weight reversal, posterior aggregation.
+  \item Unit tests cover each component with known-output cases, including edge cases (unweighted networks, $\pinode = 0$, $\piedge = 0$, single-community fallback, sparse cell handling).
+  \item End-to-end smoke test on a small network (Moreno) produces output that is internally consistent: realized correlations between bin assignment and missingness across replicates match the requested~$\rho$ within tolerance; bin counts match $N_{\text{add}}$ in expectation.
+  \item Computational performance permits at least one full framework run on Balikatan ($N = 1{,}347$) in under 10~minutes wall-clock on a single modern CPU core (condition C4 from Section~6.1).
+\end{itemize}
+
+\paragraph{Artifact.} Implemented framework as a Python package, unit test suite, and a smoke-test report demonstrating end-to-end operation and the Balikatan timing benchmark.
+
+\paragraph{Gates.} Validation cannot run on an unimplemented or unverified framework. The Balikatan timing constraint must be met before committing to the full validation grid; if not met, optimization work intervenes before Milestone~5.
+
+\subsection*{Milestone 5: Comparison Baseline Implementation}
+
+\paragraph{Necessary conditions.}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item Listwise deletion, asymmetric, symmetric, and probabilistic imputation methods are implemented and produce results matching \citet{SmithMorganMoody2022}'s reported behavior on Moreno when supplied with equivalent missingness conditions.
+  \item Random augmentation bootstrap (from \citet{Bellutta2026}, Chapter~4) is implemented and produces results matching the Chapter~4 description.
+  \item All baseline methods accept the same network and missingness inputs as the framework, producing comparable outputs (point estimates for all; credible intervals for random augmentation and the framework).
+\end{itemize}
+
+\paragraph{Artifact.} Implemented baseline methods as part of the validation pipeline, plus a baseline-verification report showing that each baseline reproduces published behavior on at least one network.
+
+\paragraph{Gates.} The validation cannot make valid comparisons against baselines that have not been verified to behave correctly. Verification against published results is the necessary check.
+
+\subsection*{Milestone 6: Pilot Validation}
+
+\paragraph{Necessary conditions.}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item The full validation pipeline (network loading, missingness induction, framework execution, baseline execution, metric computation, output aggregation) runs end-to-end on Moreno across all five induced~$\rho$ values, all six missingness rates, and all three user-supplied~$\rho$ conditions, with reduced iterations ($n = 50$) for tractability.
+  \item Pilot results are sane: coverage is in a plausible range (not 0 or 1 everywhere), interval widths scale reasonably with missingness, and method comparisons produce expected ordering on at least one condition (e.g., listwise deletion bias increases with missingness rate).
+  \item No catastrophic failures are observed: no crashes, no NaN outputs, no negative interval widths, no coverage outside~$[0, 1]$.
+\end{itemize}
+
+\paragraph{Artifact.} Pilot validation report on Moreno: coverage and width tables, point-estimate comparisons, and an explicit assessment of whether the pipeline is producing sensible results.
+
+\paragraph{Gates.} The pilot exists specifically to catch problems before committing computational resources to the full grid. If pilot results are not sane, the full validation does not proceed; the issue is diagnosed and the pipeline revised.
+
+\subsection*{Milestone 7: Full Validation and Reporting}
+
+\paragraph{Necessary conditions.}
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item The full factorial validation grid completes across all eight networks, five induced~$\rho$ values, six missingness rates, three user-supplied~$\rho$ conditions, and 200 iterations per condition.
+  \item All measures from Section~5.1 are computed for the framework, all applicable baselines, and the true network values.
+  \item Output is stored in the agreed Parquet schema with sufficient metadata to reconstruct any individual condition's run.
+  \item The primary success conditions (C1--C5 from Section~6.1) are evaluated against the empirical results, with each condition's status (met / partially met / not met) documented.
+  \item The secondary conditions (C6--C8) and failure conditions (F1--F3) are evaluated and documented.
+  \item A validation report is drafted following the reporting plan in Section~8, with figures generated from the Parquet output.
+\end{itemize}
+
+\paragraph{Artifact.} Complete validation dataset in Parquet format, plus a validation report addressing every success condition and providing the comparison narrative against the baselines.
+
+\paragraph{Gates.} The framework is considered validated and ready for broader use only if the primary conditions (C1--C5) are met. If any primary condition fails, the failure analysis in Section~9 determines next steps (revision of framework, revision of validation, or limitation acknowledgment in publication).
+
+\subsection*{Summary of Milestones and Dependencies}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{p{0.7cm} p{4.5cm} p{4cm} p{3.8cm}}
+\toprule
+\textbf{\#} & \textbf{Milestone} & \textbf{Primary artifact} & \textbf{Gates the start of} \\
+\midrule
+1 & Data infrastructure & Loaded Parquet files & M2, M3, M4 \\
+2 & Empirical characterization (Phase 0) & Phase 0 report & M3 \\
+3 & Synthetic network generation & Synthetic Parquet files & M6 \\
+4 & Framework implementation & Python package + smoke test & M5, M6 \\
+5 & Comparison baseline implementation & Verified baseline code & M6 \\
+6 & Pilot validation & Pilot report on Moreno & M7 \\
+7 & Full validation and reporting & Validation report & Publication / release \\
+\bottomrule
+\end{tabular}
+\caption{Milestone dependency structure. Each milestone's completion gates the start of one or more later milestones.}
+\label{tab:milestones}
+\end{table}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
