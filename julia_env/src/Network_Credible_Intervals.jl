@@ -63,6 +63,7 @@ module Network_Credible_Intervals
            local_weighted_reciprocity,
            local_clustering_coefficient,
            global_clustering_coefficient,
+           _triad_census_layered,
            triad_census,
            largest_bicomponent_proportion,
            tau_statistic,

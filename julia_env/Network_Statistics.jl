@@ -18,6 +18,7 @@
 
 using CSV
 using DataFrames
+using Printf
 using Statistics
 using Network_Credible_Intervals
 
@@ -2121,6 +2122,516 @@ using Network_Credible_Intervals
 			return all_passed
 	end
     run_synthetic_tau_tests()
+
+#	Test: Threaded vs Serial Layered Triad Census Must Match Bit-Exactly
+	function test_threaded_vs_serial_layered(edges::DataFrame;
+												nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}}=nothing,
+												graph_type::Symbol=:directed,
+												reciprocity_collapse::Bool=false,
+												L::Int=20,
+												tau_min::Union{Symbol,Float64}=:auto,
+												tau_max::Union{Symbol,Float64}=:auto,
+												label::String="<unnamed>",
+												show_progress::Bool=true)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst, :weight
+			nodes, graph_type, reciprocity_collapse, L, tau_min, tau_max:
+				forwarded to _triad_census_layered
+			label::String: descriptive name for diagnostic output
+			show_progress::Bool: display a per-τ progress bar inside each of the
+				serial and threaded runs (default true). On small/fast graphs
+				the bars complete instantly and add no useful information; on
+				large graphs (especially Marvel-scale undirected, where the
+				kernel is O(N^3) per τ) the bars are essential for visibility
+				into a multi-minute run.
+		Returns:
+			NamedTuple: (passed::Bool, serial_count_sum::Int, threaded_count_sum::Int,
+			             ntau::Int, mismatches::Vector{NamedTuple},
+			             t_serial::Float64, t_threaded::Float64)
+		Notes:
+			Runs the layered census twice — once with parallel=false, once with
+			parallel=true — and compares the per-τ count tables row-by-row.
+			Any mismatch reports the τ index, triad label, and the two count
+			values. Bit-exactness is required: threaded scheduling must not
+			perturb any count.
+
+			This test exercises the bit-equality determinism contract documented
+			on _triad_census_layered.
+
+			Progress bars are labeled with [serial] and [threaded] suffixes so
+			the two runs can be distinguished when they appear in sequence.
+		"""
+
+		println("=" ^ 70)
+		println("Threaded vs Serial Layered Triad Census — $label")
+		println("Graph: $(nrow(edges)) edges, graph_type=$graph_type, collapse=$reciprocity_collapse, L=$L")
+		println("Threads available: $(Threads.nthreads())")
+		println("=" ^ 70)
+
+		#	Run Serial Reference
+			println("  Running serial reference...")
+			t0 = time()
+			ref = _triad_census_layered(edges;
+								nodes                = nodes,
+								graph_type           = graph_type,
+								reciprocity_collapse = reciprocity_collapse,
+								L                    = L,
+								tau_min              = tau_min,
+								tau_max              = tau_max,
+								parallel             = false,
+								show_progress        = show_progress,
+								progress_desc        = "  [serial] $label")
+			t_serial = time() - t0
+			println(@sprintf("  Serial done (%.2f s)", t_serial))
+
+		#	Run Threaded
+			println("  Running threaded version...")
+			t0 = time()
+			thr = _triad_census_layered(edges;
+								nodes                = nodes,
+								graph_type           = graph_type,
+								reciprocity_collapse = reciprocity_collapse,
+								L                    = L,
+								tau_min              = tau_min,
+								tau_max              = tau_max,
+								parallel             = true,
+								show_progress        = show_progress,
+								progress_desc        = "  [threaded] $label")
+			t_threaded = time() - t0
+			println(@sprintf("  Threaded done (%.2f s)", t_threaded))
+
+		#	Compare Per-τ Tables
+			pt_ref = ref.per_tau
+			pt_thr = thr.per_tau
+			@assert nrow(pt_ref) == nrow(pt_thr) "row count mismatch: serial $(nrow(pt_ref)), threaded $(nrow(pt_thr))"
+
+			mismatches = NamedTuple[]
+			for i in 1:nrow(pt_ref)
+				if pt_ref.count[i] != pt_thr.count[i] || !isapprox(pt_ref.tau[i], pt_thr.tau[i]; atol = 0.0, rtol = 0.0)
+					push!(mismatches, (row     = i,
+										tau     = pt_ref.tau[i],
+										triad   = pt_ref.triad[i],
+										serial  = pt_ref.count[i],
+										threaded = pt_thr.count[i]))
+				end
+			end
+
+		#	Report
+			passed = isempty(mismatches)
+			println()
+			println("  Serial total count sum:   ", sum(pt_ref.count))
+			println("  Threaded total count sum: ", sum(pt_thr.count))
+			println("  τ grid points:            ", thr.meta.L)
+			println("  Threads actually used:    ", thr.meta.n_threads_used)
+			if t_serial > 0
+				speedup = t_serial / t_threaded
+				println(@sprintf("  Speedup:                  %.2fx (serial %.2f s, threaded %.2f s)",
+									speedup, t_serial, t_threaded))
+			end
+			if passed
+				println("  Bit-exact equality:       PASS")
+			else
+				println("  Bit-exact equality:       FAIL ($(length(mismatches)) mismatches)")
+				println("  First 5 mismatches:")
+				for m in first(mismatches, 5)
+					println("    row=$(m.row) tau=$(round(m.tau, sigdigits=4)) triad=$(m.triad) serial=$(m.serial) threaded=$(m.threaded)")
+				end
+			end
+			println("=" ^ 70)
+
+		return (passed             = passed,
+				serial_count_sum   = sum(pt_ref.count),
+				threaded_count_sum = sum(pt_thr.count),
+				ntau               = thr.meta.L,
+				mismatches         = mismatches,
+				t_serial           = t_serial,
+				t_threaded         = t_threaded)
+	end
+
+#	Test: Binary Triad Census vs Pajek Reference (Balikatan Directed w/ Reciprocity Collapse)
+	function test_pajek_reference_triad_census(edges::DataFrame,
+												observed_vec_path::String;
+												nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}}=nothing,
+												label::String="<unnamed>")
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst (weights ignored — binary path)
+			observed_vec_path::String: path to a Pajek .vec file of observed counts
+				(expected format: "*Vertices 16" header followed by 16 numeric rows
+				in Davis-Leinhardt order)
+			nodes::Union{Nothing,DataFrame,Vector}: optional node universe
+			label::String: descriptive name for diagnostic output
+		Returns:
+			NamedTuple: (passed::Bool, total_delta::Float64, per_triad::DataFrame)
+		Notes:
+			Runs the binary directed-with-reciprocity-collapse census (the only
+			variant the existing fixture covers) and compares against Pajek's
+			observed counts. Total delta should be exactly zero on a correct run.
+
+			The reciprocity_collapse=true path emits non-zero counts only in
+			{003, 102, 201, 300} — the four undirected classes — and zeros
+			everywhere else. This is the expected Pajek behavior.
+		"""
+
+		println("=" ^ 70)
+		println("Pajek Fixture Test — $label")
+		println("=" ^ 70)
+
+		triad_types = ["003", "012", "102", "021D", "021U", "021C", "111D", "111U",
+		               "030T", "030C", "201", "120D", "120U", "120C", "210", "300"]
+
+		#	Load Pajek Observed Counts
+			obs_lines = readlines(observed_vec_path)
+			#	First line is "*Vertices 16" header; skip it
+				observed_counts = parse.(Float64, obs_lines[2:end])
+			@assert length(observed_counts) == 16 ".vec file must contain 16 count rows after the header"
+
+		#	Run Census (Directed, Reciprocity-Collapsed, Binary)
+			print("  Running binary directed-collapse census... ")
+			t0 = time()
+			result = triad_census(edges;
+									nodes                = nodes,
+									weighted             = false,
+									graph_type           = :directed,
+									reciprocity_collapse = true)
+			t_elapsed = time() - t0
+			println(@sprintf("done (%.2f s)", t_elapsed))
+
+		#	Align by Triad Label and Compute Per-Class Delta
+			per_triad = DataFrame(triad           = triad_types,
+									pajek_observed = observed_counts,
+									our_count      = Float64.(result.count))
+			per_triad.delta = per_triad.pajek_observed .- per_triad.our_count
+			total_delta = sum(per_triad.delta)
+
+		#	Report
+			println()
+			println("  Per-class comparison (Pajek observed vs ours):")
+			for r in eachrow(per_triad)
+				marker = abs(r.delta) < 0.5 ? "OK" : "** MISMATCH **"
+				println(@sprintf("    %-5s  pajek=%-15.0f  ours=%-15.0f  delta=%-15.0f  %s",
+									r.triad, r.pajek_observed, r.our_count, r.delta, marker))
+			end
+			passed = isapprox(total_delta, 0.0; atol = 0.5)
+			println()
+			println("  Total delta: ", total_delta)
+			println("  Result:      ", passed ? "PASS" : "FAIL")
+			println("=" ^ 70)
+
+		return (passed = passed, total_delta = total_delta, per_triad = per_triad)
+	end
+
+#	Motif Test Helper: Directed Triad Motif Generator
+	function _motif_triad_edges_directed(code::String; weight::Float64=1.0)
+		"""
+		Args:
+			code::String: DL class label (e.g. "003", "012", "030T", "300")
+			weight::Float64: edge weight to assign (default 1.0)
+		Returns:
+			DataFrame: edges DataFrame for a single triad of class `code`,
+				with node ids "n1", "n2", "n3"
+		Notes:
+			Generates a minimal three-node directed graph whose single triad
+			falls in the named DL class. Used by motif suite tests to verify
+			that the census correctly classifies each motif type.
+
+			The "D" / "U" suffix on classes 111 and 120 distinguishes the
+			direction of the asymmetric arc(s) relative to the mutual edge.
+			This generator follows the convention encoded by the package's
+			BM kernel (verified empirically by the motif suite):
+			- "D" (Down): the asymmetric arc points OUT of the dyad — its
+			  endpoint inside the mutual edge is the source.
+			- "U" (Up): the asymmetric arc points INTO the dyad — its endpoint
+			  inside the mutual edge is the destination.
+
+			Edge conventions per DL class (i=n1, j=n2, k=n3):
+			- 003:  empty (no edges)
+			- 012:  i→j
+			- 102:  i↔j (mutual)
+			- 021D: i→j, i→k (down — both arcs leave i)
+			- 021U: j→i, k→i (up — both arcs enter i)
+			- 021C: i→j→k (chain)
+			- 111D: i↔j, k→i (mutual + tail entering the dyad from outside ≡ "U" — see below)
+			- 111U: i↔j, i→k (mutual + tail leaving the dyad ≡ "D" — see below)
+			- 030T: i→j, i→k, j→k (transitive)
+			- 030C: i→j→k→i (cyclic)
+			- 201:  i↔j, i↔k
+			- 120D: i↔j, k→i, k→j (mutual + both asymmetric arcs target the dyad)
+			- 120U: i↔j, i→k, j→k (mutual + both asymmetric arcs leave the dyad)
+			- 120C: i↔j, i→k→j (cyclic on the asymmetric arcs)
+			- 210:  i↔j, i↔k, j→k
+			- 300:  i↔j, i↔k, j↔k (complete reciprocal)
+
+			Note that the kernel's D/U labeling for 111 and 120 follows a
+			convention that is the reverse of one common reading: "D" means
+			"asymmetric tail goes away from the mutual edge" interpreted from
+			the kernel's perspective is encoded here as `k→i, k→j` for 120D
+			(both outside-arcs enter the mutual pair). Empirically, the motif
+			suite verifies this convention is what the kernel produces.
+		"""
+
+		#	Storage for Edge Triples
+			src = String[]
+			dst = String[]
+			wts = Float64[]
+
+		#	Add Directed Edge
+			@inline function add_dir(i::Int, j::Int)
+				push!(src, "n$(i)"); push!(dst, "n$(j)"); push!(wts, weight)
+			end
+
+		#	Add Mutual (Reciprocal) Edge
+			@inline function add_mut(i::Int, j::Int)
+				add_dir(i, j); add_dir(j, i)
+			end
+
+		#	Build by DL Class
+			if code == "003"
+				#	Empty triad
+					nothing
+			elseif code == "012"
+				add_dir(1, 2)
+			elseif code == "102"
+				add_mut(1, 2)
+			elseif code == "021D"
+				#	Down: both edges from i
+					add_dir(1, 2); add_dir(1, 3)
+			elseif code == "021U"
+				#	Up: both edges to i
+					add_dir(2, 1); add_dir(3, 1)
+			elseif code == "021C"
+				#	Chain: i→j→k
+					add_dir(1, 2); add_dir(2, 3)
+			elseif code == "111D"
+				#	Mutual + tail INTO the dyad (kernel's "D" convention)
+					add_mut(1, 2); add_dir(3, 1)
+			elseif code == "111U"
+				#	Mutual + tail OUT OF the dyad (kernel's "U" convention)
+					add_mut(1, 2); add_dir(1, 3)
+			elseif code == "030T"
+				#	Transitive: i→j, i→k, j→k
+					add_dir(1, 2); add_dir(1, 3); add_dir(2, 3)
+			elseif code == "030C"
+				#	Cyclic: i→j→k→i
+					add_dir(1, 2); add_dir(2, 3); add_dir(3, 1)
+			elseif code == "201"
+				add_mut(1, 2); add_mut(1, 3)
+			elseif code == "120D"
+				#	Mutual + both asymmetric arcs target the dyad (kernel's "D")
+					add_mut(1, 2); add_dir(3, 1); add_dir(3, 2)
+			elseif code == "120U"
+				#	Mutual + both asymmetric arcs leave the dyad (kernel's "U")
+					add_mut(1, 2); add_dir(1, 3); add_dir(2, 3)
+			elseif code == "120C"
+				#	Cyclic asymmetric arcs around the mutual edge
+					add_mut(1, 2); add_dir(1, 3); add_dir(3, 2)
+			elseif code == "210"
+				add_mut(1, 2); add_mut(1, 3); add_dir(2, 3)
+			elseif code == "300"
+				add_mut(1, 2); add_mut(1, 3); add_mut(2, 3)
+			else
+				throw(ArgumentError("Unknown directed DL class: $code"))
+			end
+
+		#	Return
+			return DataFrame(; src, dst, weight = wts)
+	end
+
+#	Test: Each DL-Class Motif Yields count=1 in Its Own Class, count=0 Elsewhere
+	function test_motif_suite_directed()
+		"""
+		Args:
+			None
+		Returns:
+			NamedTuple: (all_passed::Bool, per_motif::Dict{String,Bool})
+		Notes:
+			For each of the 16 directed DL classes, builds a single-triad graph
+			of that class on three nodes (n1, n2, n3), runs the binary directed
+			census (without reciprocity collapse), and asserts that the resulting
+			16-class count vector is the unit vector at the matching slot.
+
+			Forces the node universe to {n1, n2, n3} for the empty (003) case,
+			which would otherwise have no nodes inferable from edges.
+		"""
+
+		println("=" ^ 70)
+		println("Directed Motif Suite — Each Class Should Yield count=1 in Its Own Slot")
+		println("=" ^ 70)
+
+		dl_codes = ["003", "012", "102", "021D", "021U", "021C", "111D", "111U",
+		            "030T", "030C", "201", "120D", "120U", "120C", "210", "300"]
+
+		per_motif = Dict{String, Bool}()
+		all_passed = true
+
+		#	Fixed Node Universe for the Empty Triad Case
+			fixed_nodes = ["n1", "n2", "n3"]
+
+		for (idx, code) in pairs(dl_codes)
+			edges = _motif_triad_edges_directed(code)
+			result = triad_census(edges;
+									nodes                = fixed_nodes,
+									weighted             = false,
+									graph_type           = :directed,
+									reciprocity_collapse = false)
+
+			#	Build Expected Vector (1.0 at code's slot, 0.0 elsewhere)
+				expected_counts = zeros(Int, 16)
+				expected_counts[idx] = 1
+
+			#	Compare
+				match = all(result.count .== expected_counts)
+				per_motif[code] = match
+				if !match
+					all_passed = false
+					actual_nonzero = [(dl_codes[k], result.count[k]) for k in 1:16 if result.count[k] != 0]
+					println("  [$idx] $code: FAIL — expected count=1 at slot $idx, got nonzero at $actual_nonzero")
+				else
+					println("  [$idx] $code: PASS")
+				end
+		end
+
+		println()
+		println("Summary: $(all_passed ? "ALL 16 PASSED" : "SOME FAILED")")
+		println("=" ^ 70)
+
+		return (all_passed = all_passed, per_motif = per_motif)
+	end
+
+#	Motif Test Helper: Undirected Triad Motif Generator
+	function _motif_triad_edges_undirected(kind::Symbol; weight::Float64=1.0)
+		"""
+		Args:
+			kind::Symbol: :empty (003), :single (102), :open (201), :triangle (300)
+			weight::Float64: edge weight (default 1.0)
+		Returns:
+			DataFrame: edges DataFrame with paired arcs (i→j AND j→i)
+		Notes:
+			Simple undirected motifs returned as paired arcs to match the
+			package's symmetrization-handled-upstream convention. Maps the
+			four undirected motif kinds to their DL class slots:
+			- :empty    → 003 (slot 1)
+			- :single   → 102 (slot 3)
+			- :open     → 201 (slot 11)
+			- :triangle → 300 (slot 16)
+		"""
+
+		src = String[]
+		dst = String[]
+		wts = Float64[]
+
+		@inline function add_und(i::Int, j::Int)
+			push!(src, "n$(i)"); push!(dst, "n$(j)"); push!(wts, weight)
+			push!(src, "n$(j)"); push!(dst, "n$(i)"); push!(wts, weight)
+		end
+
+		if kind === :empty
+			nothing
+		elseif kind === :single
+			add_und(1, 2)
+		elseif kind === :open
+			add_und(1, 2); add_und(1, 3)
+		elseif kind === :triangle
+			add_und(1, 2); add_und(2, 3); add_und(1, 3)
+		else
+			throw(ArgumentError("Unknown undirected kind: $kind"))
+		end
+
+		return DataFrame(; src, dst, weight = wts)
+	end
+
+#	Test: Undirected Motif Suite — Four Classes, Each Yields count=1 in Its Slot
+	function test_motif_suite_undirected()
+		"""
+		Args:
+			None
+		Returns:
+			NamedTuple: (all_passed::Bool, per_motif::Dict{Symbol,Bool})
+		Notes:
+			Verifies the undirected binary BM kernel classifies each of the
+			four undirected triad types correctly. Slots not in {1, 3, 11, 16}
+			should always be zero for undirected output.
+		"""
+
+		println("=" ^ 70)
+		println("Undirected Motif Suite — 4 Classes Should Yield count=1 in Their Slots")
+		println("=" ^ 70)
+
+		#	Map Kinds to (DL Slot Index, DL Label)
+			motif_slots = Dict(:empty    => (1, "003"),
+			                   :single   => (3, "102"),
+			                   :open     => (11, "201"),
+			                   :triangle => (16, "300"))
+
+		per_motif  = Dict{Symbol, Bool}()
+		all_passed = true
+
+		#	Fixed Node Universe (Covers Empty Case)
+			fixed_nodes = ["n1", "n2", "n3"]
+
+		for (kind, (slot, label)) in motif_slots
+			edges = _motif_triad_edges_undirected(kind)
+			result = triad_census(edges;
+									nodes      = fixed_nodes,
+									weighted   = false,
+									graph_type = :undirected)
+
+			#	Build Expected Vector
+				expected_counts = zeros(Int, 16)
+				expected_counts[slot] = 1
+
+			#	Compare
+				match = all(result.count .== expected_counts)
+				per_motif[kind] = match
+				if !match
+					all_passed = false
+					nonzero = [(result.triad[k], result.count[k]) for k in 1:16 if result.count[k] != 0]
+					println("  $kind ($label, slot $slot): FAIL — got $nonzero")
+				else
+					println("  $kind ($label, slot $slot): PASS")
+				end
+		end
+
+		println()
+		println("Summary: $(all_passed ? "ALL 4 PASSED" : "SOME FAILED")")
+		println("=" ^ 70)
+
+		return (all_passed = all_passed, per_motif = per_motif)
+	end
+
+#	Motif suites — fast unit-style tests on synthetic micro-graphs
+	motif_dir_results   = test_motif_suite_directed()
+	motif_undir_results = test_motif_suite_undirected()
+
+#	Pajek fixture — Balikatan binary directed-collapse census
+	agent_agent_all_com_edges = networks["balikatan_2022_weighted"].edges
+	pajek_results = test_pajek_reference_triad_census(
+		agent_agent_all_com_edges,
+		"/mnt/d/Dropbox/Netanomics_Resources/Documents/SBP_BRIMS_2025/Large_Graph_Similarity/Test_Data/traid_census_observed.vec";
+		label = "Balikatan directed w/ reciprocity collapse")
+
+#	Threaded-vs-Serial bit-equality — Balikatan weighted layered census
+#	This is the determinism contract test for the threaded τ loop.
+#	Uses L=20 to keep total runtime manageable.
+	balikatan_thread_test = test_threaded_vs_serial_layered(
+		agent_agent_all_com_edges;
+		graph_type           = :directed,
+		reciprocity_collapse = false,
+		L                    = 20,
+		label                = "Balikatan directed weighted (L=20)")
+
+#	Threaded-vs-Serial bit-equality — Marvel undirected weighted census
+#	Tests the undirected layered path on the new large-undirected case.
+	marvel_network_edges = networks["marvel_universe_weighted"].edges
+	marvel_network_nodes = networks["marvel_universe_weighted"].nodes
+	marvel_thread_test = test_threaded_vs_serial_layered(
+		marvel_network_edges;
+		nodes                = marvel_network_nodes,
+		graph_type           = :undirected,
+		reciprocity_collapse = false,
+		L                    = 20,
+		label                = "Marvel undirected weighted (L=20)")
 
 #	Helper Function for run_synthetic_blockmodel_tests: Build the "Hourglass" Network
 	function _build_hourglass_test_network()

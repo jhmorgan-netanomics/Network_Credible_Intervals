@@ -4,6 +4,7 @@ module network_statistics
     using DataFrames
     using SparseArrays
     using LinearAlgebra
+    using ProgressMeter
     using Random
     using Statistics
 
@@ -2412,7 +2413,7 @@ module network_statistics
 			return (membership = membership, sizes = sizes)
 	end
 
-#	Largest Weakly Connected Component as a Proportion of N
+#	LARGEST WEAKLY CONNECTED COMPONENT AS A PROPORTION OF N
 	function largest_component_proportion(edges::DataFrame;
 	                                     nodes::Union{Nothing, DataFrame, AbstractVector{<:AbstractString}} = nothing,
 	                                     directed::Bool = true,
@@ -2529,7 +2530,7 @@ module network_statistics
 	`largest_bicomponent_proportion` (Section 6), `centralization`
 	""" largest_component_proportion
 
-#	Global Reciprocity
+#	GLOBAL RECIPROCITY
 	function reciprocity(edges::DataFrame;
 	                    weighted::Bool = false,
 	                    agg_func::Union{Function, Nothing} = nothing,
@@ -2721,7 +2722,7 @@ module network_statistics
 	`local_weighted_reciprocity`
 	""" reciprocity
 
-#	Local Weighted Reciprocity (Squartini Per-Node)
+#	LOCAL WEIGHTED RECIPROCITY (Squartini Per-Node)
 	function local_weighted_reciprocity(edges::DataFrame;
 	                                   weighted::Bool = true,
 	                                   agg_func::Union{Function, Nothing} = nothing,
@@ -2972,7 +2973,7 @@ module network_statistics
 			return (closed_triplets, total_triplets)
 	end
 
-#	Local Clustering Coefficient & Ego Density (Node Level)
+#	LOCAL CLUSTERING COEFFICIENT & EGO DENSITY (Node Level)
 	function local_clustering_coefficient(edges::DataFrame;
 	                                     directed::Bool = true,
 	                                     method::Symbol = :local_clustering,
@@ -3227,7 +3228,7 @@ module network_statistics
 	`global_clustering_coefficient`
 	""" local_clustering_coefficient
 
-#	Global Clustering Coefficient
+#	GLOBAL CLUSTERING COEFFICIENT
 	function global_clustering_coefficient(edges::DataFrame;
 	                                      directed::Bool = true,
 	                                      method::Symbol = :average,
@@ -3393,7 +3394,7 @@ module network_statistics
 	`local_clustering_coefficient`, `triad_census`
 	""" global_clustering_coefficient
 
-# Triad census (port from Large_Graph_Similarity.jl)
+# TRIAD CENSUS
 # Implements Batagelj-Mrvar (2001) via RSiena's dyad-driven approach.
 # Triad classes follow Davis-Leinhardt order:
 #   003, 012, 102, 021D, 021U, 021C, 111D, 111U,
@@ -3610,6 +3611,48 @@ module network_statistics
 			return (counts = tc, labels = labels)
 	end
 
+#	Helper Function for triad_census: Normalize Undirected BM Output to counts16 Vector
+	function _bm_undir_counts16(Au::SparseMatrixCSC{Float64,Int})
+		"""
+		Args:
+			Au::SparseMatrixCSC: symmetric 0/1, zero diagonal (undirected simple graph)
+		Returns:
+			Vector{Int}: length-16 counts in Davis-Leinhardt order
+		Notes:
+			Wraps _triad_census_bm_undirected to provide a consistent
+			Vector{Int} return regardless of which return-shape variant the
+			underlying kernel uses. Handles either:
+			  - Vector{Int} (current package convention)
+			  - NamedTuple(counts = ::Vector{Int}, labels = ...) (legacy)
+			  - NamedTuple(counts16 = ::Vector{Int}) (older legacy from the
+			    source Large_Graph_Similarity package)
+			Only {003, 102, 201, 300} can be non-zero for undirected graphs;
+			all other slots are zero.
+
+			This normalizer exists so that callers (notably _triad_census_layered)
+			can treat directed and undirected outputs uniformly: a length-16
+			Vector{Int} in DL order regardless of the kernel's choice of
+			return shape.
+		"""
+
+		#	Call the Undirected BM Kernel
+			res = _triad_census_bm_undirected(Au)
+
+		#	Normalize to Vector{Int}
+			if res isa AbstractVector
+				#	Already a length-16 vector
+					return res
+			elseif hasproperty(res, :counts)
+				#	NamedTuple with :counts (current package convention)
+					return res.counts
+			elseif hasproperty(res, :counts16)
+				#	NamedTuple with :counts16 (older legacy from Large_Graph_Similarity)
+					return res.counts16
+			else
+				throw(ArgumentError("_bm_undir_counts16: unrecognized return shape from _triad_census_bm_undirected: $(typeof(res))"))
+			end
+	end
+
 #	Helper Function for triad_census: BM Triad Census (Undirected Binary)
 	function _triad_census_bm_undirected(Au::SparseMatrixCSC{Float64, Int})
 		"""
@@ -3665,28 +3708,495 @@ module network_statistics
 			return (counts = counts, labels = _dl_labels())
 	end
 
-#	Public Triad Census
-	function triad_census(edges::DataFrame;
-	                    nodes::Union{Nothing, DataFrame, AbstractVector{<:AbstractString}} = nothing,
-	                    weighted::Bool = false,
-	                    graph_type::Symbol = :directed,
-	                    reciprocity_collapse::Bool = false)
+#	Helper Function for triad_census: Compute Log-Spaced τ Grid
+	function _tau_grid(weights::Vector{Float64};
+						L::Int=40,
+						tau_min::Union{Symbol,Float64}=:auto,
+						tau_max::Union{Symbol,Float64}=:auto)
 		"""
 		Args:
-			edges::DataFrame: edge list with :src, :dst, optionally :weight (ignored)
-			nodes::Union{Nothing, DataFrame, Vector}: optional fixed node universe
-			weighted::Bool: must be false in this commit (binarized BM census).
-				The weighted/layered tau-thresholding path is not ported.
-				Passing true throws ArgumentError.
-			graph_type::Symbol: :directed (default) or :undirected
-			reciprocity_collapse::Bool: :directed only — when true, treat mutual
-				arcs i↔j as a single tie by setting A = max(A, A')
+			weights::Vector{Float64}: positive edge weights (zeros excluded)
+			L::Int: number of τ points (default 40)
+			tau_min::Union{:auto,Float64}: lower τ bound (default :auto = max(eps(), q005))
+			tau_max::Union{:auto,Float64}: upper τ bound (default :auto = maximum weight)
 		Returns:
-			DataFrame: columns [triad, count] in Davis-Leinhardt order
+			Vector{Float64}: log-spaced τ values in [tau_min, tau_max]
 		Notes:
-			Implements Batagelj-Mrvar (2001) binary triad census in the
-			Davis-Leinhardt 16-class order. For undirected graphs only
-			{003, 102, 201, 300} are non-zero.
+			Builds the threshold grid used by _triad_census_layered. The grid is
+			log-spaced because triadic structure typically responds to weight
+			thresholds multiplicatively, not additively — doubling τ has a
+			characteristically different effect than adding a constant.
+
+			:auto defaults are conservative: tau_min uses the 0.5%-quantile of
+			positive weights (clipped from below by eps()) to avoid wasting
+			grid points on noise; tau_max uses the actual maximum to ensure
+			the grid covers the full weight range.
+
+			If all weights are equal (degenerate grid), returns the singleton
+			value. If L ≤ 1, returns [tau_max] (single threshold).
+		"""
+
+		#	Filter to Positive Weights Only
+			wpos = filter(>(0.0), weights)
+			if isempty(wpos)
+				return [1.0]  # no positive weights; degenerate grid
+			end
+
+		#	Compute Bounds
+			wmin = minimum(wpos)
+			wmax = maximum(wpos)
+			tmin = tau_min === :auto ? max(eps(), quantile(wpos, 0.005)) : Float64(tau_min)
+			tmax = tau_max === :auto ? wmax : Float64(tau_max)
+			tmin = min(max(tmin, wmin), tmax)
+
+		#	Degenerate Grid Cases
+			if L <= 1 || tmin ≈ tmax
+				return [tmax]
+			end
+
+		#	Build Log-Spaced Grid
+			log10t = range(log10(tmin), log10(tmax), length=L)
+			return 10.0 .^ collect(log10t)
+	end
+
+#	Helper Function for triad_census: Threshold Weighted Adjacency at τ (In-Place)
+	function _threshold_to_binary!(A::SparseMatrixCSC{Float64,Int}, tau::Float64)
+		"""
+		Args:
+			A::SparseMatrixCSC{Float64,Int}: weighted adjacency (modified in-place)
+			tau::Float64: threshold (keep edges with weight ≥ τ)
+		Returns:
+			SparseMatrixCSC{Float64,Int}: 0/1 per-direction; self-loops removed
+		Notes:
+			Sets entries < τ to 0; entries ≥ τ to 1. Drops self-loops and
+			structural zeros after thresholding. Used by _prepare_binary_for_mode
+			to build per-τ binary matrices in the layered census.
+		"""
+
+		#	Iterate Over CSC Nonzeros
+			vals = nonzeros(A)
+			rows = rowvals(A)
+			n    = size(A, 1)
+			@inbounds for j in 1:size(A, 2)
+				for idx in nzrange(A, j)
+					i = rows[idx]
+					v = vals[idx]
+					vals[idx] = (i != j && v >= tau) ? 1.0 : 0.0
+				end
+			end
+
+		#	Drop Zeros and Return
+			dropzeros!(A)
+			return A
+	end
+
+#	Helper Function for triad_census: Canonicalize Undirected Binary Matrix
+	function _canonicalize_undirected_binary(A::SparseMatrixCSC{Float64,Int})
+		"""
+		Args:
+			A::SparseMatrixCSC: intended undirected 0/1 adjacency (may be asymmetric in storage)
+		Returns:
+			SparseMatrixCSC{Float64,Int}: binary, zero-diagonal, symmetric, canonical sparsity
+		Notes:
+			Unions A and A', gathers unordered edge set {(i,j), i<j}, then mirrors
+			to both sides. Ensures identical nnz / sparsity pattern for logically
+			equivalent inputs — important for the undirected census so that two
+			matrices representing the same undirected graph produce identical
+			triad counts regardless of input storage convention.
+		"""
+
+		#	Validation
+			n = size(A, 1)
+			@assert size(A, 2) == n "A must be square"
+
+		#	Union with Transpose, Zero Diagonal
+			U = max.(A, A')
+			@inbounds for i in 1:n
+				U[i, i] = 0.0
+			end
+			dropzeros!(U)
+
+		#	Gather Unordered Pairs (i < j) That Are Present
+			rows = rowvals(U)
+			vals = nonzeros(U)
+			pairs_i = Int[]
+			pairs_j = Int[]
+
+			@inbounds for j in 1:n
+				for idx in nzrange(U, j)
+					i = rows[idx]
+					if (i < j) && (vals[idx] != 0.0)
+						push!(pairs_i, i)
+						push!(pairs_j, j)
+					end
+				end
+			end
+
+		#	Rebuild Symmetric 0/1 from Unordered Pairs
+			I = Int[]
+			J = Int[]
+			V = Float64[]
+			@inbounds for t in eachindex(pairs_i)
+				i = pairs_i[t]
+				j = pairs_j[t]
+				push!(I, i); push!(J, j); push!(V, 1.0)  # i → j
+				push!(I, j); push!(J, i); push!(V, 1.0)  # j → i
+			end
+
+		#	Return Canonical Symmetric 0/1
+			return sparse(I, J, V, n, n)
+	end
+
+#	Helper Function for triad_census: Prepare Per-τ Binary Matrix for Chosen graph_type
+	function _prepare_binary_for_mode(Aw::SparseMatrixCSC{Float64,Int},
+										tau::Float64,
+										graph_type::Symbol,
+										reciprocity_collapse::Bool)
+		"""
+		Args:
+			Aw::SparseMatrixCSC{Float64,Int}: weighted adjacency (directed)
+			tau::Float64: threshold
+			graph_type::Symbol: :directed or :undirected
+			reciprocity_collapse::Bool: only used for :directed
+		Returns:
+			SparseMatrixCSC{Float64,Int}: binary simple matrix prepared for the BM kernel
+		Notes:
+			:directed → threshold per-direction to 0/1; optionally collapse
+				reciprocity by max(A, A').
+			:undirected → symmetrize weights by SUM first (Aw .+ Aw'), threshold
+				once with a small epsilon, then canonicalize to eliminate
+				sparsity-pattern differences from input storage variations.
+
+			The sum-before-threshold convention for undirected aligns with
+			s-core semantics: an unordered edge {i,j} carries the combined
+			weight from both directions, and the threshold is applied to that
+			summed weight.
+		"""
+
+		if graph_type === :directed
+			#	Threshold Directed Weights to 0/1 (Per-Direction)
+				A = copy(Aw)
+				_threshold_to_binary!(A, tau)
+
+			#	Optional Compatibility Collapse (Pajek-Like)
+				if reciprocity_collapse
+					A = max.(A, A')
+					_make_directed_simple!(A)
+				end
+
+			#	Return Directed Binary
+				return A
+
+		elseif graph_type === :undirected
+			#	Symmetrize Weights by SUM First (Aligns with s-Core Semantics)
+				AU = Aw .+ Aw'
+				n  = size(AU, 1)
+				@inbounds for i in 1:n
+					AU[i, i] = 0.0
+				end
+				dropzeros!(AU)
+
+			#	Threshold Undirected Weights to 0/1 Once
+				#	Use a small ε to tolerate floating-point rounding from the
+				#	symmetrization sum; treats w_sum ≥ τ − ε as "keep this edge."
+					ε    = max(eps(tau), 1e-12)
+					vals = nonzeros(AU)
+					rows = rowvals(AU)
+					@inbounds for j in 1:n
+						for idx in nzrange(AU, j)
+							i = rows[idx]
+							v = vals[idx]
+							vals[idx] = (i != j && v + ε >= tau) ? 1.0 : 0.0
+						end
+					end
+					dropzeros!(AU)
+
+			#	Canonicalize to Eliminate Sparsity-Pattern Differences
+				AU = _canonicalize_undirected_binary(AU)
+
+			#	Return Undirected Binary
+				return AU
+
+		else
+			throw(ArgumentError("graph_type must be :directed or :undirected"))
+		end
+	end
+
+#	Helper Function for triad_census: Convert 16-Class Count Vector to Density by nC3
+	function _to_density_16!(counts::Vector{Int}, n::Int)
+		"""
+		Args:
+			counts::Vector{Int}: 16 triad counts in DL order
+			n::Int: number of nodes
+		Returns:
+			Vector{Float64}: densities (count divided by C(n,3))
+		Notes:
+			Returns zeros if n < 3 (no triads possible). Otherwise returns
+			Float64.(counts) ./ nC3 where nC3 = n*(n-1)*(n-2)/6.
+
+			The trailing ! is a holdover convention from a prior version that
+			modified in place; the current implementation allocates a new
+			Vector{Float64} and returns it. Kept for caller compatibility.
+		"""
+
+		#	Compute Total Possible Triads
+			total_triads = n < 3 ? 0 : (n * (n - 1) * (n - 2)) ÷ 6
+
+		#	Handle Trivial Case
+			if total_triads == 0
+				return zeros(Float64, length(counts))
+			end
+
+		#	Compute Densities
+			return Float64.(counts) ./ total_triads
+	end
+
+#	Helper Function for triad_census: AUMC over log10(τ) via Trapezoid Rule
+	function _aumc_logtau(tau::Vector{Float64}, y::Vector{Float64})
+		"""
+		Args:
+			tau::Vector{Float64}: τ grid (strictly increasing)
+			y::Vector{Float64}: motif density at each τ
+		Returns:
+			Float64: area under y vs log10(τ) via trapezoidal integration
+		Notes:
+			Integrates the motif-density curve in log-τ space. Used by
+			_triad_census_layered to produce per-motif summary statistics
+			(AUMC_density) that capture the cumulative presence of a triad
+			class across the τ grid.
+
+			Returns 0.0 for grids with fewer than 2 points (cannot form a
+			trapezoid).
+		"""
+
+		#	Validation
+			@assert length(tau) == length(y) "tau and y must have equal length"
+
+		#	Trivial Case
+			if length(tau) < 2
+				return 0.0
+			end
+
+		#	Trapezoidal Sum in log10(τ) Space
+			xt  = log10.(tau)
+			acc = 0.0
+			@inbounds for k in 1:length(tau) - 1
+				h = xt[k + 1] - xt[k]
+				acc += 0.5 * h * (y[k] + y[k + 1])
+			end
+			return acc
+	end
+
+#	Helper Triad Census: Layered BM triad census with log-spaced τ (developer wrapper)
+	function _triad_census_layered(edges::DataFrame;
+									graph_type::Symbol = :directed,
+									reciprocity_collapse::Bool = false,
+									nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing,
+									L::Int = 40,
+									tau_min::Union{Symbol,Float64} = :auto,
+									tau_max::Union{Symbol,Float64} = :auto,
+									parallel::Bool = true,
+									show_progress::Bool = false,
+									progress_desc::Union{Nothing,String} = nothing)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst, :weight
+			graph_type::Symbol: :directed (default) or :undirected
+			reciprocity_collapse::Bool: directed-only; collapse mutual arcs (default false)
+			nodes::Union{Nothing,DataFrame,Vector}: optional node universe (includes isolates)
+			L::Int: number of τ points in the log-spaced grid (default 40)
+			tau_min::Union{Symbol,Float64}: lower τ bound (default :auto)
+			tau_max::Union{Symbol,Float64}: upper τ bound (default :auto)
+			parallel::Bool: parallelize the outer τ loop via Threads.@threads :static
+				(default true). Set false when calling from an outer threaded
+				context to avoid oversubscription, or to obtain a strictly serial
+				reference run.
+			show_progress::Bool: show a per-τ progress bar (default false). Useful
+				for long-running undirected runs on large graphs where the kernel
+				is O(N^3) per τ and total wall-clock can reach tens of minutes.
+				When parallel=true, progress is ticked from inside the threaded
+				loop under a ReentrantLock; ordering of tick events reflects
+				completion order, not τ-grid order, but the final result is
+				still folded in τ order and is bit-identical to a serial run.
+			progress_desc::Union{Nothing,String}: optional description shown on
+				the progress bar (default nothing, which produces "Triad census
+				τ-grid (graph_type=..., L=...)"). Set explicitly when displaying
+				multiple bars in sequence so they can be distinguished.
+		Returns:
+			NamedTuple: (per_tau::DataFrame, summary::DataFrame, meta::NamedTuple)
+		Notes:
+			Threading model. Each τ in the log-spaced grid runs an independent
+			BM census on its own thresholded adjacency: no shared mutable state,
+			no accumulator races, no false sharing. The outer τ loop is therefore
+			the safe and natural threading target. The BM kernels themselves
+			(_triad_census_bm_directed, _triad_census_bm_undirected) stay serial
+			under this scheme.
+
+			Determinism. Threading uses Threads.@threads :static, which assigns
+			loop iterations to threads in a fixed, deterministic partition
+			regardless of dynamic scheduling decisions. Results are pre-allocated
+			into a per-τ Vector indexed by τ position (not appended to a shared
+			Vector), so no cross-thread ordering can occur. Final results are
+			folded in τ order, producing bit-identical output regardless of
+			Threads.nthreads() and across repeated runs.
+
+			When parallel=false, the function executes the τ loop serially.
+			Set this when (a) calling from another threaded context (e.g., a
+			Monte Carlo grid that's already parallelized over network instances),
+			(b) measuring the serial baseline for performance comparison, or
+			(c) debugging.
+
+			meta.threaded reports whether the run actually used threads (requires
+			parallel=true AND Threads.nthreads() > 1 AND length(τ-grid) > 1).
+			meta.n_threads_used reports Threads.nthreads() if threaded, else 1.
+		"""
+
+		#	Build weighted adjacency once (directed)
+			Aw, _, _ = isnothing(nodes) ?
+				_graph_to_sparse_matrix(edges; weighted=true) :
+				_graph_to_sparse_matrix(edges; nodes=nodes, weighted=true)
+			n = size(Aw, 1)
+
+		#	Compute τ grid from the weights we will actually threshold
+			if graph_type === :undirected
+				AU = Aw .+ Aw'
+				@inbounds for i in 1:n; AU[i, i] = 0.0; end
+				dropzeros!(AU)
+				wvec = collect(nonzeros(AU))      # undirected (summed) weights
+			else
+				wvec = collect(nonzeros(Aw))      # directed weights
+			end
+			tgrid = _tau_grid(wvec; L=L, tau_min=tau_min, tau_max=tau_max)
+			Ntau  = length(tgrid)
+
+		#	Pre-Allocate Per-τ Count Storage (Each Slot Filled Independently)
+			#	counts_by_tau[t] holds the length-16 DL count vector for tgrid[t].
+			#	Pre-allocating by τ index — rather than appending to a shared
+			#	Vector — is what makes the threaded loop deterministic and
+			#	race-free: each thread writes only to its own slot(s).
+				counts_by_tau = Vector{Vector{Int}}(undef, Ntau)
+
+		#	Configure Progress Bar
+			#	Mirrors the leiden_community_detection progress pattern: a
+			#	Progress instance plus a ReentrantLock for thread-safe ticks.
+				use_threads = parallel && Threads.nthreads() > 1 && Ntau > 1
+				desc        = progress_desc !== nothing ? progress_desc :
+				              "Triad census τ-grid ($(string(graph_type)), L=$Ntau, " *
+				              (use_threads ? "$(Threads.nthreads()) threads" : "serial") * ")"
+				prog        = show_progress ? Progress(Ntau, desc = desc, enabled = true) : nothing
+				prog_lock   = ReentrantLock()
+
+		#	Run Census Across τ (Threaded or Serial Per `parallel` Flag)
+			if use_threads
+				#	Threaded: deterministic :static scheduling, per-τ independence
+					Threads.@threads :static for t in 1:Ntau
+						τ  = tgrid[t]
+						Ab = _prepare_binary_for_mode(Aw, τ, graph_type, reciprocity_collapse)
+						if graph_type === :directed
+							res = _triad_census_bm_directed(Ab)
+							counts_by_tau[t] = res.counts
+						else
+							#	Use normalizer to accept either Vector or NamedTuple
+								counts_by_tau[t] = _bm_undir_counts16(Ab)
+						end
+						#	Thread-Safe Progress Tick
+							if show_progress
+								lock(prog_lock) do
+									next!(prog)
+								end
+							end
+					end
+			else
+				#	Serial path: same logic, no threading overhead
+					for t in 1:Ntau
+						τ  = tgrid[t]
+						Ab = _prepare_binary_for_mode(Aw, τ, graph_type, reciprocity_collapse)
+						if graph_type === :directed
+							res = _triad_census_bm_directed(Ab)
+							counts_by_tau[t] = res.counts
+						else
+							counts_by_tau[t] = _bm_undir_counts16(Ab)
+						end
+						#	Serial Progress Tick (No Lock Needed)
+							if show_progress
+								next!(prog)
+							end
+					end
+			end
+
+		#	Fold Per-τ Counts into Per-τ Rows (Deterministic Order)
+			labels16     = _dl_labels()
+			per_tau_rows = Vector{NamedTuple}(undef, 0)
+			for t in 1:Ntau
+				τ      = tgrid[t]
+				counts = counts_by_tau[t]
+				dens   = _to_density_16!(counts, n)
+				@inbounds for k in 1:16
+					push!(per_tau_rows, (tau = τ, triad = labels16[k], count = counts[k], density = dens[k]))
+				end
+			end
+
+		#	Tidy per-τ DataFrame
+			per_tau = DataFrame(per_tau_rows)
+
+		#	Summaries: AUMC over log10(τ), peak τ and peak density per triad
+			summary_rows = Vector{NamedTuple}(undef, 0)
+			for tri in labels16
+				sub = per_tau[per_tau.triad .== tri, :]
+				if nrow(sub) == 0
+					push!(summary_rows, (triad=tri, AUMC_density=0.0, peak_tau=NaN, peak_density=0.0))
+				else
+					auc = _aumc_logtau(sub.tau, sub.density)
+					mx  = argmax(sub.density)
+					push!(summary_rows, (triad=tri, AUMC_density=auc, peak_tau=sub.tau[mx], peak_density=sub.density[mx]))
+				end
+			end
+			summary = DataFrame(summary_rows)
+
+		#	Meta
+			meta = (n                    = n,
+					L                    = Ntau,
+					tau_min              = first(tgrid),
+					tau_max              = last(tgrid),
+					graph_type           = graph_type,
+					reciprocity_collapse = reciprocity_collapse,
+					threaded             = use_threads,
+					n_threads_used       = use_threads ? Threads.nthreads() : 1)
+
+		#	Return
+			return (per_tau=per_tau, summary=summary, meta=meta)
+	end
+
+#	Triad Census (directed/undirected; binary/weighted via layered τ or single-bin)
+	function triad_census(edges::DataFrame;
+						nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}}=nothing,
+						weighted::Bool=false,
+						graph_type::Symbol=:directed,
+						reciprocity_collapse::Bool=false,
+						L::Int=20, tau_min::Float64=1.0, tau_max::Float64=maximum(ones(Float64,1)),
+						parallel::Bool=true)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst, optionally :weight
+			nodes::Union{Nothing,DataFrame,Vector}: optional node universe (includes isolates)
+			weighted::Bool: false → binary BM single-bin; true → layered BM over τ
+			graph_type::Symbol: :directed (default) or :undirected
+			reciprocity_collapse::Bool: directed-only; collapse mutual arcs (default false)
+			L, tau_min, tau_max: layered τ controls (weighted=true only)
+			parallel::Bool: weighted=true only; parallelize the outer τ loop via
+				Threads.@threads :static (default true). Has no effect on the binary
+				path (weighted=false), which is a single kernel call.
+		Returns:
+			- weighted=false: DataFrame(triad, count) in 16-class DL order
+			- weighted=true:  NamedTuple(per_tau, summary, meta) from layered census
+		Notes:
+			Threading. The binary path (weighted=false) does a single BM kernel
+			call and is unaffected by the parallel kwarg. The weighted path
+			(weighted=true) runs a τ grid and parallelizes the outer loop;
+			results are bit-identical across thread counts thanks to :static
+			scheduling and pre-allocated per-τ result storage.
+
+			See _triad_census_layered for the full threading contract.
 		"""
 
 		#	Validation
@@ -3694,85 +4204,206 @@ module network_statistics
 			if graph_type == :undirected
 				@assert !reciprocity_collapse "reciprocity_collapse applies only when graph_type == :directed"
 			end
-			if weighted
-				throw(ArgumentError(
-					"triad_census: weighted=true is not supported in this commit. " *
-					"For weighted-layered analysis, use the source Large_Graph_Similarity.jl package. " *
-					"For Phase 0 reporting, pass weighted=false (default) to binarize."
-				))
-			end
 
-		#	Binary BM Path
-			if graph_type == :directed
-				#	Build Directed Simple 0/1, Drop Loops
-					adj, _, _ = isnothing(nodes) ?
-						_edgelist_to_sparse_matrix(edges; weighted = false) :
-						_graph_to_sparse_matrix(edges; nodes = nodes, weighted = false)
-					_make_directed_simple!(adj)
+		#	Route by weighted flag
+			if !weighted
+				#	— Binary BM paths —
+					if graph_type == :directed
+						#	Build directed simple 0/1, drop loops
+							adj, _, _ = isnothing(nodes) ?
+								_graph_to_sparse_matrix(edges; weighted=false) :
+								_graph_to_sparse_matrix(edges; nodes=nodes, weighted=false)
+							_make_directed_simple!(adj)
 
-				#	Optional Compatibility Collapse (Pajek-Style)
-					if reciprocity_collapse
-						adj = max.(adj, adj')
-						_make_directed_simple!(adj)
+						#	Optional compatibility collapse (Pajek-style)
+							if reciprocity_collapse
+								adj = max.(adj, adj')
+								_make_directed_simple!(adj)
+							end
+
+						#	Run directed BM
+							res = _triad_census_bm_directed(adj)
+							return DataFrame(triad = res.labels, count = res.counts)
+
+					else
+						#	Undirected binary: symmetrize by max, zero diag, run undirected BM
+							adj, _, _ = isnothing(nodes) ?
+								_graph_to_sparse_matrix(edges; weighted=false) :
+								_graph_to_sparse_matrix(edges; nodes=nodes, weighted=false)
+							_make_directed_simple!(adj)           # binarize per-direction, drop loops
+							Au = max.(adj, adj')                  # undirected 0/1
+							n = size(Au, 1); @inbounds for i in 1:n; Au[i,i] = 0.0; end
+							dropzeros!(Au)
+
+						#	Normalize to a consistent Vector{Int} (counts16)
+							counts16 = _bm_undir_counts16(Au)
+							return DataFrame(triad = _dl_labels(), count = counts16)
 					end
 
-				#	Run Directed BM
-					res = _triad_census_bm_directed(adj)
-					return DataFrame(triad = res.labels, count = res.counts)
-
 			else
-				#	Undirected Binary: Symmetrize by Max, Zero Diag, Run Undirected BM
-					adj, _, _ = isnothing(nodes) ?
-						_edgelist_to_sparse_matrix(edges; weighted = false) :
-						_graph_to_sparse_matrix(edges; nodes = nodes, weighted = false)
-					_make_directed_simple!(adj)
-					Au = max.(adj, adj')
-					n = size(Au, 1)
-					@inbounds for i in 1:n; Au[i, i] = 0.0; end
-					dropzeros!(Au)
-
-				#	Run Undirected BM
-					res = _triad_census_bm_undirected(Au)
-					return DataFrame(triad = res.labels, count = res.counts)
+				#	— Layered weighted BM (log-spaced τ), threading forwarded —
+					return _triad_census_layered(edges;
+								nodes                = nodes,
+								graph_type           = graph_type,
+								reciprocity_collapse = reciprocity_collapse,
+								L                    = L,
+								tau_min              = tau_min,
+								tau_max              = tau_max,
+								parallel             = parallel)
 			end
 	end
 	@doc raw"""
 	**Description**
-	Triad census in Davis-Leinhardt 16-class order: counts every triple of
-	nodes by its isomorphism class. For directed graphs all 16 classes can be
-	non-zero. For undirected graphs only $\{003, 102, 201, 300\}$ are
-	non-zero (the four undirected triad classes).
+	Triad census in the Davis–Leinhardt 16-class order, supporting both binary
+	(unweighted) and weighted networks under directed and undirected
+	conventions. Counts every unordered triple of nodes by its isomorphism
+	class. For directed graphs all 16 classes can be non-zero; for undirected
+	graphs only $\{003, 102, 201, 300\}$ — the four undirected isomorphism
+	types — can be non-zero. The full 16-vector is always returned for
+	consistency.
 
-	The 16 classes in order:
+	Two computational paths:
+	- **Binary path** (`weighted=false`): a single Batagelj–Mrvar (BM) census
+	  on the binarized graph; subquadratic for sparse graphs.
+	- **Weighted path** (`weighted=true`): a layered BM census across a
+	  log-spaced grid of edge-weight thresholds $\tau$, with the outer loop
+	  parallelized by default.
+
+	The 16 classes in DL order:
 
 	$$003,\ 012,\ 102,\ 021D,\ 021U,\ 021C,\ 111D,\ 111U,\ 030T,\ 030C,\ 201,\ 120D,\ 120U,\ 120C,\ 210,\ 300$$
 
 	**Usage**
-	`triad_census(edges::DataFrame; nodes=nothing, weighted=false, graph_type=:directed, reciprocity_collapse=false)`
+	`triad_census(edges; nodes=nothing, weighted=false, graph_type=:directed, reciprocity_collapse=false, L=20, tau_min=1.0, tau_max=..., parallel=true)`
 
 	**Arguments**
 	- `edges::DataFrame`: Edge list with `:src`, `:dst`, optionally `:weight`
-	  (ignored — binary census).
-	- `nodes::Union{Nothing, DataFrame, Vector}`: Optional fixed node universe.
-	- `weighted::Bool`: Must be `false` in this commit. The weighted-layered
-	  tau-thresholding path is not ported; passing `true` throws `ArgumentError`.
+	  (used only when `weighted=true`; ignored for the binary path).
+	- `nodes::Union{Nothing,DataFrame,Vector}`: Optional fixed node universe;
+	  includes isolates in the census.
+	- `weighted::Bool`: `false` (default) → single binary BM census; `true` →
+	  layered weighted BM across a $\tau$ grid.
 	- `graph_type::Symbol`: `:directed` (default) or `:undirected`.
 	- `reciprocity_collapse::Bool`: Directed only — when `true`, mutual arcs
-	  $i \leftrightarrow j$ are collapsed to single ties by $A = \max(A, A^T)$,
-	  reproducing Pajek-style triad semantics.
+	  $i \leftrightarrow j$ are collapsed to single ties by $\max(A, A^\top)$,
+	  reproducing Pajek-style triad semantics (suppresses asymmetric classes
+	  so only $\{003, 102, 201, 300\}$ are non-zero).
+	- `L::Int`, `tau_min::Float64`, `tau_max::Float64`: Layered $\tau$ controls
+	  (used only when `weighted=true`). For automatic $\tau$ bound selection
+	  based on the observed weight distribution, see `recommend_L` and
+	  `_triad_census_layered` (which accepts `:auto` for the bounds).
+	- `parallel::Bool`: Weighted path only — parallelize the outer $\tau$ loop
+	  via `Threads.@threads :static` (default `true`). No effect on the
+	  binary path. See *Threading* below.
+
+	**Details**
+
+	*Binary path.* Builds a $0/1$ loopless adjacency. For directed graphs with
+	`reciprocity_collapse=true`, mutual arcs are first collapsed to single
+	ties. The resulting matrix is fed to `_triad_census_bm_directed` (directed)
+	or `_triad_census_bm_undirected` (undirected). The kernels implement
+	Batagelj–Mrvar (2001), dyad-driven, subquadratic for sparse inputs.
+
+	*Weighted path.* Delegates to `_triad_census_layered`, which thresholds
+	the weighted adjacency at each $\tau$ in a log-spaced grid and runs the
+	binary BM kernel on each thresholded matrix. Returns per-$\tau$ counts
+	and densities plus per-triad AUMC/peak summaries. For directed weighted
+	graphs the optional `reciprocity_collapse` flag is honored at each $\tau$.
+	For undirected weighted graphs, weights are symmetrized by sum
+	($W + W^\top$) before thresholding, aligning with $s$-core semantics.
+
+	*Threading.* The weighted path parallelizes the outer $\tau$ loop. Each
+	$\tau$ runs an independent census on its own thresholded matrix, so there
+	is no shared mutable state and no risk of accumulator races. `:static`
+	scheduling with pre-allocated per-$\tau$ result storage guarantees the
+	threaded output is bit-identical to the serial output regardless of
+	`Threads.nthreads()`. To verify this contract on a given input, use
+	`test_threaded_vs_serial_layered` from the test suite. To obtain a strict
+	serial run for benchmarking or when calling from another threaded context,
+	pass `parallel=false`.
+
+	*Reciprocity collapse semantics.* When `reciprocity_collapse=true`, the
+	directed network is rendered as if undirected for purposes of triad
+	classification: every mutual arc $i \leftrightarrow j$ is treated as a
+	single tie. The result is that asymmetric DL classes (012, 021D, 021U,
+	021C, 111D, 111U, 030T, 030C, 120D, 120U, 120C, 210) all report zero
+	counts, leaving only the four classes $\{003, 102, 201, 300\}$. This
+	reproduces Pajek's triad-census output on directed inputs.
 
 	**Value**
-	`DataFrame` with columns `:triad` (label) and `:count` (number of triples
-	of that class). Rows are in Davis-Leinhardt order.
 
-	**References**
-	- Davis JA, Leinhardt S (1972). "The structure of positive interpersonal
-	  relations in small groups."
-	- Batagelj V, Mrvar A (2001). "A subquadratic triad census algorithm for
-	  large sparse networks with small maximum degree." *Social Networks* 23: 237–243.
+	*Binary path* (`weighted=false`): `DataFrame` with columns:
+	- `:triad::String` — DL class label
+	- `:count::Int` — number of triples in that class
+
+	Rows are in DL order.
+
+	*Weighted path* (`weighted=true`): `NamedTuple` with:
+	- `per_tau::DataFrame`: long-format table with `:tau`, `:triad`, `:count`,
+	  `:density` (count divided by $\binom{n}{3}$). One row per
+	  $(\tau, \text{triad})$ pair.
+	- `summary::DataFrame`: per-triad summary with `:triad`, `:AUMC_density`,
+	  `:peak_tau`, `:peak_density`.
+	- `meta::NamedTuple`: $n$, $L$, $\tau_{\min}$, $\tau_{\max}$, `graph_type`,
+	  `reciprocity_collapse`, `threaded`, `n_threads_used`.
+
+	**Examples**
+```julia
+	using DataFrames
+
+	#	Binary directed triad census
+		edges = DataFrame(src = ["a","b","c","a"],
+		                  dst = ["b","c","a","c"])
+		result = triad_census(edges; graph_type=:directed)
+		result  # DataFrame with 16 rows, counts for each DL class
+
+	#	Pajek-style: collapse mutual arcs first
+		result = triad_census(edges; graph_type=:directed,
+		                              reciprocity_collapse=true)
+		#	Non-zero counts only at slots 1 (003), 3 (102), 11 (201), 16 (300)
+
+	#	Undirected binary
+		undir = DataFrame(src = ["a","a","b"],
+		                  dst = ["b","c","c"])
+		result = triad_census(undir; graph_type=:undirected)
+		#	Single triangle → count[16] (300) == 1
+
+	#	Weighted layered census (threaded by default)
+		w = DataFrame(src = ["a","a","b","b","c"],
+		              dst = ["b","c","c","a","a"],
+		              weight = [3.0, 1.0, 5.0, 2.0, 4.0])
+		layered = triad_census(w; weighted=true, graph_type=:directed,
+		                              L=20, tau_min=0.5, tau_max=5.0)
+		layered.per_tau   # tidy table across τ × triad
+		layered.summary   # per-triad AUMC + peak τ
+		layered.meta      # threading info + grid parameters
+
+	#	Strict serial run (for benchmarking or nested threading contexts)
+		layered_serial = triad_census(w; weighted=true, L=20,
+		                                      parallel=false)
+```
+
+	**Performance Notes**
+	The binary directed kernel is subquadratic for sparse graphs (dyad-driven
+	BM); a single census on a Balikatan-scale graph ($N = 1{,}347$,
+	$|E| = 3{,}146$) runs in well under a second on a single thread. The
+	undirected binary kernel is currently a triple loop over node triples
+	($O(N^3)$) — adequate for small networks but the gating cost on
+	Marvel-scale undirected runs ($N = 6{,}486$). Threading does not change
+	this asymptotic complexity; for the weighted layered path, threading
+	gives near-linear speedup in the τ loop, which is the dominant cost when
+	$L \cdot n_{\text{thresholds}}$ is large.
 
 	**See Also**
-	`global_clustering_coefficient`
+	`_triad_census_layered`, `_triad_census_bm_directed`,
+	`_triad_census_bm_undirected`, `recommend_L`, `test_threaded_vs_serial_layered`
+
+	**References**
+	- Batagelj, V., & Mrvar, A. (2001). "A subquadratic triad census algorithm
+	  for large sparse networks with small maximum degree." *Social Networks*,
+	  23(3), 237–243.
+	- Davis, J. A., & Leinhardt, S. (1972). "The structure of positive
+	  interpersonal relations in small groups."
 	""" triad_census
 
 ##############################
@@ -5226,6 +5857,7 @@ module network_statistics
            local_weighted_reciprocity,
            local_clustering_coefficient,
            global_clustering_coefficient,
+		   _triad_census_layered,
            triad_census,
            largest_bicomponent_proportion,
            tau_statistic,
