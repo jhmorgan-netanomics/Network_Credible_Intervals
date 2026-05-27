@@ -88,10 +88,15 @@ module graphml_io
 		Notes:
 			Booleans are written as "true" / "false" per GraphML convention.
 			Floats use default Julia string conversion (full precision).
-			Missing values return nothing so the caller can skip emission.
+			Missing values return nothing so the caller can skip emission entirely.
+			An empty string ("") is NOT missing — it is a legitimate value and is
+			returned as "", which the writer then emits as a present-but-empty
+			<data> element. The reader (_parse_graphml_value) distinguishes
+			these on the way back: empty text for a string attribute returns "",
+			while empty text for a non-string attribute returns missing.
 		"""
 
-		#	Handle Missing
+		#	Handle Missing (None of Empty String)
 			(v === missing || v === nothing) && return nothing
 
 		#	Format by Type
@@ -339,14 +344,32 @@ module graphml_io
 		Returns:
 			Union{Int, Float64, Bool, String, Missing}: parsed value
 		Notes:
-			Returns missing if the text is empty (which the writer doesn't emit
-			anyway). Returns string-typed fallback if parsing fails for numeric
-			or boolean types.
+			For string-typed attributes, an empty (or whitespace-only) text content
+			is treated as a legitimate empty-string value and returned as "". This
+			preserves writer/reader symmetry: write_graphml emits "" as a present-
+			but-empty <data> element (an absent attribute is emitted as no <data>
+			element at all), and the reader must recover "" rather than coercing
+			it to missing.
+
+			For non-string types (int, double, boolean), empty text cannot be
+			parsed and is returned as missing. The caller distinguishes this from
+			"data element absent entirely," which is handled at the call site
+			(load_graphml uses `get(this_node_data, attr_name, missing)` so an
+			absent element never reaches this helper).
+
+			Numeric and boolean parses use the declared attr_type. String parses
+			run XML entity unescaping (&amp;, &lt;, &gt;, &quot;, &apos;).
 		"""
 
-		#	Handle Empty
+		#	Strip Surrounding Whitespace
 			t = strip(text)
-			isempty(t) && return missing
+
+		#	Handle Empty Text by Type
+			if isempty(t)
+				#	Empty string is a legitimate value only for string-typed attrs.
+				#	For numeric/boolean attrs, empty text is unparseable → missing.
+					return attr_type == "string" ? "" : missing
+			end
 
 		#	Parse by Declared Type
 			if attr_type == "int"

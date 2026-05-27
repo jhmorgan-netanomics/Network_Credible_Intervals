@@ -423,6 +423,283 @@ using Network_Credible_Intervals
 			return (edges = edges_df, nodes = nodes_df)
 	end
 
+#	Parse a 1-Section 2-Mode Pajek File with a Single Bipartite Vertex Block (Marvel-style)
+	function parse_pajek_marvel(filepath::String)
+		"""
+		Args:
+			filepath::String: path to the Marvel_Universe.paj (or compatible) file
+		Returns:
+			NamedTuple: (heroes, comics, edges, vertex_type)
+				heroes::DataFrame   — columns :id, :label, :mode (always "hero")
+				comics::DataFrame   — columns :id, :label, :mode (always "comic")
+				edges::DataFrame    — columns :src, :dst, :weight (unweighted bipartite, weight = 1.0)
+				vertex_type::Vector{Int} — per-vertex partition codes (1 = hero, 2 = comic), length n_total
+		Notes:
+			The Marvel Universe Pajek file declares its layout in the *Vertices header:
+
+				*Vertices 19428 6486
+
+			Here 19428 is the total vertex count and 6486 is the size of mode 1 (heroes).
+			Heroes occupy vertex IDs 1..6486; comics occupy vertex IDs 6487..19428. Edges
+			in the *Edges section are bipartite hero–comic appearances, one row per
+			appearance, with no explicit weight (weight = 1.0 throughout).
+
+			The file also carries a *Partition Vertex_Type.clu block that labels every
+			vertex as 1 (hero) or 2 (comic). The parser reads it and returns it as
+			vertex_type for consistency-checking against the header-derived mode
+			assignment.
+
+			This parser is intentionally distinct from parse_pajek_2mode, which assumes
+			the caller supplies the bipartite split (n_firms) externally and looks for
+			separate *Partition and *Vector attribute blocks tied to mode 1. The Marvel
+			file declares the split in the header itself and has no per-vertex
+			attributes beyond the type partition, so the two parsers have different
+			argument shapes and different expected section structures.
+
+			Pajek files are commonly Latin-1 (ISO-8859-1) encoded. The reader decodes
+			byte-by-byte as Latin-1, which never fails and produces valid UTF-8 strings
+			internally. The four Pajek helpers (_strip_pajek_token, _parse_pajek_vertex_line,
+			_parse_pajek_edge_line, _find_pajek_section) are shared with parse_pajek_2mode.
+
+			Reference:
+				Alberich, R., Miro-Julia, J., and Rossello, F. (2002).
+				"Marvel Universe looks almost like a real social network."
+				arXiv preprint cond-mat/0202174.
+		"""
+
+		#	Validation
+			if !isfile(filepath)
+				throw(ArgumentError("File not found: $filepath"))
+			end
+
+		#	Read All Lines (Decode as Latin-1 / ISO-8859-1)
+			#	Pajek files often use Latin-1 encoding for non-ASCII characters; decoding
+			#	byte-by-byte sidesteps any UTF-8 validation failures on legacy bytes.
+				raw_bytes = read(filepath)
+				decoded   = String(Char.(raw_bytes))
+				raw       = String.(split(decoded, r"\r?\n"))
+
+		#	Locate Required Section Headers
+			ix_vertices  = _find_pajek_section(raw, "*Vertices")
+			ix_edges     = _find_pajek_section(raw, "*Edges")
+			ix_partition = _find_pajek_section(raw, "*Partition")
+			if ix_vertices === nothing
+				throw(ArgumentError("Pajek file missing *Vertices section"))
+			end
+			if ix_edges === nothing
+				throw(ArgumentError("Pajek file missing *Edges section"))
+			end
+
+		#	Parse Bipartite Header (Total Count + Mode-1 Count)
+			#	Marvel header form:  *Vertices 19428 6486
+			#	→ n_total = 19428, n_heroes = 6486 (mode 1), n_comics = n_total - n_heroes
+				header_line   = strip(raw[ix_vertices])
+				header_tokens = split(header_line)
+				if length(header_tokens) < 3
+					throw(ArgumentError("Expected bipartite *Vertices header with total and mode-1 counts; got: $header_line"))
+				end
+				n_total  = parse(Int, header_tokens[2])
+				n_heroes = parse(Int, header_tokens[3])
+				if !(1 ≤ n_heroes < n_total)
+					throw(ArgumentError("Bipartite split invalid: n_heroes=$n_heroes, n_total=$n_total"))
+				end
+				n_comics = n_total - n_heroes
+
+		#	Parse Vertices
+			hero_labels  = Vector{String}(undef, n_heroes)
+			comic_labels = Vector{String}(undef, n_comics)
+			for line_ix in (ix_vertices + 1):(ix_edges - 1)
+				ln = strip(raw[line_ix])
+				isempty(ln) && continue
+				startswith(ln, "*") && break    # next section header
+				startswith(ln, "%") && continue # comment line
+				vid, label = _parse_pajek_vertex_line(ln)
+				if 1 ≤ vid ≤ n_heroes
+					hero_labels[vid] = label
+				elseif n_heroes < vid ≤ n_total
+					comic_labels[vid - n_heroes] = label
+				end
+			end
+
+		#	Parse Edges (Stop at Next Section or EOF)
+			edge_srcs    = Int[]
+			edge_dsts    = Int[]
+			edge_weights = Float64[]
+			for line_ix in (ix_edges + 1):length(raw)
+				ln = strip(raw[line_ix])
+				isempty(ln) && continue
+				if startswith(ln, "*")
+					break                       # reached next section
+				end
+				startswith(ln, "%") && continue # comment line
+				#	The Marvel edge format is unweighted: "src_id dst_id". If a future
+				#	variant adds weights, _parse_pajek_edge_line handles that too.
+					try
+						src, dst, w = _parse_pajek_edge_line(ln)
+						push!(edge_srcs, src)
+						push!(edge_dsts, dst)
+						push!(edge_weights, w)
+					catch
+						continue
+					end
+			end
+
+		#	Parse Vertex Type Partition (Optional Sanity Check)
+			vertex_type = Int[]
+			if ix_partition !== nothing
+				#	Skip the *Partition header AND the *Vertices N line beneath it
+					skip_count_line = true
+					for line_ix in (ix_partition + 1):length(raw)
+						ln = strip(raw[line_ix])
+						if skip_count_line && startswith(lowercase(ln), "*vertices")
+							skip_count_line = false
+							continue
+						end
+						isempty(ln) && continue
+						startswith(ln, "*") && break
+						val = tryparse(Int, ln)
+						if val !== nothing
+							push!(vertex_type, val)
+						end
+						length(vertex_type) ≥ n_total && break
+					end
+			end
+
+		#	Build Heroes DataFrame
+			heroes_df = DataFrame(
+				id    = 1:n_heroes,
+				label = hero_labels,
+				mode  = fill("hero", n_heroes)
+			)
+
+		#	Build Comics DataFrame
+			comics_df = DataFrame(
+				id    = (n_heroes + 1):n_total,
+				label = comic_labels,
+				mode  = fill("comic", n_comics)
+			)
+
+		#	Build Edges DataFrame
+			edges_df = DataFrame(
+				src    = edge_srcs,
+				dst    = edge_dsts,
+				weight = edge_weights
+			)
+
+		#	Return All Components
+			return (
+				heroes      = heroes_df,
+				comics      = comics_df,
+				edges       = edges_df,
+				vertex_type = vertex_type
+			)
+	end
+
+#	Project Hero-Hero Network from Bipartite Hero-Comic Edges, Thresholded at Weight ≥ 2
+	function project_marvel_characters(parser_result::NamedTuple;
+	                                   min_weight::Int = 2)
+		"""
+		Args:
+			parser_result::NamedTuple: output of parse_pajek_marvel with fields
+				heroes, comics, edges, vertex_type
+			min_weight::Int: minimum co-appearance count for an edge to be kept
+				(default = 2, dropping single co-appearances per the punchlist)
+		Returns:
+			NamedTuple: (edges, nodes) where
+				edges::DataFrame   — columns :src, :dst, :weight (hero-hero weighted, undirected)
+				nodes::DataFrame   — columns :id, :label (hero attributes)
+		Notes:
+			Computes the hero-hero co-appearance projection of the bipartite hero-comic
+			network. Two heroes i and j are connected with weight equal to the number
+			of comics in which they both appear. Mathematically, if B is the bipartite
+			incidence matrix (heroes × comics), the projection is C = B × B', with the
+			diagonal zeroed (no self-loops) and entries below min_weight dropped.
+
+			The threshold at min_weight = 2 removes pairs of heroes who appear together
+			in only a single comic. This is the punchlist-specified policy: single
+			co-appearances are dropped, retaining only pairs with documented recurring
+			collaboration. Pre-threshold the projection contains a very large number of
+			weak (weight = 1) edges driven by ensemble issues; thresholding produces a
+			network of meaningful collaboration structure.
+
+			Returns an undirected weighted network. Edge ordering is canonical: for
+			each pair {i, j} with i < j, only one edge (src=i, dst=j) is emitted, not
+			both (i, j) and (j, i). This matches the convention used by the rest of
+			the community detection pipeline for undirected graphs.
+
+			Node attributes carried through from the parser:
+			- :id    — hero Pajek vertex id (1..n_heroes)
+			- :label — hero name (e.g., "CAPTAIN AMERICA", "SPIDER-MAN/PETER PARKER")
+		"""
+
+		#	Validation
+			n_heroes    = nrow(parser_result.heroes)
+			n_comics    = nrow(parser_result.comics)
+			n_bipartite = nrow(parser_result.edges)
+			if n_bipartite == 0
+				throw(ArgumentError("project_marvel_characters: parser_result has no edges"))
+			end
+			if min_weight < 1
+				throw(ArgumentError("min_weight must be ≥ 1; got $min_weight"))
+			end
+
+		#	Build Bipartite Incidence Matrix B (heroes × comics)
+			#	Comic column index is (comic_id - n_heroes), 1-based
+				bipartite_src = parser_result.edges.src             # hero ids 1..n_heroes
+				bipartite_dst = parser_result.edges.dst             # comic ids n_heroes+1..n_total
+				bipartite_w   = parser_result.edges.weight          # all 1.0 for Marvel
+
+			#	Map comic ids to columns 1..n_comics
+				comic_cols = bipartite_dst .- n_heroes
+				B = sparse(bipartite_src, comic_cols, bipartite_w, n_heroes, n_comics)
+
+		#	Compute Projection C = B × B'
+			#	Result is n_heroes × n_heroes, symmetric; entry (i,j) = shared comic count
+			#	(i.e., number of comics in which heroes i and j co-appear)
+				C = B * B'
+
+		#	Extract Upper-Triangular Off-Diagonal Entries Meeting Threshold
+			#	For an undirected graph, we keep one edge per pair {i,j} with i < j.
+			#	Single co-appearances (weight = 1) are dropped per min_weight policy.
+				rows, cols, vals = findnz(C)
+				edge_srcs    = Int[]
+				edge_dsts    = Int[]
+				edge_weights = Float64[]
+				n_pre_threshold = 0
+				for k in eachindex(vals)
+					i, j, w = rows[k], cols[k], vals[k]
+					if i < j && w > 0
+						n_pre_threshold += 1
+						if w ≥ min_weight
+							push!(edge_srcs, i)
+							push!(edge_dsts, j)
+							push!(edge_weights, w)
+						end
+					end
+				end
+
+		#	Report Threshold Impact
+			println("    Projection pre-threshold:  $n_pre_threshold unordered hero-hero pairs")
+			println("    Projection post-threshold: $(length(edge_srcs)) edges (weight ≥ $min_weight)")
+			println("    Dropped:                   $(n_pre_threshold - length(edge_srcs)) single-coappearance pairs")
+
+		#	Build Edges DataFrame
+			edges_df = DataFrame(
+				src    = edge_srcs,
+				dst    = edge_dsts,
+				weight = edge_weights
+			)
+
+		#	Build Nodes DataFrame with Hero Attributes
+			nodes_df = DataFrame(
+				id    = 1:n_heroes,
+				label = parser_result.heroes.label
+			)
+
+		#	Return Projection
+			return (edges = edges_df, nodes = nodes_df)
+	end
+
 #	Parse a Konect-Format Edge List File
 	function parse_konect(filepath::String)
 		"""
@@ -1005,10 +1282,15 @@ using Network_Credible_Intervals
 		Notes:
 			Booleans are written as "true" / "false" per GraphML convention.
 			Floats use default Julia string conversion (full precision).
-			Missing values return nothing so the caller can skip emission.
+			Missing values return nothing so the caller can skip emission entirely.
+			An empty string ("") is NOT missing — it is a legitimate value and is
+			returned as "", which the writer then emits as a present-but-empty
+			<data> element. The reader (_parse_graphml_value) distinguishes
+			these on the way back: empty text for a string attribute returns "",
+			while empty text for a non-string attribute returns missing.
 		"""
 
-		#	Handle Missing
+		#	Handle Missing (Not Empty String)
 			(v === missing || v === nothing) && return nothing
 
 		#	Format by Type
@@ -1207,14 +1489,39 @@ using Network_Credible_Intervals
 		Returns:
 			Union{Int, Float64, Bool, String, Missing}: parsed value
 		Notes:
-			Returns missing if the text is empty (which the writer doesn't emit
-			anyway). Returns string-typed fallback if parsing fails for numeric
-			or boolean types.
+			For string-typed attributes, the text content is returned verbatim
+			(after XML entity unescape) — including any leading or trailing
+			whitespace, which is treated as part of the value. This matters for
+			datasets where labels carry trailing spaces or other whitespace as
+			meaningful data (e.g., Marvel character names from the
+			Alberich/Miro-Julia/Rossello 2002 dataset, where some labels end
+			with a trailing space as a marker for missing surname components).
+
+			An empty (or whitespace-only) text content for a string-typed attr
+			is returned as the empty string "". This preserves writer/reader
+			symmetry: write_graphml emits "" as a present-but-empty <data>
+			element (an absent attribute is emitted as no <data> element at
+			all), and the reader must recover "" rather than coercing to missing.
+
+			For non-string types (int, double, boolean), surrounding whitespace
+			is stripped before parsing, and empty (or whitespace-only) text
+			returns missing because it cannot be parsed.
+
+			Numeric and boolean parses use the declared attr_type. String parses
+			run XML entity unescaping (&amp;, &lt;, &gt;, &quot;, &apos;).
 		"""
 
-		#	Handle Empty
+		#	String-Typed Attribute: Preserve Text Verbatim (After Unescape)
+		#	Empty or whitespace-only content collapses to "" (a legitimate value).
+			if attr_type == "string"
+				return isempty(strip(text)) ? "" : _xml_unescape(String(text))
+			end
+
+		#	Non-String Types: Strip Whitespace Before Parsing
 			t = strip(text)
-			isempty(t) && return missing
+			if isempty(t)
+				return missing
+			end
 
 		#	Parse by Declared Type
 			if attr_type == "int"
@@ -1224,30 +1531,42 @@ using Network_Credible_Intervals
 			elseif attr_type == "boolean"
 				return lowercase(t) in ("true", "1")
 			else
-				return _xml_unescape(String(t))
+				#	Unknown type: fall back to verbatim string
+					return _xml_unescape(String(text))
 			end
 	end
 
-#	Helper Function for load_graphml: Extract Node ID Integer from Prefixed String
+#	Helper Function for load_graphml: Strip Node ID Prefix
 	function _strip_node_prefix(id_str::AbstractString)
 		"""
 		Args:
-			id_str::AbstractString: a GraphML node ID, expected to be "n{integer}"
+			id_str::AbstractString: a GraphML node ID, expected to be "n{integer}" or similar
 		Returns:
-			Int: the integer portion of the ID
+			String: the stripped ID (e.g., "n42" → "42")
 		Notes:
-			The writer prefixes node IDs with "n" (e.g., id=42 becomes "n42").
-			This helper reverses the prefix. Falls back to parsing the entire
-			string if no "n" prefix is found, which supports GraphML files from
-			other sources that may use different ID conventions.
+			The writer prefixes node IDs with "n" (e.g., id=42 becomes "n42") to
+			satisfy GraphML's requirement that element IDs be valid XML names.
+			This helper reverses the prefix and returns the result as a String,
+			preserving the type convention used by the rest of the
+			Network_Credible_Intervals package — where node IDs flow through
+			internal helpers (e.g., _graph_to_sparse_matrix) as strings.
+
+			If no "n" prefix is found, returns the input unchanged (still as a
+			String). This supports GraphML files from other sources that may
+			use different ID conventions (Gephi, igraph, NetworkX).
+
+			Previously this helper parsed the result to Int. That choice was
+			inconsistent with how IDs are represented elsewhere in the package
+			and required adapter code in every downstream consumer. Returning
+			String here puts the type convention in one place.
 		"""
 
-		#	Strip "n" Prefix If Present
+		#	Strip "n" Prefix If Present, Otherwise Return Unchanged
 			s = String(id_str)
 			if startswith(s, "n")
-				return parse(Int, s[2:end])
+				return s[2:end]
 			else
-				return parse(Int, s)
+				return s
 			end
 	end
 
@@ -1296,6 +1615,14 @@ using Network_Credible_Intervals
 			Reverses write_graphml. Type-aware: numeric attributes come back as
 			Int or Float64, booleans as Bool, everything else as String.
 
+			Node and edge IDs are returned as String, not Int. This is a
+			deliberate convention choice that aligns with the rest of the
+			Network_Credible_Intervals package, where internal helpers
+			(particularly _graph_to_sparse_matrix in network_community_detection)
+			expect string-valued IDs. The "n{integer}" prefix that write_graphml
+			emits is stripped on read; the integer portion is returned as a
+			String rather than parsed to Int.
+
 			Reads only well-formed GraphML 1.0 documents matching the schema
 			emitted by write_graphml. Edges are expected to have :src/:dst (the
 			source/target attributes on <edge> elements). Node IDs are expected
@@ -1303,7 +1630,8 @@ using Network_Credible_Intervals
 
 			GraphML files from other sources (Gephi, igraph, NetworkX) may not
 			use the "n{integer}" ID convention. This loader handles other prefix
-			schemes by falling back to direct integer parsing if "n" is absent.
+			schemes by returning the ID unchanged (still as a String) if "n" is
+			absent.
 
 			Missing values are emitted as absent <data> elements by write_graphml,
 			and load_graphml reads them back as `missing` in the corresponding
@@ -1371,15 +1699,15 @@ using Network_Credible_Intervals
 			edge_attr_keys = [k for (k, v) in key_schema if v.for_type == "edge"]
 
 		#	Initialize Node Attribute Storage
-			node_ids = Int[]
+			node_ids = String[]
 			node_attrs = Dict{Symbol, Vector{Any}}()
 			for k in node_attr_keys
 				node_attrs[Symbol(key_schema[k].attr_name)] = Any[]
 			end
 
 		#	Initialize Edge Attribute Storage
-			edge_srcs = Int[]
-			edge_dsts = Int[]
+			edge_srcs = String[]
+			edge_dsts = String[]
 			edge_attrs = Dict{Symbol, Vector{Any}}()
 			for k in edge_attr_keys
 				edge_attrs[Symbol(key_schema[k].attr_name)] = Any[]
@@ -1699,6 +2027,257 @@ using Network_Credible_Intervals
 		"scotland_interlock_weighted.graphml",
 		"scotland_interlock_unweighted.graphml",
 		"Scotland.paj"
+	)
+
+#	MARVEL UNIVERSE (Alberich, Miró-Julià, & Roselló 2002)
+
+#   Creating
+    marvel_bipartite = parse_pajek_marvel("Marvel_Universe.paj")
+
+#   Sanity checks
+    println("Heroes:     $(nrow(marvel_bipartite.heroes))")           # should print 6486
+    println("Comics:     $(nrow(marvel_bipartite.comics))")           # should print 12942
+    println("Edges:      $(nrow(marvel_bipartite.edges))")            # should print ~96663
+    println("Vertex types: $(length(marvel_bipartite.vertex_type))")  # should print 19428
+
+#   Spot-check a few heroes
+    println("\nFirst 3 heroes:")
+    println(first(marvel_bipartite.heroes, 3))
+
+#   Spot-check a few comics
+    println("\nFirst 3 comics:")
+    println(first(marvel_bipartite.comics, 3))
+
+#   Spot-check first edge
+    println("\nFirst edge: hero $(marvel_bipartite.edges.src[1]) ↔ comic $(marvel_bipartite.edges.dst[1])")
+
+#   Verify Vertex Type Partition Matches Header-Derived Mode Assignment
+    if !isempty(marvel_bipartite.vertex_type)
+        n_heroes = nrow(marvel_bipartite.heroes)
+        partition_heroes_ok = all(marvel_bipartite.vertex_type[1:n_heroes] .== 1)
+        partition_comics_ok = all(marvel_bipartite.vertex_type[(n_heroes + 1):end] .== 2)
+        println("\nVertex_Type.clu consistency check:")
+        println("  Heroes labeled 1 in partition: $(partition_heroes_ok ? "PASS" : "FAIL")")
+        println("  Comics labeled 2 in partition: $(partition_comics_ok ? "PASS" : "FAIL")")
+    end
+
+#   Creating a Projection of the Network: Heroes x Heroes - Shared Comics (Threshold ≥ 2)
+    marvel_network = project_marvel_characters(marvel_bipartite; min_weight = 2)
+
+    println("\nHero-hero edges:  $(nrow(marvel_network.edges))")
+    println("Nodes:            $(nrow(marvel_network.nodes))")
+    println("Max weight:       $(maximum(marvel_network.edges.weight))")
+    println("Mean weight:      $(round(sum(marvel_network.edges.weight) / nrow(marvel_network.edges), digits=2))")
+    println("Total weight:     $(sum(marvel_network.edges.weight))")
+
+#   Network density (undirected, post-threshold)
+    n_heroes_proj = nrow(marvel_network.nodes)
+    n_possible    = n_heroes_proj * (n_heroes_proj - 1) ÷ 2
+    density       = nrow(marvel_network.edges) / n_possible
+    println("Density:          $(round(density, digits=5))  ($(nrow(marvel_network.edges)) / $n_possible)")
+
+#   Isolates after thresholding (heroes with no surviving co-appearance edge)
+    nodes_with_edges = union(marvel_network.edges.src, marvel_network.edges.dst)
+    n_isolates       = n_heroes_proj - length(nodes_with_edges)
+    println("Isolates after threshold: $n_isolates / $n_heroes_proj heroes ($(round(100 * n_isolates / n_heroes_proj, digits=1))%)")
+
+#   How many hero pairs share more than 5 comics? More than 20?
+    hi_share_5  = sum(marvel_network.edges.weight .> 5)
+    hi_share_20 = sum(marvel_network.edges.weight .> 20)
+    println("Pairs co-appearing in >5 comics:  $hi_share_5")
+    println("Pairs co-appearing in >20 comics: $hi_share_20")
+
+#   Spot-check first 5 edges with hero names
+    println("\nFirst 5 hero-hero edges:")
+    for i in 1:5
+        src_name = marvel_network.nodes.label[marvel_network.edges.src[i]]
+        dst_name = marvel_network.nodes.label[marvel_network.edges.dst[i]]
+        w = marvel_network.edges.weight[i]
+        println("  $src_name ↔ $dst_name (weight=$w)")
+    end
+
+#   Top 5 highest-weight edges (most collaborative pairs)
+    println("\nTop 5 highest-weight hero-hero edges:")
+    top_idx = sortperm(marvel_network.edges.weight; rev = true)[1:5]
+    for i in top_idx
+        src_name = marvel_network.nodes.label[marvel_network.edges.src[i]]
+        dst_name = marvel_network.nodes.label[marvel_network.edges.dst[i]]
+        w = marvel_network.edges.weight[i]
+        println("  $src_name ↔ $dst_name (weight=$w)")
+    end
+
+#   Build metadata
+    metadata_weighted = (
+        network_name      = "Marvel Universe Collaboration 2002",
+        source_format     = "pajek_2mode_projection",
+        source_file       = "Marvel_Universe.paj",
+        directed          = false,
+        weighted          = true,
+        is_binary         = false,
+        n_heroes          = nrow(marvel_bipartite.heroes),
+        n_comics          = nrow(marvel_bipartite.comics),
+        n_bipartite_edges = nrow(marvel_bipartite.edges),
+        projection_method = "B times B-transpose, threshold weight >= 2",
+        min_coappearance  = 2,
+        reference         = "Alberich, Miro-Julia, & Rossello 2002 (arXiv:cond-mat/0202174)"
+    )
+
+#   Write weighted GraphML
+    write_graphml(marvel_network.edges, marvel_network.nodes, metadata_weighted,
+                "GraphML_Test_Networks/marvel_universe_weighted.graphml")
+
+#   Write unweighted variant (post-threshold edge set, weights flattened to 1.0)
+    edges_binary    = binarize_edges_df(marvel_network.edges)
+    metadata_binary = merge(metadata_weighted, (weighted = false, is_binary = true))
+    write_graphml(edges_binary, marvel_network.nodes, metadata_binary,
+                "GraphML_Test_Networks/marvel_universe_unweighted.graphml")
+
+#	Test: Verify GraphML Round-Trip Integrity for Marvel
+	function test_marvel_graphml_integrity(weighted_path::String,
+	                                        unweighted_path::String,
+	                                        pajek_path::String;
+	                                        min_weight::Int = 2)
+		"""
+		Args:
+			weighted_path::String:   path to weighted GraphML file
+			unweighted_path::String: path to unweighted GraphML file
+			pajek_path::String:      path to original Pajek file
+			min_weight::Int:         co-appearance threshold used at projection time
+				(default = 2; must match what was passed to project_marvel_characters)
+		Returns:
+			NamedTuple: (all_passed::Bool, per_test::Dict)
+		Notes:
+			Loads both written GraphML files, reproduces the projection from the
+			Pajek file, and checks that the loaded contents match the in-memory
+			versions. Reports per-check pass/fail status. On label mismatch, prints
+			a diagnostic listing of the first few differing labels for inspection.
+		"""
+
+		println("=" ^ 70)
+		println("Marvel GraphML Round-Trip Integrity Test")
+		println("=" ^ 70)
+
+		results = Dict{Symbol, Bool}()
+
+		#	Regenerate Reference Network
+			println("\n  Step 1: Regenerate reference network from Pajek...")
+			parsed    = parse_pajek_marvel(pajek_path)
+			reference = project_marvel_characters(parsed; min_weight = min_weight)
+			ref_edges = reference.edges
+			ref_nodes = reference.nodes
+			println("    Reference: $(nrow(ref_edges)) edges, $(nrow(ref_nodes)) nodes")
+
+		#	Load Weighted GraphML
+			println("\n  Step 2: Load weighted GraphML...")
+			loaded_w = load_graphml(weighted_path)
+			println("    Loaded:   $(nrow(loaded_w.edges)) edges, $(nrow(loaded_w.nodes)) nodes")
+
+		#	Check Counts Match (Weighted)
+			counts_ok_w = (nrow(loaded_w.edges) == nrow(ref_edges)) &&
+			              (nrow(loaded_w.nodes) == nrow(ref_nodes))
+			results[:weighted_counts] = counts_ok_w
+			println("    Counts match: $(counts_ok_w ? "PASS" : "FAIL")")
+
+		#	Check Total Weight Preserved
+			ref_total_w    = sum(ref_edges.weight)
+			loaded_total_w = sum(loaded_w.edges.weight)
+			weight_ok_w    = isapprox(ref_total_w, loaded_total_w; atol = 1e-9)
+			results[:weighted_total_weight] = weight_ok_w
+			println("    Total weight: ref = $ref_total_w, loaded = $loaded_total_w  $(weight_ok_w ? "PASS" : "FAIL")")
+
+		#	Check Max Weight Preserved
+			max_ok_w = isapprox(maximum(ref_edges.weight), maximum(loaded_w.edges.weight); atol = 1e-9)
+			results[:weighted_max_weight] = max_ok_w
+			println("    Max weight:   ref = $(maximum(ref_edges.weight)), loaded = $(maximum(loaded_w.edges.weight))  $(max_ok_w ? "PASS" : "FAIL")")
+
+		#	Check Threshold Was Respected (No Weights Below min_weight in Loaded File)
+			threshold_ok = minimum(loaded_w.edges.weight) ≥ min_weight
+			results[:weighted_threshold] = threshold_ok
+			println("    Min weight ≥ $min_weight (threshold respected): $(threshold_ok ? "PASS" : "FAIL")  (observed min = $(minimum(loaded_w.edges.weight)))")
+
+		#	Check Label Attribute Round-Tripped (with Diagnostic Output)
+			if hasproperty(loaded_w.nodes, :label)
+				ref_labels    = sort(string.(ref_nodes.label))
+				loaded_labels = sort(string.(loaded_w.nodes.label))
+				labels_ok     = ref_labels == loaded_labels
+				results[:weighted_labels] = labels_ok
+				println("    Label attribute (set equality): $(labels_ok ? "PASS" : "FAIL")")
+
+				#	On Failure, Show First Few Mismatches
+					if !labels_ok
+						n_diff = sum(ref_labels .!= loaded_labels)
+						println("       $n_diff label(s) differ out of $(length(ref_labels))")
+						println("       First 5 mismatches (ref → loaded):")
+						shown = 0
+						for i in eachindex(ref_labels)
+							if ref_labels[i] != loaded_labels[i] && shown < 5
+								#	repr() makes whitespace and special characters visible
+									println("         [$i]  ref:    $(repr(ref_labels[i]))")
+									println("              loaded: $(repr(loaded_labels[i]))")
+								#	Show byte-level comparison
+									ref_bytes    = collect(codeunits(ref_labels[i]))
+									loaded_bytes = collect(codeunits(loaded_labels[i]))
+									if ref_bytes != loaded_bytes
+										println("              ref bytes:    $(ref_bytes[1:min(end, 30)])")
+										println("              loaded bytes: $(loaded_bytes[1:min(end, 30)])")
+									end
+								shown += 1
+							end
+						end
+					end
+			else
+				results[:weighted_labels] = false
+				println("    Label attribute: FAIL (column not found)")
+			end
+
+		#	Check Metadata Preserved
+			meta = loaded_w.metadata
+			meta_ok = haskey(meta, :network_name) && haskey(meta, :weighted) &&
+			          meta[:weighted] === true && meta[:directed] === false &&
+			          haskey(meta, :min_coappearance) && meta[:min_coappearance] == min_weight
+			results[:weighted_metadata] = meta_ok
+			println("    Metadata (network_name, weighted=true, directed=false, min_coappearance=$min_weight): $(meta_ok ? "PASS" : "FAIL")")
+			println("    Loaded metadata: $(meta)")
+
+		#	Load Unweighted GraphML
+			println("\n  Step 3: Load unweighted GraphML...")
+			loaded_u = load_graphml(unweighted_path)
+			println("    Loaded:   $(nrow(loaded_u.edges)) edges, $(nrow(loaded_u.nodes)) nodes")
+
+		#	Check Counts Match (Unweighted)
+			counts_ok_u = (nrow(loaded_u.edges) == nrow(ref_edges)) &&
+			              (nrow(loaded_u.nodes) == nrow(ref_nodes))
+			results[:unweighted_counts] = counts_ok_u
+			println("    Counts match (same edge set as weighted variant): $(counts_ok_u ? "PASS" : "FAIL")")
+
+		#	Check Binarization
+			all_ones = all(loaded_u.edges.weight .== 1.0)
+			results[:unweighted_binarized] = all_ones
+			println("    All weights = 1.0: $(all_ones ? "PASS" : "FAIL")")
+
+		#	Check Metadata Reflects Unweighted
+			meta_u    = loaded_u.metadata
+			meta_u_ok = haskey(meta_u, :is_binary) && meta_u[:is_binary] === true &&
+			            meta_u[:weighted] === false
+			results[:unweighted_metadata] = meta_u_ok
+			println("    Metadata (is_binary=true, weighted=false): $(meta_u_ok ? "PASS" : "FAIL")")
+
+		#	Summary
+			all_passed = all(values(results))
+			println("\n" * "=" ^ 70)
+			println("SUMMARY: $(all_passed ? "ALL PASSED" : "SOME FAILED")")
+			for (k, v) in results
+				println("  $k: $(v ? "PASS" : "FAIL")")
+			end
+			println("=" ^ 70)
+
+		return (all_passed = all_passed, per_test = results)
+	end
+
+	marvel_results = test_marvel_graphml_integrity(
+		"GraphML_Test_Networks/marvel_universe_weighted.graphml",
+		"GraphML_Test_Networks/marvel_universe_unweighted.graphml",
+		"Marvel_Universe.paj"
 	)
 
 #   MORENO DIRECTED HIGH SCHOOL FRIENDSHIP NETWORK (1957-1958)
