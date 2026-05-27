@@ -1038,6 +1038,314 @@ module network_statistics
 			return (neighbor_starts, neighbor_data)
 	end
 
+#	Helper Function for Weighted Path-Based Measures: Build CSR with Edge Weights
+	function _build_weighted_neighbor_lists(adj::SparseMatrixCSC{<:Real, <:Integer})
+		"""
+		Args:
+			adj::SparseMatrixCSC: sparse adjacency matrix with edge weights
+		Returns:
+			Tuple{Vector{Int}, Vector{Int}, Vector{Float64}}:
+				(neighbor_starts, neighbor_data, neighbor_weights)
+				neighbor_starts::Vector{Int}: length n+1; neighbors of node i
+					are at indices neighbor_starts[i] : neighbor_starts[i+1]-1
+				neighbor_data::Vector{Int}: concatenated out-neighbor IDs
+				neighbor_weights::Vector{Float64}: edge weights, parallel to
+					neighbor_data
+		Notes:
+			Weighted analog of _build_neighbor_lists. Preserves edge weights
+			as a parallel Vector{Float64} so the Dijkstra forward pass can
+			access them in O(1) per neighbor without indexing back into the
+			sparse matrix.
+
+			Zero-weight entries are skipped (treated as absent edges) so the
+			neighbor list is well-formed for weighted graphs that have
+			structural zeros in the sparse representation.
+
+			Caller is responsible for ensuring weights are non-negative.
+			Negative weights would invalidate Dijkstra; the helper does not
+			check.
+		"""
+
+		#	Dimensions
+			n = size(adj, 1)
+
+		#	First Pass: Count Out-Neighbors per Node
+			row_counts = zeros(Int, n)
+			rows = rowvals(adj)
+			vals = nonzeros(adj)
+			@inbounds for j in 1:n
+				for ptr in nzrange(adj, j)
+					i = rows[ptr]
+					if vals[ptr] != 0
+						row_counts[i] += 1
+					end
+				end
+			end
+
+		#	Build CSR Start Offsets
+			neighbor_starts = Vector{Int}(undef, n + 1)
+			neighbor_starts[1] = 1
+			@inbounds for i in 1:n
+				neighbor_starts[i + 1] = neighbor_starts[i] + row_counts[i]
+			end
+
+		#	Second Pass: Populate Neighbor IDs and Weights
+			total_edges      = neighbor_starts[n + 1] - 1
+			neighbor_data    = Vector{Int}(undef, total_edges)
+			neighbor_weights = Vector{Float64}(undef, total_edges)
+			write_ptr = copy(neighbor_starts)
+			@inbounds for j in 1:n
+				for ptr in nzrange(adj, j)
+					i = rows[ptr]
+					w = vals[ptr]
+					if w != 0
+						neighbor_data[write_ptr[i]]    = j
+						neighbor_weights[write_ptr[i]] = Float64(w)
+						write_ptr[i] += 1
+					end
+				end
+			end
+
+		#	Return CSR Representation with Weights
+			return (neighbor_starts, neighbor_data, neighbor_weights)
+	end
+
+#	Helper Function for Weighted Path-Based Measures: Transform Weights to Path Cost
+	function _transform_weights_for_path_cost(neighbor_weights::Vector{Float64},
+												edge_interpretation::Symbol)
+		"""
+		Args:
+			neighbor_weights::Vector{Float64}: raw edge weights from _build_weighted_neighbor_lists
+			edge_interpretation::Symbol: :tie_strength or :distance
+		Returns:
+			Vector{Float64}: transformed costs suitable for Dijkstra
+		Notes:
+			Maps raw edge weights to Dijkstra-ready costs based on the
+			semantic interpretation of the weight.
+
+			:tie_strength — weights represent intensity / frequency of the
+				tie; convert to cost via 1/w. Stronger ties produce shorter
+				weighted distances. Standard convention for co-appearance,
+				interaction-count, and shared-attribute networks.
+
+			:distance — weights are already distances / costs (e.g., travel
+				times, transit costs, dissimilarities). Used as-is.
+
+			For :tie_strength, zero or negative weights map to Inf (treated
+			as absent edges), since they would otherwise produce undefined
+			or negative path costs. For :distance, negative weights also
+			map to Inf since Dijkstra requires non-negative costs. Both
+			cases result in an edge that exists in the adjacency but cannot
+			be used in shortest-path computation.
+
+			Does not mutate the input array; returns a new Vector.
+		"""
+
+		#	Validation
+			if !(edge_interpretation in (:tie_strength, :distance))
+				throw(ArgumentError(
+					"_transform_weights_for_path_cost: edge_interpretation=$(edge_interpretation) " *
+					"not supported. Use :tie_strength or :distance."
+				))
+			end
+
+		#	Allocate Output
+			n_edges = length(neighbor_weights)
+			costs   = Vector{Float64}(undef, n_edges)
+
+		#	Apply Transformation
+			if edge_interpretation === :tie_strength
+				@inbounds for i in 1:n_edges
+					w = neighbor_weights[i]
+					costs[i] = (w > 0.0 && isfinite(w)) ? 1.0 / w : Inf
+				end
+			else  # :distance
+				@inbounds for i in 1:n_edges
+					w = neighbor_weights[i]
+					costs[i] = (w >= 0.0 && isfinite(w)) ? w : Inf
+				end
+			end
+
+		#	Return Transformed Costs
+			return costs
+	end
+
+#	Helper Function for Weighted Path-Based Measures: Single-Source Dijkstra
+	function _dijkstra_distances_and_sigma!(neighbor_starts::Vector{Int},
+												neighbor_data::Vector{Int},
+												neighbor_costs::Vector{Float64},
+												source::Int,
+												distance::Vector{Float64},
+												sigma::Vector{Float64},
+												stack_order::Vector{Int})
+		"""
+		Args:
+			neighbor_starts::Vector{Int}: CSR row pointers (length n+1)
+			neighbor_data::Vector{Int}: CSR neighbor IDs (length total_edges)
+			neighbor_costs::Vector{Float64}: parallel edge costs from
+				_transform_weights_for_path_cost
+			source::Int: source node ID (1-indexed)
+			distance::Vector{Float64}: pre-allocated, filled with Inf for unreachable
+			sigma::Vector{Float64}: pre-allocated, filled with shortest-path counts
+			stack_order::Vector{Int}: pre-allocated, filled with finalization order
+		Returns:
+			Int: number of reachable nodes, including the source
+		Notes:
+			Weighted analog of _bfs_distances_and_sigma!. Computes:
+				distance[v] = shortest weighted distance from source to v
+							  (Inf if unreachable)
+				sigma[v]    = number of distinct shortest paths from source to v
+				stack_order = nodes in non-decreasing finalized-distance order
+							  (Dijkstra closes nodes in this order, analogous to
+							  BFS layer order)
+
+			Uses a binary heap (min-heap) of (distance, node_id) tuples for
+			the priority queue. Pops the closest unfinalized node each
+			iteration; finalizes it; relaxes outgoing edges.
+
+			Shortest-path counting (sigma) follows the standard rule:
+				if dist[v] + cost(v, w) < dist[w]:    # strictly shorter
+					dist[w] = dist[v] + cost(v, w)
+					sigma[w] = sigma[v]
+					(re-push w with new distance)
+				elif dist[v] + cost(v, w) == dist[w]: # equally short
+					sigma[w] += sigma[v]
+
+			Floating-point equality is tested against an explicit tolerance
+			(_DIJKSTRA_EPS) scaled by the magnitude of the distances being
+			compared. This is necessary because accumulated path costs are
+			subject to floating-point rounding.
+
+			Each finalized node is pushed onto stack_order in the order it's
+			closed by the heap. Multiple heap entries per node are normal
+			(deferred relaxation); only the first finalization counts.
+
+			Inf-cost edges are skipped (treated as absent), supporting the
+			:tie_strength transformation that maps zero weights to Inf.
+		"""
+
+		#	Dimensions and Reset
+			n = length(distance)
+			fill!(distance, Inf)
+			fill!(sigma, 0.0)
+
+		#	Initialize Source
+			distance[source] = 0.0
+			sigma[source]    = 1.0
+
+		#	Binary Min-Heap of (distance, node_id) Tuples
+		#	Using a Vector with hand-rolled heap operations to avoid pulling
+		#	in DataStructures.jl for this single use. Tuples compare
+		#	lexicographically, so (distance, node) gives min-distance order
+		#	with stable node tiebreak.
+			heap = Tuple{Float64, Int}[]
+			sizehint!(heap, n)
+			push!(heap, (0.0, source))
+
+		#	Stack-Order Tracking
+			n_finalized = 0
+			finalized = falses(n)
+
+		#	Tolerance for Equal-Distance Comparison
+		#	Scale with the magnitude of the larger distance to handle both
+		#	small and large absolute path costs robustly.
+			_DIJKSTRA_REL_EPS = 1e-12
+
+		#	Heap Operations (Min-Heap, 1-Indexed)
+			function _heap_push!(h, item)
+				push!(h, item)
+				i = length(h)
+				@inbounds while i > 1
+					parent = i >> 1
+					if h[i] < h[parent]
+						h[i], h[parent] = h[parent], h[i]
+						i = parent
+					else
+						break
+					end
+				end
+			end
+
+			function _heap_pop!(h)
+				top = h[1]
+				last_item = pop!(h)
+				if !isempty(h)
+					h[1] = last_item
+					i = 1
+					len = length(h)
+					@inbounds while true
+						l = 2 * i
+						r = l + 1
+						smallest = i
+						if l <= len && h[l] < h[smallest]
+							smallest = l
+						end
+						if r <= len && h[r] < h[smallest]
+							smallest = r
+						end
+						if smallest != i
+							h[i], h[smallest] = h[smallest], h[i]
+							i = smallest
+						else
+							break
+						end
+					end
+				end
+				return top
+			end
+
+		#	Main Dijkstra Loop
+			@inbounds while !isempty(heap)
+				#	Pop Closest Unfinalized Node
+					(d_v, v) = _heap_pop!(heap)
+
+				#	Skip Stale Heap Entries
+					if finalized[v]
+						continue
+					end
+
+				#	Finalize v
+					finalized[v] = true
+					n_finalized += 1
+					stack_order[n_finalized] = v
+
+				#	Relax Outgoing Edges
+					sigma_v   = sigma[v]
+					start_ptr = neighbor_starts[v]
+					end_ptr   = neighbor_starts[v + 1] - 1
+					for ptr in start_ptr:end_ptr
+						w    = neighbor_data[ptr]
+						cost = neighbor_costs[ptr]
+
+						#	Skip Inf-Cost Edges (Treated as Absent)
+							if !isfinite(cost)
+								continue
+							end
+
+						new_dist = d_v + cost
+						old_dist = distance[w]
+
+						#	Tolerance for Equal-Distance Comparison
+							scale = max(abs(new_dist), abs(old_dist), 1.0)
+							tol   = _DIJKSTRA_REL_EPS * scale
+
+						if new_dist < old_dist - tol
+							#	Strictly Shorter Path
+								distance[w] = new_dist
+								sigma[w]    = sigma_v
+								_heap_push!(heap, (new_dist, w))
+						elseif new_dist < old_dist + tol
+							#	Equally Short Path
+								sigma[w] += sigma_v
+						end
+						#	Otherwise: new_dist > old_dist, ignore
+					end
+			end
+
+		#	Return Number of Reachable Nodes
+			return n_finalized
+	end
+
 #	Helper Function for Path-Based Measures: Single-Source BFS
 	function _bfs_distances_and_sigma!(neighbor_starts::Vector{Int},
 	                                  neighbor_data::Vector{Int},
@@ -1279,30 +1587,117 @@ module network_statistics
 			return (per_source_sum, total_sum)
 	end
 
-#	Closeness Centrality (SMM Inverse-Distance Form)
+#	Helper Function for Weighted closeness_centrality and mean_inverse_distance:
+#	Compute Per-Source Inverse-Distance Sums and Total (Dijkstra)
+	function _all_pairs_inverse_distance_sum_weighted(adj::SparseMatrixCSC{<:Real, <:Integer},
+														edge_interpretation::Symbol)
+		"""
+		Args:
+			adj::SparseMatrixCSC: weighted sparse adjacency matrix
+			edge_interpretation::Symbol: :tie_strength or :distance
+		Returns:
+			Tuple{Vector{Float64}, Float64}: (per_source_inv_dist_sum, total_inv_dist_sum)
+				per_source_inv_dist_sum[i] = sum_{j != i} 1/d(i, j)
+				total_inv_dist_sum         = sum over all ordered pairs of 1/d(i, j)
+		Notes:
+			Weighted analog of _all_pairs_inverse_distance_sum. Single
+			all-pairs Dijkstra pass producing both the per-source sum
+			(for closeness) and the global total (for mean inverse distance).
+			Unreachable pairs contribute 0.
+
+			Threaded over source nodes. Each thread maintains its own work
+			buffers (distance, sigma, stack_order); results are combined
+			into the final vectors.
+
+			Treats the adjacency as weighted with the given semantic
+			interpretation. Weights are transformed to Dijkstra costs via
+			_transform_weights_for_path_cost. The CSR conversion happens
+			once before the threaded loop and is shared across threads.
+
+			For directed graphs, the per-source sum reflects the out-direction
+			(d(i, j) = directed weighted shortest path from i to j). The
+			caller is responsible for applying the desired direction
+			convention (symmetrize, transpose, etc.) before passing adj.
+		"""
+
+		#	Dimensions
+			n = size(adj, 1)
+
+		#	Build Weighted CSR Once (Shared Across Threads)
+			neighbor_starts, neighbor_data, neighbor_weights = _build_weighted_neighbor_lists(adj)
+
+		#	Transform Weights to Dijkstra Costs
+			neighbor_costs = _transform_weights_for_path_cost(neighbor_weights, edge_interpretation)
+
+		#	Per-Source Output and Thread-Local Total Accumulators
+			per_source_sum = zeros(Float64, n)
+			n_threads      = Threads.nthreads()
+			thread_totals  = zeros(Float64, n_threads)
+
+		#	Threaded Loop Over Sources
+			Threads.@threads for s in 1:n
+				#	Per-Thread Work Buffers
+					tid = Threads.threadid()
+					distance    = Vector{Float64}(undef, n)
+					sigma       = Vector{Float64}(undef, n)
+					stack_order = Vector{Int}(undef, n)
+
+				#	Single-Source Dijkstra
+					n_reached = _dijkstra_distances_and_sigma!(neighbor_starts,
+																neighbor_data,
+																neighbor_costs,
+																s,
+																distance,
+																sigma,
+																stack_order)
+
+				#	Sum 1/d Over Reachable Non-Source Nodes
+					local_sum = 0.0
+					@inbounds for idx in 2:n_reached
+						v = stack_order[idx]
+						d = distance[v]
+						if isfinite(d) && d > 0.0
+							local_sum += 1.0 / d
+						end
+					end
+
+				#	Write per-Source Result and Update Thread Total
+					per_source_sum[s] = local_sum
+					thread_totals[tid] += local_sum
+			end
+
+		#	Combine Thread Totals
+			total_sum = sum(thread_totals)
+
+		#	Return Both
+			return (per_source_sum, total_sum)
+	end
+
+#	Closeness Centrality (SMM Inverse-Distance Form, Binary or Weighted)
 	function closeness_centrality(edges::DataFrame;
-	                             nodes::Union{Nothing, DataFrame, AbstractVector{<:AbstractString}} = nothing,
-	                             weighted::Bool = false,
-	                             directed::Bool = true,
-	                             direction::Symbol = :symmetric,
-	                             edge_interpretation::Symbol = :ignore,
-	                             normalize::Bool = true,
-	                             agg_func::Function = sum)
+									nodes::Union{Nothing, DataFrame, AbstractVector{<:AbstractString}} = nothing,
+									weighted::Bool = false,
+									directed::Bool = true,
+									direction::Symbol = :symmetric,
+									edge_interpretation::Symbol = :tie_strength,
+									normalize::Bool = true,
+									agg_func::Function = sum)
 		"""
 		Args:
 			edges::DataFrame: edge list with :src, :dst, optionally :weight
 			nodes::Union{Nothing, DataFrame, Vector}: optional node universe
-			weighted::Bool: kept for API symmetry; ignored when
-				edge_interpretation=:ignore (default = false)
+			weighted::Bool: API symmetry; ignored — actual weight handling
+				is determined by edge_interpretation
 			directed::Bool: treat graph as directed (default = true)
 			direction::Symbol: :out | :in | :symmetric (default = :symmetric)
-			edge_interpretation::Symbol: :ignore (the only mode supported in this
-				commit). Use :ignore to binarize before path computation.
-				:tie_strength and :distance throw ArgumentError pending Dijkstra
-				implementation.
+			edge_interpretation::Symbol: how to interpret edge weights
+				:tie_strength (default) — weights are intensity; cost = 1/w
+					(Dijkstra on inverted weights)
+				:distance     — weights are distances; cost = w
+					(Dijkstra on raw weights)
+				:ignore       — binarize before path computation (BFS)
 			normalize::Bool: divide by N-1 (default = true)
-			agg_func::Function: aggregation for parallel edges (default = sum,
-				irrelevant when binarized)
+			agg_func::Function: aggregation for parallel edges (default = sum)
 		Returns:
 			DataFrame: columns [node, closeness]
 		Notes:
@@ -1310,26 +1705,48 @@ module network_statistics
 				C_C(i) = (1/(N-1)) * sum_{j != i} 1/d(i, j)
 			with 1/inf = 0 for unreachable pairs and 1/0 = 0 for self-pairs.
 
-			A directly-connected pair contributes 1/1 = 1; a 2-hop pair
-			contributes 1/2 = 0.5; an unreachable pair contributes 0. Under
-			normalize=true the node-level score is in [0, 1]: a node connected
-			at distance 1 to all N-1 others scores 1.0; a fully isolated node
-			scores 0.0.
+			Three edge-weight semantics:
+				:tie_strength (default) — weights interpreted as intensity
+					or frequency of the tie. Each edge cost is 1/w, so
+					stronger ties produce shorter weighted distances.
+					Standard for co-appearance, interaction, shared-attribute
+					networks (Marvel, Balikatan, Scotland, Moreno).
+				:distance — weights interpreted as costs or geographic
+					distances. Used as-is. Standard for transit and road
+					networks.
+				:ignore — binarize the graph before computing paths. Matches
+					Smith, Morgan, & Moody (2022) Table 1 convention. Used
+					for cross-binarization comparability with SMM and for
+					networks where weight semantics are unclear.
+
+			The default is :tie_strength because most networks in this
+			corpus encode weights as tie strength. To match SMM 2022's
+			binarized Table 1 convention exactly, pass
+			edge_interpretation=:ignore.
+
+			Performance:
+				:ignore — BFS, O(N + E) per source, fastest path
+				:tie_strength / :distance — Dijkstra, O((N + E) log N)
+					per source, ~2-3x slower than BFS on the same graph
 
 			For directed graphs:
 				:out       — d(i, j) is the directed shortest path i → j
 				:in        — d(i, j) is the directed shortest path j → i
 				:symmetric — compute on max(A, A^T), the symmetrized adjacency
-				             (this matches how Bonacich is computed; consistent
-				             with the SMM Phase 0 convention)
+					(this matches how Bonacich is computed; consistent with
+					the SMM Phase 0 convention)
 
 			For undirected graphs the `direction` argument is ignored; the
 			adjacency is symmetrized via max(A, A^T) since GraphML storage
 			may use asymmetric edge lists even for conceptually undirected
 			networks.
 
+			For weighted symmetric mode, max(A, A^T) takes the higher of
+			the two directed weights on a mutual pair. This is consistent
+			with the binary case where max(A, A^T) yields the union of
+			edges.
+
 			Pass `nodes` to include isolates (closeness = 0) in the output.
-			Without `nodes`, only nodes appearing in some edge are returned.
 		"""
 
 		#	Validation
@@ -1339,62 +1756,74 @@ module network_statistics
 			if !(direction in (:out, :in, :symmetric))
 				throw(ArgumentError("direction must be :out, :in, or :symmetric"))
 			end
-			if edge_interpretation != :ignore
+			if !(edge_interpretation in (:ignore, :tie_strength, :distance))
 				throw(ArgumentError(
-					"closeness_centrality: edge_interpretation=$(edge_interpretation) not yet implemented. " *
-					"Pass edge_interpretation=:ignore to binarize before path computation."
+					"closeness_centrality: edge_interpretation=$(edge_interpretation) not supported. " *
+					"Use :ignore (binary), :tie_strength (weights as intensity), or :distance (weights as cost)."
+				))
+			end
+
+		#	Edge Interpretation Requires Weight Column (Unless :ignore)
+			if edge_interpretation !== :ignore && !hasproperty(edges, :weight)
+				throw(ArgumentError(
+					"closeness_centrality: edge_interpretation=$(edge_interpretation) requires a :weight column on edges. " *
+					"Either add weights or pass edge_interpretation=:ignore for binary computation."
 				))
 			end
 
 		#	Handle Empty Edge List
 			if nrow(edges) == 0
 				if nodes !== nothing
-					#	Return Zeros for All Nodes in Universe
-						if nodes isa DataFrame
-							return DataFrame(node = nodes.id, closeness = zeros(Float64, nrow(nodes)))
-						else
-							return DataFrame(node = collect(nodes), closeness = zeros(Float64, length(nodes)))
-						end
+					if nodes isa DataFrame
+						return DataFrame(node = nodes.id, closeness = zeros(Float64, nrow(nodes)))
+					else
+						return DataFrame(node = collect(nodes), closeness = zeros(Float64, length(nodes)))
+					end
 				else
 					return DataFrame(node = [], closeness = Float64[])
 				end
 			end
 
-		#	Binarize Edges (edge_interpretation = :ignore)
-			edges_binary = DataFrame(src = edges.src, dst = edges.dst)
-			edges_binary.weight = ones(Float64, nrow(edges_binary))
-			edges_binary = _aggregate_multi_edges(edges_binary; agg_func = maximum)
-
-		#	Build Sparse Adjacency on Correct Node Universe
-			if nodes === nothing
-				adj, _, idx_to_node = _edgelist_to_sparse_matrix(edges_binary; weighted = false)
+		#	Prepare Edges and Build Sparse Adjacency
+		#	For :ignore, binarize. For :tie_strength and :distance, preserve weights.
+			if edge_interpretation === :ignore
+				edges_for_adj = DataFrame(src = edges.src, dst = edges.dst)
+				edges_for_adj.weight = ones(Float64, nrow(edges_for_adj))
+				edges_for_adj = _aggregate_multi_edges(edges_for_adj; agg_func = maximum)
+				build_weighted = false
 			else
-				adj, _, idx_to_node = _graph_to_sparse_matrix(edges_binary;
-				                                              nodes = nodes,
-				                                              weighted = false)
+				edges_for_adj = DataFrame(src = edges.src, dst = edges.dst, weight = edges.weight)
+				edges_for_adj = _aggregate_multi_edges(edges_for_adj; agg_func = agg_func)
+				build_weighted = true
+			end
+
+			if nodes === nothing
+				adj, _, idx_to_node = _edgelist_to_sparse_matrix(edges_for_adj; weighted = build_weighted)
+			else
+				adj, _, idx_to_node = _graph_to_sparse_matrix(edges_for_adj;
+																nodes    = nodes,
+																weighted = build_weighted)
 			end
 
 		#	Apply Direction Convention
 			if !directed
-				#	Symmetrize. We always symmetrize rather than checking, because
-				#	_is_symmetric(adj; directed=false) returns true by convention
-				#	(treating "undirected" as a label, not a property) and would
-				#	wrongly skip symmetrization on asymmetric storage.
-					adj = max.(adj, adj')
+				adj = max.(adj, adj')
 			else
 				if direction == :out
 					#	Use Adjacency As-Is
 				elseif direction == :in
-					#	Transpose to Reverse Path Direction
-						adj = sparse(adj')
+					adj = sparse(adj')
 				else  # :symmetric
-					#	Symmetrize via max(A, A^T)
-						adj = max.(adj, adj')
+					adj = max.(adj, adj')
 				end
 			end
 
-		#	Compute Per-Source Inverse-Distance Sums
-			per_source_sum, _ = _all_pairs_inverse_distance_sum(adj)
+		#	Compute Per-Source Inverse-Distance Sums (BFS or Dijkstra)
+			if edge_interpretation === :ignore
+				per_source_sum, _ = _all_pairs_inverse_distance_sum(adj)
+			else
+				per_source_sum, _ = _all_pairs_inverse_distance_sum_weighted(adj, edge_interpretation)
+			end
 
 		#	Apply Normalization
 			N = size(adj, 1)
@@ -1408,55 +1837,82 @@ module network_statistics
 	@doc raw"""
 	**Description**
 	Compute closeness centrality using Smith, Morgan, & Moody's (2022)
-	inverse-distance formulation: each node's score is the (normalized) sum of
-	the reciprocals of its shortest-path distances to all other nodes, with
-	unreachable pairs contributing 0.
+	inverse-distance formulation: each node's score is the (normalized) sum
+	of the reciprocals of its shortest-path distances to all other nodes,
+	with unreachable pairs contributing 0. Supports three weight semantics:
+	tie strength (default), distance, or ignored (binary).
 
 	**Usage**
-	`closeness_centrality(edges::DataFrame; nodes=nothing, weighted=false, directed=true, direction=:symmetric, edge_interpretation=:ignore, normalize=true, agg_func=sum)`
+	`closeness_centrality(edges; nodes=nothing, weighted=false, directed=true, direction=:symmetric, edge_interpretation=:tie_strength, normalize=true, agg_func=sum)`
 
 	**Arguments**
-	- `edges::DataFrame`: Edge list with `:src` and `:dst`, optionally `:weight`.
-	- `nodes::Union{Nothing,DataFrame,Vector}`: Optional node universe. Pass to
-	  include isolates (`closeness = 0`) in the output.
-	- `weighted::Bool`: API symmetry only; ignored when `edge_interpretation=:ignore`.
+	- `edges::DataFrame`: Edge list with `:src`, `:dst`, and (for non-`:ignore`
+	  interpretations) `:weight`.
+	- `nodes::Union{Nothing,DataFrame,Vector}`: Optional node universe. Pass
+	  to include isolates.
+	- `weighted::Bool`: API symmetry only; actual weight handling is
+	  controlled by `edge_interpretation`.
 	- `directed::Bool`: Treat as directed (default `true`).
-	- `direction::Symbol`: For directed graphs, one of `:out`, `:in`, or
-	  `:symmetric` (default `:symmetric`). Ignored for undirected graphs.
-	  `:symmetric` computes on `max(A, A^T)`, matching the Phase 0 convention
-	  used for Bonacich.
-	- `edge_interpretation::Symbol`: `:ignore` (binarize before path computation,
-	  the only currently-supported mode). `:tie_strength` and `:distance` will
-	  raise `ArgumentError` pending the Dijkstra implementation.
-	- `normalize::Bool`: Divide by $N-1$ (default `true`). A node connected at
-	  distance 1 to all others scores 1.0; an isolate scores 0.0.
+	- `direction::Symbol`: For directed graphs: `:out`, `:in`, or
+	  `:symmetric` (default `:symmetric`).
+	- `edge_interpretation::Symbol`: How to interpret edge weights.
+	  - `:tie_strength` (default) — weights are intensity; edge cost = $1/w$
+	    (Dijkstra on inverted weights). Standard for co-appearance,
+	    interaction-count, and shared-attribute networks.
+	  - `:distance` — weights are distances/costs; used as-is (Dijkstra on
+	    raw weights). Standard for road and transit networks.
+	  - `:ignore` — binarize before computing paths (BFS). Matches the SMM
+	    (2022) Table 1 convention; required to reproduce that table's values.
+	- `normalize::Bool`: Divide by $N-1$ (default `true`). A node connected
+	  at distance 1 to all others scores 1.0; an isolate scores 0.0.
 	- `agg_func::Function`: Aggregation for parallel edges (default `sum`).
 
 	**Details**
-	Defined as $C_C(i) = \frac{1}{N-1} \sum_{j \neq i} \frac{1}{d(i,j)}$ with
-	$\frac{1}{\infty} = 0$. Shortest-path distances are computed by BFS on the
-	binarized adjacency. Threaded over source nodes via `Threads.@threads`.
+	The score is $C_C(i) = \frac{1}{N-1} \sum_{j \neq i} \frac{1}{d(i, j)}$
+	with $\frac{1}{\infty} = 0$ for unreachable pairs.
 
-	For directed graphs the `direction` keyword selects how the directed
-	adjacency is treated. The default `:symmetric` uses $\max(A, A^T)$, matching
-	the convention SMM (2022) use for Bonacich power centrality on directed
-	networks. Use `:out` or `:in` for asymmetric reachability summaries.
+	When `edge_interpretation = :ignore`, distances are integer hop counts
+	from BFS on the binarized graph; the result reproduces SMM (2022).
+	When `:tie_strength`, edges with weight $w$ contribute cost $1/w$ to
+	any path through them — stronger ties give shorter weighted distances.
+	When `:distance`, edges contribute their weight directly. Both weighted
+	modes use Dijkstra's algorithm; threaded over source nodes.
+
+	The default is `:tie_strength` because most networks in this corpus
+	encode weights as tie strength rather than as geographic or cost
+	distances. To match the binarized SMM (2022) convention exactly, pass
+	`edge_interpretation = :ignore`.
+
+	**Performance**
+	`:ignore` uses BFS with cost $O(N + E)$ per source. `:tie_strength` and
+	`:distance` use Dijkstra with cost $O((N + E) \log N)$ per source, about
+	2–3× slower on the same graph. All three paths are threaded over source
+	nodes.
 
 	**Value**
 	A `DataFrame` with columns `:node` and `:closeness`.
 
 	**Examples**
 	```julia
-	using DataFrames
-	edges = DataFrame(src=[1,1,2,3], dst=[2,3,3,2])
-	nodes = DataFrame(id=string.(1:5), label=string.(1:5))
-	closeness_centrality(edges; nodes=nodes, directed=true, direction=:symmetric)
+		using DataFrames
+
+		#	Default: weights interpreted as tie strength
+			edges = DataFrame(src=[1,1,2,3], dst=[2,3,3,2], weight=[3.0, 1.0, 2.0, 4.0])
+			nodes = DataFrame(id=string.(1:5), label=string.(1:5))
+			closeness_centrality(edges; nodes=nodes, directed=true, direction=:symmetric)
+
+		#	SMM-style binarized closeness (matches SMM 2022 Table 1)
+			closeness_centrality(edges; nodes=nodes, edge_interpretation=:ignore)
+
+		#	Distance semantics (e.g., road network with travel times)
+			closeness_centrality(edges; nodes=nodes, edge_interpretation=:distance)
 	```
 
 	**References**
 	- Smith JA, Morgan JH, Moody J (2022). "Network sampling coverage III."
 	  *Social Networks* 68: 148–178.
-	- Marchiori M, Latora V (2000). "Harmony in the small-world." *Physica A* 285.
+	- Dijkstra EW (1959). "A note on two problems in connexion with graphs."
+	  *Numerische Mathematik* 1: 269–271.
 
 	**See Also**
 	`betweenness_centrality`, `mean_inverse_distance`
@@ -1666,24 +2122,26 @@ module network_statistics
 	`closeness_centrality`, `mean_inverse_distance`
 	""" betweenness_centrality
 
-#	Mean Inverse Distance, Optionally Scaled by Log N
+#	Mean Inverse Distance, Optionally Scaled by Log N (Binary or Weighted)
 	function mean_inverse_distance(edges::DataFrame;
-	                              nodes::Union{Nothing, DataFrame, AbstractVector{<:AbstractString}} = nothing,
-	                              weighted::Bool = false,
-	                              directed::Bool = true,
-	                              direction::Symbol = :symmetric,
-	                              edge_interpretation::Symbol = :ignore,
-	                              scale_by_log_n::Bool = true,
-	                              agg_func::Function = sum)
+									nodes::Union{Nothing, DataFrame, AbstractVector{<:AbstractString}} = nothing,
+									weighted::Bool = false,
+									directed::Bool = true,
+									direction::Symbol = :symmetric,
+									edge_interpretation::Symbol = :tie_strength,
+									scale_by_log_n::Bool = true,
+									agg_func::Function = sum)
 		"""
 		Args:
 			edges::DataFrame: edge list with :src, :dst, optionally :weight
 			nodes::Union{Nothing, DataFrame, Vector}: optional node universe
-			weighted::Bool: API symmetry; ignored when edge_interpretation=:ignore
+			weighted::Bool: API symmetry; ignored
 			directed::Bool: treat graph as directed (default = true)
 			direction::Symbol: :out | :in | :symmetric (default = :symmetric)
-				(only relevant for directed graphs; mirrors closeness_centrality)
-			edge_interpretation::Symbol: :ignore only in this commit
+			edge_interpretation::Symbol: how to interpret edge weights
+				:tie_strength (default) — weights as intensity, cost = 1/w (Dijkstra)
+				:distance     — weights as cost, used as-is (Dijkstra)
+				:ignore       — binarize before path computation (BFS)
 			scale_by_log_n::Bool: divide by log(N) per SMM footnote 6 (default = true)
 			agg_func::Function: aggregation for parallel edges (default = sum)
 		Returns:
@@ -1691,17 +2149,27 @@ module network_statistics
 		Notes:
 			Smith, Morgan, & Moody (2022) third topology measure:
 				MID = (1 / (N(N-1))) * sum_{i != j} 1/d(i, j)
-			with 1/inf = 0 for unreachable pairs. For undirected graphs the
-			sum runs over unordered pairs with denominator binom(N, 2).
+			with 1/inf = 0 for unreachable pairs.
 
-			When scale_by_log_n=true, divides by log(N) per SMM footnote 6
-			(rationale: larger networks have proportionally more disconnected
-			pairs, so unscaled MID drops mechanically with N).
+			The edge_interpretation argument controls how edge weights enter
+			into d(i, j):
+				:tie_strength — d(i, j) is the weighted shortest path under
+					cost = 1/w. Stronger ties give shorter distances.
+				:distance — d(i, j) is the weighted shortest path under
+					cost = w.
+				:ignore — d(i, j) is the unweighted hop count via BFS;
+					matches the SMM (2022) Table 1 convention.
 
-			Falls out of the same all-pairs BFS used by closeness_centrality.
-			The function reuses the shared _all_pairs_inverse_distance_sum
-			helper, divides by the appropriate pair count, and optionally
-			scales by log(N).
+			The default is :tie_strength for consistency with
+			closeness_centrality. To match SMM 2022 exactly, pass
+			edge_interpretation=:ignore.
+
+			When scale_by_log_n=true, divides by log(N) per SMM footnote 6.
+			The rationale (larger networks have proportionally more
+			disconnected pairs, pulling unscaled MID down mechanically) was
+			developed for binary graphs; the same intuition applies to
+			weighted graphs but the scaling is more aesthetic than principled
+			under weighted interpretations.
 
 			Returns 0.0 if N < 2.
 		"""
@@ -1713,10 +2181,15 @@ module network_statistics
 			if !(direction in (:out, :in, :symmetric))
 				throw(ArgumentError("direction must be :out, :in, or :symmetric"))
 			end
-			if edge_interpretation != :ignore
+			if !(edge_interpretation in (:ignore, :tie_strength, :distance))
 				throw(ArgumentError(
-					"mean_inverse_distance: edge_interpretation=$(edge_interpretation) not yet implemented. " *
-					"Pass edge_interpretation=:ignore to binarize before path computation."
+					"mean_inverse_distance: edge_interpretation=$(edge_interpretation) not supported. " *
+					"Use :ignore (binary), :tie_strength (weights as intensity), or :distance (weights as cost)."
+				))
+			end
+			if edge_interpretation !== :ignore && !hasproperty(edges, :weight)
+				throw(ArgumentError(
+					"mean_inverse_distance: edge_interpretation=$(edge_interpretation) requires a :weight column on edges."
 				))
 			end
 
@@ -1725,18 +2198,24 @@ module network_statistics
 				return 0.0
 			end
 
-		#	Binarize Edges
-			edges_binary = DataFrame(src = edges.src, dst = edges.dst)
-			edges_binary.weight = ones(Float64, nrow(edges_binary))
-			edges_binary = _aggregate_multi_edges(edges_binary; agg_func = maximum)
-
-		#	Build Sparse Adjacency on Correct Node Universe
-			if nodes === nothing
-				adj, _, _ = _edgelist_to_sparse_matrix(edges_binary; weighted = false)
+		#	Prepare Edges and Build Sparse Adjacency
+			if edge_interpretation === :ignore
+				edges_for_adj = DataFrame(src = edges.src, dst = edges.dst)
+				edges_for_adj.weight = ones(Float64, nrow(edges_for_adj))
+				edges_for_adj = _aggregate_multi_edges(edges_for_adj; agg_func = maximum)
+				build_weighted = false
 			else
-				adj, _, _ = _graph_to_sparse_matrix(edges_binary;
-				                                    nodes = nodes,
-				                                    weighted = false)
+				edges_for_adj = DataFrame(src = edges.src, dst = edges.dst, weight = edges.weight)
+				edges_for_adj = _aggregate_multi_edges(edges_for_adj; agg_func = agg_func)
+				build_weighted = true
+			end
+
+			if nodes === nothing
+				adj, _, _ = _edgelist_to_sparse_matrix(edges_for_adj; weighted = build_weighted)
+			else
+				adj, _, _ = _graph_to_sparse_matrix(edges_for_adj;
+													nodes    = nodes,
+													weighted = build_weighted)
 			end
 
 		#	Apply Direction Convention
@@ -1750,11 +2229,14 @@ module network_statistics
 				elseif direction == :symmetric
 					adj = max.(adj, adj')
 				end
-				# :out uses adj as-is
 			end
 
-		#	Get Total Inverse-Distance Sum (Over Ordered Pairs)
-			_, total_inv_dist = _all_pairs_inverse_distance_sum(adj)
+		#	Get Total Inverse-Distance Sum (BFS or Dijkstra)
+			if edge_interpretation === :ignore
+				_, total_inv_dist = _all_pairs_inverse_distance_sum(adj)
+			else
+				_, total_inv_dist = _all_pairs_inverse_distance_sum_weighted(adj, edge_interpretation)
+			end
 
 		#	Dimensions
 			N = size(adj, 1)
@@ -1763,23 +2245,11 @@ module network_statistics
 			end
 
 		#	Divide by Pair Count
-			if directed && direction != :symmetric
-				#	Ordered Pairs (i, j) with i != j
-					mid = total_inv_dist / (N * (N - 1))
-			else
-				#	Undirected or Symmetrized: Each Unordered Pair Counted Twice in
-				#	the Directed Sum, So Divide by N*(N-1) Still Yields the Average
-				#	Over Ordered Pairs (Which Equals the Average Over Unordered).
-					mid = total_inv_dist / (N * (N - 1))
-			end
+			mid = total_inv_dist / (N * (N - 1))
 
 		#	Scale by Log N
 			if scale_by_log_n
-				if N > 1
-					mid /= log(N)
-				else
-					mid = 0.0
-				end
+				mid /= log(N)
 			end
 
 		#	Return
@@ -1790,39 +2260,52 @@ module network_statistics
 	Compute the mean inverse distance between node pairs in the network,
 	optionally scaled by $\log N$ to mitigate the mechanical decline of the
 	raw measure with network size (per Smith, Morgan, & Moody 2022, footnote 6).
+	Supports binary (BFS), tie-strength-weighted (Dijkstra on $1/w$), or
+	distance-weighted (Dijkstra on $w$) path computation.
 
 	**Usage**
-	`mean_inverse_distance(edges::DataFrame; nodes=nothing, weighted=false, directed=true, direction=:symmetric, edge_interpretation=:ignore, scale_by_log_n=true, agg_func=sum)`
+	`mean_inverse_distance(edges; nodes=nothing, weighted=false, directed=true, direction=:symmetric, edge_interpretation=:tie_strength, scale_by_log_n=true, agg_func=sum)`
 
 	**Arguments**
-	- `edges::DataFrame`: Edge list with `:src` and `:dst`, optionally `:weight`.
+	- `edges::DataFrame`: Edge list with `:src`, `:dst`, and (for non-`:ignore`
+	  interpretations) `:weight`.
 	- `nodes::Union{Nothing,DataFrame,Vector}`: Optional node universe.
-	- `weighted::Bool`: API symmetry; ignored when `edge_interpretation=:ignore`.
+	- `weighted::Bool`: API symmetry; ignored.
 	- `directed::Bool`: Treat as directed (default `true`).
 	- `direction::Symbol`: `:out`, `:in`, or `:symmetric` (default `:symmetric`).
-	- `edge_interpretation::Symbol`: Only `:ignore` currently supported.
+	- `edge_interpretation::Symbol`: How to interpret edge weights:
+	  - `:tie_strength` (default) — Dijkstra on $1/w$, stronger ties give
+	    shorter paths.
+	  - `:distance` — Dijkstra on $w$, used as-is.
+	  - `:ignore` — BFS on binarized graph. Matches SMM (2022) Table 1.
 	- `scale_by_log_n::Bool`: Divide by $\log N$ (default `true`).
 	- `agg_func::Function`: Aggregation for parallel edges (default `sum`).
 
 	**Details**
 	Defined as
 	$$\overline{d^{-1}} = \frac{1}{N(N-1)} \sum_{i \neq j} \frac{1}{d(i, j)}$$
-	with $1/\infty = 0$ for unreachable pairs. The $\log N$ scaling rationale
-	is that as $N$ grows, the proportion of unreachable pairs typically grows,
-	pulling the unscaled mean down mechanically.
+	with $1/\infty = 0$ for unreachable pairs. The choice of $d(i,j)$ is
+	controlled by `edge_interpretation`: BFS hop count for `:ignore`,
+	weighted Dijkstra distance for `:tie_strength` and `:distance`.
 
-	Shares the all-pairs BFS computation with `closeness_centrality`. Higher
-	values indicate a more compact / better-connected network.
+	The default `:tie_strength` matches `closeness_centrality` and reflects
+	the dominant weight semantics in this corpus. To match SMM (2022)
+	exactly, pass `:ignore`.
 
 	**Value**
 	A `Float64` summary statistic for the whole network.
 
 	**Examples**
-	```julia
+```julia
 	using DataFrames
-	edges = DataFrame(src=[1,1,2,3], dst=[2,3,3,2])
-	mean_inverse_distance(edges; directed=true, direction=:symmetric)
-	```
+
+	#	Default: weights as tie strength
+		edges = DataFrame(src=[1,1,2,3], dst=[2,3,3,2], weight=[3.0, 1.0, 2.0, 4.0])
+		mean_inverse_distance(edges; directed=true, direction=:symmetric)
+
+	#	SMM-compatible binarized form
+		mean_inverse_distance(edges; edge_interpretation=:ignore)
+```
 
 	**References**
 	- Smith JA, Morgan JH, Moody J (2022). "Network sampling coverage III."

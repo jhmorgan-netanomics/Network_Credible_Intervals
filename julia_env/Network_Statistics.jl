@@ -550,9 +550,11 @@ using Network_Credible_Intervals
 		Notes:
 			Verifies closeness_centrality, betweenness_centrality, and
 			mean_inverse_distance on the 8-node synthetic network with
-			hand-computed expected values.
+			hand-computed expected values, then exercises the weighted-path
+			dispatch (:tie_strength, :distance) on a small varied-weight
+			directed path with hand-computed weighted distances.
 
-			Topology recap:
+			Topology recap (foundation test network):
 				1 → 2, 1 → 3, 2 → 3, 3 → 2     (component A: 2-out hub + mutual)
 				4 → 5, 5 → 6, 6 → 4              (component B: directed triangle)
 				7, 8                              (isolates)
@@ -574,31 +576,35 @@ using Network_Credible_Intervals
 
 			Expected betweenness (directed, unnormalized):
 				Triangle component: each node sits on exactly one length-2
-				geodesic (e.g., 4→5→6 puts 5 on the path 4→6) → B = 1
-				Mutual dyad 2↔3: all geodesics are length 1, no intermediates
-				Node 1: pure source, sits on no path
-				Nodes 7, 8: isolates, sit on no path
+				geodesic → B = 1. Mutual dyad: no intermediates. Isolates: 0.
 				Expected: [0, 0, 0, 1, 1, 1, 0, 0]
 
 			Expected betweenness (undirected/symmetric, unnormalized):
 				Once symmetrized, component B becomes a 3-clique. Every pair
-				is at distance 1; no intermediates. All zeros.
+				at distance 1; no intermediates. All zeros.
 				Expected: [0, 0, 0, 0, 0, 0, 0, 0]
 
 			Expected mean_inverse_distance:
-				Directed, sum over ordered pairs:
-					Component A: 4 edges at d=1 → contribution 4.0
-					Component B: 6 ordered pairs (3 at d=1, 3 at d=2) →
-						contribution 3 * 1 + 3 * 0.5 = 4.5
-					Grand total = 8.5
-					Mean = 8.5 / (8 * 7) = 8.5 / 56 ≈ 0.15179
-					Scaled by log(8) ≈ 2.0794 → ≈ 0.07299
+				Directed out: 8.5/56 ≈ 0.15179, scaled by log(8) ≈ 0.07299
+				Symmetric:   12/56 ≈ 0.21429, scaled by log(8) ≈ 0.10305
 
-				Symmetric: both components are 3-cliques.
-					Each contributes 3 * 2 = 6 ordered pairs at d=1 → 6
-					Total = 12
-					Mean = 12 / 56 ≈ 0.21429
-					Scaled by log(8) → ≈ 0.10305
+			Weighted-path fixture (tests 12-15): directed path 1→2→3→4
+			with weights [2.0, 4.0, 1.0] on edges (1,2), (2,3), (3,4).
+				Under :tie_strength (cost = 1/w):
+					1→2: cost 0.5
+					2→3: cost 0.25
+					3→4: cost 1.0
+					Shortest distances from 1: d(1,2)=0.5, d(1,3)=0.75, d(1,4)=1.75
+					Sum 1/d from node 1 = 1/0.5 + 1/0.75 + 1/1.75
+					                    = 2 + 1.3333... + 0.5714...
+					                    ≈ 3.9048
+				Under :distance (cost = w):
+					Shortest distances from 1: d(1,2)=2, d(1,3)=6, d(1,4)=7
+					Sum 1/d from node 1 = 1/2 + 1/6 + 1/7 = 0.5 + 0.1667 + 0.1429
+					                    ≈ 0.8095
+				Under :ignore (BFS hop counts):
+					Shortest distances from 1: d(1,2)=1, d(1,3)=2, d(1,4)=3
+					Sum 1/d from node 1 = 1 + 0.5 + 1/3 ≈ 1.8333
 		"""
 
 		println("=" ^ 70)
@@ -657,14 +663,8 @@ using Network_Credible_Intervals
 				                                 direction = :in,
 				                                 edge_interpretation = :ignore,
 				                                 normalize = true), :node)
-				#	Hand-computed in-distances:
-				#	Node 1: reachable from none → 0
-				#	Node 2: reachable from 1 (d=1), 3 (d=1) → 2/7
-				#	Node 3: reachable from 1 (d=1), 2 (d=1) → 2/7
-				#	Nodes 4, 5, 6: symmetric in the triangle → 1.5/7 each
-				#	Nodes 7, 8: 0
-					expected = [0.0, 2/7, 2/7, 1.5/7, 1.5/7, 1.5/7, 0.0, 0.0]
-					@assert isapprox(cc_in.closeness, expected; atol = 1e-10) "Got: $(cc_in.closeness)"
+				expected = [0.0, 2/7, 2/7, 1.5/7, 1.5/7, 1.5/7, 0.0, 0.0]
+				@assert isapprox(cc_in.closeness, expected; atol = 1e-10) "Got: $(cc_in.closeness)"
 				println("  PASSED")
 			catch e
 				println("  FAILED: $e")
@@ -744,10 +744,8 @@ using Network_Credible_Intervals
 				                                     directed = true,
 				                                     edge_interpretation = :ignore,
 				                                     normalize = true), :node)
-				#	Denominator: (N-1)(N-2) = 7 * 6 = 42
-				#	Normalized values: [0,0,0,1/42,1/42,1/42,0,0]
-					expected = [0.0, 0.0, 0.0, 1/42, 1/42, 1/42, 0.0, 0.0]
-					@assert isapprox(bc_norm.betweenness, expected; atol = 1e-12) "Got: $(bc_norm.betweenness)"
+				expected = [0.0, 0.0, 0.0, 1/42, 1/42, 1/42, 0.0, 0.0]
+				@assert isapprox(bc_norm.betweenness, expected; atol = 1e-12) "Got: $(bc_norm.betweenness)"
 				println("  PASSED")
 			catch e
 				println("  FAILED: $e")
@@ -805,18 +803,194 @@ using Network_Credible_Intervals
 				all_passed = false
 			end
 
-		#	Test 12: edge_interpretation Unsupported Mode Throws Cleanly
-			println("\nTest 12: edge_interpretation=:tie_strength raises ArgumentError")
+		#	---------------------------------------------------------------
+		#	Weighted-Path Tests (Tests 12-15)
+		#	---------------------------------------------------------------
+		#	Use a small varied-weight directed path: 1→2 (w=2), 2→3 (w=4),
+		#	3→4 (w=1). Hand-computed weighted distances under each
+		#	edge_interpretation mode. The fixture is inline so it doesn't
+		#	affect other tests that might use the foundation network.
+
+		#	Build Varied-Weight Path Fixture
+			weighted_edges = DataFrame(src    = ["1", "2", "3"],
+			                          dst    = ["2", "3", "4"],
+			                          weight = [2.0, 4.0, 1.0])
+			weighted_nodes = DataFrame(id    = string.(1:4),
+			                          label = string.(1:4))
+
+		#	Test 12: Closeness with edge_interpretation=:tie_strength (Default)
+			println("\nTest 12: closeness_centrality (:tie_strength on weighted path)")
+			try
+				cc_ts = sort(closeness_centrality(weighted_edges;
+				                                 nodes = weighted_nodes,
+				                                 directed = true,
+				                                 direction = :out,
+				                                 edge_interpretation = :tie_strength,
+				                                 normalize = true), :node)
+				#	From node 1 (out direction): reaches 2 (cost 0.5), 3 (cost 0.75), 4 (cost 1.75)
+				#	Sum 1/d = 1/0.5 + 1/0.75 + 1/1.75 = 2 + 4/3 + 4/7 = (84+56+24)/42 = 164/42
+				#	Normalized: 164/42 / 3 = 164/126 ≈ 1.3016
+					exp_node1 = (1.0/0.5 + 1.0/0.75 + 1.0/1.75) / 3
+				#	From node 2: reaches 3 (cost 0.25), 4 (cost 1.25)
+				#	Sum 1/d = 4 + 0.8 = 4.8, normalized = 4.8/3 = 1.6
+					exp_node2 = (1.0/0.25 + 1.0/1.25) / 3
+				#	From node 3: reaches 4 (cost 1.0)
+				#	Sum 1/d = 1, normalized = 1/3
+					exp_node3 = 1.0 / 3
+				#	From node 4: reaches nothing → 0
+					exp_node4 = 0.0
+					expected  = [exp_node1, exp_node2, exp_node3, exp_node4]
+					@assert isapprox(cc_ts.closeness, expected; atol = 1e-10) "Got: $(cc_ts.closeness), Expected: $expected"
+				println("  PASSED (node 1 closeness = $(round(cc_ts.closeness[1], digits=6)))")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Test 13: Closeness with edge_interpretation=:distance
+			println("\nTest 13: closeness_centrality (:distance on weighted path)")
+			try
+				cc_dist = sort(closeness_centrality(weighted_edges;
+				                                   nodes = weighted_nodes,
+				                                   directed = true,
+				                                   direction = :out,
+				                                   edge_interpretation = :distance,
+				                                   normalize = true), :node)
+				#	From node 1 (out): reaches 2 (cost 2), 3 (cost 6), 4 (cost 7)
+				#	Sum 1/d = 0.5 + 1/6 + 1/7, normalized / 3
+					exp_node1 = (1.0/2.0 + 1.0/6.0 + 1.0/7.0) / 3
+				#	From node 2: reaches 3 (cost 4), 4 (cost 5)
+					exp_node2 = (1.0/4.0 + 1.0/5.0) / 3
+				#	From node 3: reaches 4 (cost 1)
+					exp_node3 = 1.0 / 3
+				#	From node 4: 0
+					exp_node4 = 0.0
+					expected  = [exp_node1, exp_node2, exp_node3, exp_node4]
+					@assert isapprox(cc_dist.closeness, expected; atol = 1e-10) "Got: $(cc_dist.closeness), Expected: $expected"
+				println("  PASSED (node 1 closeness = $(round(cc_dist.closeness[1], digits=6)))")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Test 14: Three Modes Produce Different Results on Same Graph
+			println("\nTest 14: :ignore, :tie_strength, :distance produce distinct results")
+			try
+				#	Compute Closeness Under All Three Modes
+					cc_ign  = sort(closeness_centrality(weighted_edges;
+					                                   nodes = weighted_nodes,
+					                                   directed = true,
+					                                   direction = :out,
+					                                   edge_interpretation = :ignore), :node)
+					cc_ts2  = sort(closeness_centrality(weighted_edges;
+					                                   nodes = weighted_nodes,
+					                                   directed = true,
+					                                   direction = :out,
+					                                   edge_interpretation = :tie_strength), :node)
+					cc_dst2 = sort(closeness_centrality(weighted_edges;
+					                                   nodes = weighted_nodes,
+					                                   directed = true,
+					                                   direction = :out,
+					                                   edge_interpretation = :distance), :node)
+				#	Node 1's Closeness Should Differ Across All Three Modes
+					ign_v1 = cc_ign.closeness[1]
+					ts_v1  = cc_ts2.closeness[1]
+					dst_v1 = cc_dst2.closeness[1]
+					@assert !isapprox(ign_v1, ts_v1; atol = 1e-6) ":ignore and :tie_strength produced same closeness for node 1: $ign_v1"
+					@assert !isapprox(ign_v1, dst_v1; atol = 1e-6) ":ignore and :distance produced same closeness for node 1: $ign_v1"
+					@assert !isapprox(ts_v1, dst_v1; atol = 1e-6) ":tie_strength and :distance produced same closeness for node 1: $ts_v1"
+				println("  PASSED (:ignore=$(round(ign_v1, digits=4)), :tie_strength=$(round(ts_v1, digits=4)), :distance=$(round(dst_v1, digits=4)))")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Test 15: Mean Inverse Distance Under Weighted Modes
+			println("\nTest 15: mean_inverse_distance under all three modes")
+			try
+				#	:ignore on Weighted Path → BFS Hop Counts
+				#	Ordered pairs in path of length 4: (1,2)d=1, (1,3)d=2, (1,4)d=3,
+				#	(2,3)d=1, (2,4)d=2, (3,4)d=1. Sum 1/d = 1 + 0.5 + 1/3 + 1 + 0.5 + 1 = 4.333...
+				#	Mean = 4.333.../(4*3) = 0.3611..., scaled by log(4) = 1.3863 → 0.2604...
+					mid_ign = mean_inverse_distance(weighted_edges;
+					                              nodes = weighted_nodes,
+					                              directed = true,
+					                              direction = :out,
+					                              edge_interpretation = :ignore,
+					                              scale_by_log_n = false)
+					expected_ign = (1.0 + 0.5 + 1.0/3 + 1.0 + 0.5 + 1.0) / (4 * 3)
+					@assert isapprox(mid_ign, expected_ign; atol = 1e-10) ":ignore MID got $mid_ign, expected $expected_ign"
+
+				#	:tie_strength → Dijkstra on 1/w; same ordered pairs, weighted distances
+				#	Costs: 1→2 = 0.5, 2→3 = 0.25, 3→4 = 1.0
+				#	d(1,2) = 0.5, d(1,3) = 0.75, d(1,4) = 1.75
+				#	d(2,3) = 0.25, d(2,4) = 1.25
+				#	d(3,4) = 1.0
+				#	Sum 1/d = 2 + 4/3 + 4/7 + 4 + 0.8 + 1
+					mid_ts = mean_inverse_distance(weighted_edges;
+					                              nodes = weighted_nodes,
+					                              directed = true,
+					                              direction = :out,
+					                              edge_interpretation = :tie_strength,
+					                              scale_by_log_n = false)
+					expected_ts = (1.0/0.5 + 1.0/0.75 + 1.0/1.75 + 1.0/0.25 + 1.0/1.25 + 1.0/1.0) / (4 * 3)
+					@assert isapprox(mid_ts, expected_ts; atol = 1e-10) ":tie_strength MID got $mid_ts, expected $expected_ts"
+
+				#	:distance → Dijkstra on raw weights
+				#	d(1,2) = 2, d(1,3) = 6, d(1,4) = 7, d(2,3) = 4, d(2,4) = 5, d(3,4) = 1
+					mid_dist = mean_inverse_distance(weighted_edges;
+					                                nodes = weighted_nodes,
+					                                directed = true,
+					                                direction = :out,
+					                                edge_interpretation = :distance,
+					                                scale_by_log_n = false)
+					expected_dist = (1.0/2.0 + 1.0/6.0 + 1.0/7.0 + 1.0/4.0 + 1.0/5.0 + 1.0/1.0) / (4 * 3)
+					@assert isapprox(mid_dist, expected_dist; atol = 1e-10) ":distance MID got $mid_dist, expected $expected_dist"
+
+				#	All Three Should Differ
+					@assert !isapprox(mid_ign, mid_ts; atol = 1e-6) ":ignore and :tie_strength MID matched: $mid_ign"
+					@assert !isapprox(mid_ign, mid_dist; atol = 1e-6) ":ignore and :distance MID matched"
+
+				println("  PASSED (:ignore=$(round(mid_ign, digits=4)), :tie_strength=$(round(mid_ts, digits=4)), :distance=$(round(mid_dist, digits=4)))")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Test 16: Betweenness Still Errors on Weighted Modes (Deferred)
+			println("\nTest 16: betweenness_centrality(:tie_strength) raises ArgumentError (deferred)")
+			try
+				try
+					_ = betweenness_centrality(weighted_edges;
+					                          nodes = weighted_nodes,
+					                          directed = true,
+					                          edge_interpretation = :tie_strength)
+					all_passed = false
+					println("  FAILED: expected ArgumentError, got result")
+				catch e2
+					if e2 isa ArgumentError && occursin("not yet implemented", e2.msg)
+						println("  PASSED (ArgumentError for deferred weighted Brandes)")
+					else
+						rethrow(e2)
+					end
+				end
+			catch e
+				println("  FAILED: unexpected exception: $e")
+				all_passed = false
+			end
+
+		#	Test 17: Unknown edge_interpretation Mode Raises ArgumentError
+			println("\nTest 17: edge_interpretation=:bogus raises ArgumentError")
 			try
 				try
 					_ = closeness_centrality(edges;
 					                        nodes = nodes,
-					                        edge_interpretation = :tie_strength)
+					                        edge_interpretation = :bogus)
 					all_passed = false
 					println("  FAILED: expected ArgumentError, got result")
 				catch e2
 					if e2 isa ArgumentError
-						println("  PASSED (ArgumentError as expected)")
+						println("  PASSED (ArgumentError for unrecognized mode)")
 					else
 						rethrow(e2)
 					end
@@ -833,7 +1007,7 @@ using Network_Credible_Intervals
 
 			return all_passed
 	end
-    run_synthetic_path_centrality_tests()
+	run_synthetic_path_centrality_tests()
 
 #   Moreno Tests
 	function generate_path_measures_csv(network_name::String,
