@@ -2600,6 +2600,193 @@ using Network_Credible_Intervals
 		return (all_passed = all_passed, per_motif = per_motif)
 	end
 
+#	Threaded-Only Timing: Single Layered Triad Census with Optional Auto-Recommendation
+	function time_threaded_layered(edges::DataFrame;
+									nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}}=nothing,
+									graph_type::Symbol=:directed,
+									reciprocity_collapse::Bool=false,
+									auto_recommend_L::Bool=false,
+									method::Symbol=:auto,
+									L::Int=8,
+									tau_min::Union{Symbol,Float64}=:auto,
+									tau_max::Union{Symbol,Float64}=:auto,
+									L_min::Int=8,
+									L_max::Int=32,
+									points_per_decade::Int=8,
+									n_exploratory::Int=16,
+									tol::Float64=1e-3,
+									label::String="<unnamed>",
+									show_progress::Bool=true,
+									inner_show_progress::Bool=true,
+									verbose::Bool=false)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst, :weight
+			nodes::Union{Nothing,DataFrame,Vector}: optional node universe
+			graph_type::Symbol: :directed or :undirected
+			reciprocity_collapse::Bool: directed-only; collapse mutual arcs (default false)
+			auto_recommend_L::Bool: when true, call recommend_L first to derive
+				L and τ bounds, then run the layered census at those settings.
+				When false, use the explicit L, tau_min, tau_max args below.
+				Default false.
+			method::Symbol: passed to recommend_L when auto_recommend_L=true.
+				:auto (default), :analytic, or :empirical. Ignored when
+				auto_recommend_L=false.
+			L::Int: τ grid size when auto_recommend_L=false (default 8)
+			tau_min, tau_max::Union{Symbol,Float64}: τ bounds when
+				auto_recommend_L=false (default :auto, derived from weight
+				distribution)
+			L_min, L_max::Int: clamps for recommend_L's L when
+				auto_recommend_L=true (defaults 8, 32)
+			points_per_decade::Int: heuristic for recommend_L's L computation
+				when auto_recommend_L=true (default 8)
+			n_exploratory::Int: log-spaced points in recommend_L's triangle
+				profile when auto_recommend_L=true (default 16)
+			tol::Float64: AUMC stability tolerance for recommend_L's empirical
+				path only (default 1e-3). Ignored when the analytic path is
+				selected.
+			label::String: descriptive name for diagnostic output
+			show_progress::Bool: display top-level progress bars (default true).
+				For the standalone layered census this is the per-τ bar; for
+				auto_recommend_L=true with empirical method it's the candidate-
+				completion bar inside recommend_L.
+			inner_show_progress::Bool: when auto_recommend_L=true with empirical
+				method, also display per-τ progress within each candidate's
+				layered census (default true). Has no effect on the analytic
+				path (no inner census runs) or when auto_recommend_L=false.
+			verbose::Bool: print recommend_L's derivation steps when
+				auto_recommend_L=true (default false)
+		Returns:
+			NamedTuple: (result::NamedTuple, t_threaded::Float64,
+			             n_threads_used::Int, recommendation::Union{NamedTuple,Nothing},
+			             t_recommend::Float64, method_used::Symbol)
+				result: the full _triad_census_layered output (per_tau, summary, meta)
+				t_threaded: wall-clock for the layered census
+				n_threads_used: threads used by the layered census
+				recommendation: recommend_L output when auto_recommend_L=true, else nothing
+				t_recommend: wall-clock for recommend_L (0.0 if auto_recommend_L=false)
+				method_used: recommendation method (:analytic, :empirical, :user_supplied)
+					when auto_recommend_L=true, else :none
+		Notes:
+			Threaded-only performance measurement. The layered census runs with
+			parallel=true (τ-loop threading) and reports total wall-clock plus
+			per-τ amortized cost. Bit-exactness vs the serial reference has
+			been verified on Balikatan and doesn't need re-verification at
+			each graph scale.
+
+			Two usage modes:
+
+			1. Explicit L (auto_recommend_L=false, default): run the layered
+			   census at the supplied L, tau_min, tau_max. Use when you
+			   already know what grid you want.
+
+			2. Auto recommendation (auto_recommend_L=true): call recommend_L
+			   first with the specified method (:auto, :analytic, or
+			   :empirical), then run the census at the recommended settings.
+
+			Method selection. When method=:auto, recommend_L's auto-selection
+			rule chooses analytic or empirical based on T_max, weight span,
+			and triangle decay shape. For Marvel-scale networks (T_max in
+			millions) the analytic path is essentially instant; for small
+			networks (T_max < 1000) the empirical path runs but completes
+			quickly anyway.
+
+			Cache reuse note. When the empirical path runs inside recommend_L,
+			the layered census at L_best has already been computed and is
+			available as recommendation.census. This function still re-runs
+			the census for a clean wall-clock measurement; downstream callers
+			wanting the cached result should use recommendation.census
+			directly. When the analytic path runs, recommendation.census is
+			nothing and the census in this function is the only one performed.
+		"""
+
+		println("=" ^ 70)
+		println("Threaded Layered Triad Census (Timing Only) — $label")
+		println("Graph: $(nrow(edges)) edges, graph_type=$graph_type, collapse=$reciprocity_collapse")
+		println("Threads available: $(Threads.nthreads())")
+		println("Mode: $(auto_recommend_L ? "auto-recommendation via recommend_L (method=$method)" : "explicit L=$L")")
+		println("=" ^ 70)
+
+		#	Optionally Run recommend_L to Derive L and τ Bounds
+			recommendation = nothing
+			used_L         = L
+			used_tau_min   = tau_min
+			used_tau_max   = tau_max
+			t_recommend    = 0.0
+			method_used    = :none
+			if auto_recommend_L
+				println("  Running recommend_L (method = $method)...")
+				t0_rec         = time()
+				recommendation = recommend_L(edges;
+											nodes                = nodes,
+											graph_type           = graph_type,
+											reciprocity_collapse = reciprocity_collapse,
+											tau_min              = tau_min,
+											tau_max              = tau_max,
+											method               = method,
+											points_per_decade    = points_per_decade,
+											L_min                = L_min,
+											L_max                = L_max,
+											n_exploratory        = n_exploratory,
+											tol                  = tol,
+											parallel             = false,           # serial candidates with inner threading (empirical only)
+											verbose              = verbose,
+											show_progress        = show_progress,
+											inner_show_progress  = inner_show_progress)
+				t_recommend  = time() - t0_rec
+				used_L       = recommendation.L
+				used_tau_min = recommendation.tau_min
+				used_tau_max = recommendation.tau_max
+				method_used  = recommendation.method
+				println()
+				println(@sprintf("  recommend_L done in %.2f s (%.2f min)", t_recommend, t_recommend / 60))
+				println("    Method used:     $(recommendation.method)")
+				println("    Reason:          $(recommendation.method_reason)")
+				println("    T_max:           $(recommendation.T_max)")
+				println("    Recommended L:   $used_L")
+				println("    Recommended τ:   [$(round(used_tau_min, sigdigits=4)), $(round(used_tau_max, sigdigits=4))]")
+				println()
+			end
+
+		#	Run the Threaded Layered Census at the Resolved (L, τ_min, τ_max)
+			println("  Running threaded layered census at L = $used_L...")
+			t0 = time()
+			result = _triad_census_layered(edges;
+								nodes                = nodes,
+								graph_type           = graph_type,
+								reciprocity_collapse = reciprocity_collapse,
+								L                    = used_L,
+								tau_min              = used_tau_min,
+								tau_max              = used_tau_max,
+								parallel             = true,
+								show_progress        = show_progress,
+								progress_desc        = "  [threaded] $label")
+			t_threaded = time() - t0
+
+		#	Report
+			println()
+			println(@sprintf("  Threaded census done:    %.2f s (%.2f min)", t_threaded, t_threaded / 60))
+			println("    L used:                $used_L")
+			println("    τ bounds used:          [$(round(Float64(used_tau_min), sigdigits=4)), " *
+			        "$(round(Float64(used_tau_max), sigdigits=4))]")
+			println("    τ grid points:          $(result.meta.L)")
+			println("    Threads actually used:  $(result.meta.n_threads_used)")
+			println(@sprintf("    Mean per-τ wall-clock:  %.2f s", t_threaded / result.meta.L))
+			println("    Total per-τ count sum:  $(sum(result.per_tau.count))")
+			if auto_recommend_L
+				println(@sprintf("    Combined wall-clock:    %.2f s (%.2f min) including recommend_L",
+									t_recommend + t_threaded, (t_recommend + t_threaded) / 60))
+			end
+			println("=" ^ 70)
+
+		return (result         = result,
+				t_threaded     = t_threaded,
+				n_threads_used = result.meta.n_threads_used,
+				recommendation = recommendation,
+				t_recommend    = t_recommend,
+				method_used    = method_used)
+	end
+
 #	Motif suites — fast unit-style tests on synthetic micro-graphs
 	motif_dir_results   = test_motif_suite_directed()
 	motif_undir_results = test_motif_suite_undirected()
@@ -2621,17 +2808,23 @@ using Network_Credible_Intervals
 		L                    = 20,
 		label                = "Balikatan directed weighted (L=20)")
 
-#	Threaded-vs-Serial bit-equality — Marvel undirected weighted census
+#	Test Tau Bound Recommendation Algorithm 
+	balikatan_rec = recommend_L(agent_agent_all_com_edges;
+								graph_type = :directed,
+								verbose    = true)
+	println("Balikatan: L=$(balikatan_rec.L), τ ∈ [$(balikatan_rec.tau_min), $(balikatan_rec.tau_max)]")
+	balikatan_rec.scan
+
 #	Tests the undirected layered path on the new large-undirected case.
 	marvel_network_edges = networks["marvel_universe_weighted"].edges
 	marvel_network_nodes = networks["marvel_universe_weighted"].nodes
-	marvel_thread_test = test_threaded_vs_serial_layered(
-		marvel_network_edges;
-		nodes                = marvel_network_nodes,
-		graph_type           = :undirected,
-		reciprocity_collapse = false,
-		L                    = 20,
-		label                = "Marvel undirected weighted (L=20)")
+	marvel_timing_auto = time_threaded_layered(marvel_network_edges;
+											nodes            = marvel_network_nodes,
+											graph_type       = :undirected,
+											auto_recommend_L = true,
+											L_min            = 8,
+											L_max            = 32,
+											label            = "Marvel undirected weighted (auto-L)")
 
 #	Helper Function for run_synthetic_blockmodel_tests: Build the "Hourglass" Network
 	function _build_hourglass_test_network()
