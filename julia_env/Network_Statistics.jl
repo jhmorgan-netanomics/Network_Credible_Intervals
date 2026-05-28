@@ -551,8 +551,8 @@ using Network_Credible_Intervals
 			Verifies closeness_centrality, betweenness_centrality, and
 			mean_inverse_distance on the 8-node synthetic network with
 			hand-computed expected values, then exercises the weighted-path
-			dispatch (:tie_strength, :distance) on a small varied-weight
-			directed path with hand-computed weighted distances.
+			dispatch (:tie_strength, :distance) on small varied-weight
+			fixtures with hand-computed weighted distances and geodesics.
 
 			Topology recap (foundation test network):
 				1 → 2, 1 → 3, 2 → 3, 3 → 2     (component A: 2-out hub + mutual)
@@ -588,23 +588,28 @@ using Network_Credible_Intervals
 				Directed out: 8.5/56 ≈ 0.15179, scaled by log(8) ≈ 0.07299
 				Symmetric:   12/56 ≈ 0.21429, scaled by log(8) ≈ 0.10305
 
-			Weighted-path fixture (tests 12-15): directed path 1→2→3→4
-			with weights [2.0, 4.0, 1.0] on edges (1,2), (2,3), (3,4).
+			Weighted-closeness/MID fixture (tests 12-15): directed path
+			1→2→3→4 with weights [2.0, 4.0, 1.0] on edges (1,2),(2,3),(3,4).
 				Under :tie_strength (cost = 1/w):
-					1→2: cost 0.5
-					2→3: cost 0.25
-					3→4: cost 1.0
-					Shortest distances from 1: d(1,2)=0.5, d(1,3)=0.75, d(1,4)=1.75
-					Sum 1/d from node 1 = 1/0.5 + 1/0.75 + 1/1.75
-					                    = 2 + 1.3333... + 0.5714...
-					                    ≈ 3.9048
+					d(1,2)=0.5, d(1,3)=0.75, d(1,4)=1.75
+					Node-1 sum 1/d = 2 + 4/3 + 4/7 = 164/42; closeness 164/126
 				Under :distance (cost = w):
-					Shortest distances from 1: d(1,2)=2, d(1,3)=6, d(1,4)=7
-					Sum 1/d from node 1 = 1/2 + 1/6 + 1/7 = 0.5 + 0.1667 + 0.1429
-					                    ≈ 0.8095
+					d(1,2)=2, d(1,3)=6, d(1,4)=7
+					Node-1 sum 1/d = 0.5 + 1/6 + 1/7
 				Under :ignore (BFS hop counts):
-					Shortest distances from 1: d(1,2)=1, d(1,3)=2, d(1,4)=3
-					Sum 1/d from node 1 = 1 + 0.5 + 1/3 ≈ 1.8333
+					d(1,2)=1, d(1,3)=2, d(1,4)=3
+					Node-1 sum 1/d = 1 + 0.5 + 1/3
+
+			Weighted-betweenness fixture (test 16): diamond 1→2, 1→3, 2→4,
+			3→4. Only the ordered pair (1,4) has an interior node on its
+			geodesic, so betweenness concentrates on nodes 2 and 3.
+				Weights [4, 1, 4, 1] on edges (1,2),(1,3),(2,4),(3,4):
+					:tie_strength branch costs: 1-2-4 = 0.25+0.25 = 0.50;
+					1-3-4 = 1.00+1.00 = 2.00. The 1→4 weighted geodesic is
+					unique through node 2 → B = [0, 1, 0, 0].
+				(The full weighted-Brandes verification — equal-weight σ-split,
+				:distance routing, undirected halving — lives in the dedicated
+				run_weighted_betweenness_tests suite.)
 		"""
 
 		println("=" ^ 70)
@@ -804,14 +809,14 @@ using Network_Credible_Intervals
 			end
 
 		#	---------------------------------------------------------------
-		#	Weighted-Path Tests (Tests 12-15)
+		#	Weighted-Path Tests (Tests 12-16)
 		#	---------------------------------------------------------------
-		#	Use a small varied-weight directed path: 1→2 (w=2), 2→3 (w=4),
-		#	3→4 (w=1). Hand-computed weighted distances under each
-		#	edge_interpretation mode. The fixture is inline so it doesn't
-		#	affect other tests that might use the foundation network.
+		#	Tests 12-15 use a varied-weight directed path 1→2→3→4 with
+		#	weights [2.0, 4.0, 1.0]. Test 16 uses a weighted diamond. Both
+		#	fixtures are inline so they don't affect other tests using the
+		#	foundation network.
 
-		#	Build Varied-Weight Path Fixture
+		#	Build Varied-Weight Path Fixture (closeness / MID)
 			weighted_edges = DataFrame(src    = ["1", "2", "3"],
 			                          dst    = ["2", "3", "4"],
 			                          weight = [2.0, 4.0, 1.0])
@@ -827,17 +832,13 @@ using Network_Credible_Intervals
 				                                 direction = :out,
 				                                 edge_interpretation = :tie_strength,
 				                                 normalize = true), :node)
-				#	From node 1 (out direction): reaches 2 (cost 0.5), 3 (cost 0.75), 4 (cost 1.75)
-				#	Sum 1/d = 1/0.5 + 1/0.75 + 1/1.75 = 2 + 4/3 + 4/7 = (84+56+24)/42 = 164/42
-				#	Normalized: 164/42 / 3 = 164/126 ≈ 1.3016
+				#	From node 1: reaches 2 (cost 0.5), 3 (cost 0.75), 4 (cost 1.75)
 					exp_node1 = (1.0/0.5 + 1.0/0.75 + 1.0/1.75) / 3
 				#	From node 2: reaches 3 (cost 0.25), 4 (cost 1.25)
-				#	Sum 1/d = 4 + 0.8 = 4.8, normalized = 4.8/3 = 1.6
 					exp_node2 = (1.0/0.25 + 1.0/1.25) / 3
 				#	From node 3: reaches 4 (cost 1.0)
-				#	Sum 1/d = 1, normalized = 1/3
 					exp_node3 = 1.0 / 3
-				#	From node 4: reaches nothing → 0
+				#	From node 4: nothing
 					exp_node4 = 0.0
 					expected  = [exp_node1, exp_node2, exp_node3, exp_node4]
 					@assert isapprox(cc_ts.closeness, expected; atol = 1e-10) "Got: $(cc_ts.closeness), Expected: $expected"
@@ -856,14 +857,12 @@ using Network_Credible_Intervals
 				                                   direction = :out,
 				                                   edge_interpretation = :distance,
 				                                   normalize = true), :node)
-				#	From node 1 (out): reaches 2 (cost 2), 3 (cost 6), 4 (cost 7)
-				#	Sum 1/d = 0.5 + 1/6 + 1/7, normalized / 3
+				#	From node 1: reaches 2 (cost 2), 3 (cost 6), 4 (cost 7)
 					exp_node1 = (1.0/2.0 + 1.0/6.0 + 1.0/7.0) / 3
 				#	From node 2: reaches 3 (cost 4), 4 (cost 5)
 					exp_node2 = (1.0/4.0 + 1.0/5.0) / 3
 				#	From node 3: reaches 4 (cost 1)
 					exp_node3 = 1.0 / 3
-				#	From node 4: 0
 					exp_node4 = 0.0
 					expected  = [exp_node1, exp_node2, exp_node3, exp_node4]
 					@assert isapprox(cc_dist.closeness, expected; atol = 1e-10) "Got: $(cc_dist.closeness), Expected: $expected"
@@ -876,29 +875,27 @@ using Network_Credible_Intervals
 		#	Test 14: Three Modes Produce Different Results on Same Graph
 			println("\nTest 14: :ignore, :tie_strength, :distance produce distinct results")
 			try
-				#	Compute Closeness Under All Three Modes
-					cc_ign  = sort(closeness_centrality(weighted_edges;
-					                                   nodes = weighted_nodes,
-					                                   directed = true,
-					                                   direction = :out,
-					                                   edge_interpretation = :ignore), :node)
-					cc_ts2  = sort(closeness_centrality(weighted_edges;
-					                                   nodes = weighted_nodes,
-					                                   directed = true,
-					                                   direction = :out,
-					                                   edge_interpretation = :tie_strength), :node)
-					cc_dst2 = sort(closeness_centrality(weighted_edges;
-					                                   nodes = weighted_nodes,
-					                                   directed = true,
-					                                   direction = :out,
-					                                   edge_interpretation = :distance), :node)
-				#	Node 1's Closeness Should Differ Across All Three Modes
-					ign_v1 = cc_ign.closeness[1]
-					ts_v1  = cc_ts2.closeness[1]
-					dst_v1 = cc_dst2.closeness[1]
-					@assert !isapprox(ign_v1, ts_v1; atol = 1e-6) ":ignore and :tie_strength produced same closeness for node 1: $ign_v1"
-					@assert !isapprox(ign_v1, dst_v1; atol = 1e-6) ":ignore and :distance produced same closeness for node 1: $ign_v1"
-					@assert !isapprox(ts_v1, dst_v1; atol = 1e-6) ":tie_strength and :distance produced same closeness for node 1: $ts_v1"
+				cc_ign  = sort(closeness_centrality(weighted_edges;
+				                                   nodes = weighted_nodes,
+				                                   directed = true,
+				                                   direction = :out,
+				                                   edge_interpretation = :ignore), :node)
+				cc_ts2  = sort(closeness_centrality(weighted_edges;
+				                                   nodes = weighted_nodes,
+				                                   directed = true,
+				                                   direction = :out,
+				                                   edge_interpretation = :tie_strength), :node)
+				cc_dst2 = sort(closeness_centrality(weighted_edges;
+				                                   nodes = weighted_nodes,
+				                                   directed = true,
+				                                   direction = :out,
+				                                   edge_interpretation = :distance), :node)
+				ign_v1 = cc_ign.closeness[1]
+				ts_v1  = cc_ts2.closeness[1]
+				dst_v1 = cc_dst2.closeness[1]
+				@assert !isapprox(ign_v1, ts_v1; atol = 1e-6) ":ignore and :tie_strength matched for node 1: $ign_v1"
+				@assert !isapprox(ign_v1, dst_v1; atol = 1e-6) ":ignore and :distance matched for node 1: $ign_v1"
+				@assert !isapprox(ts_v1, dst_v1; atol = 1e-6) ":tie_strength and :distance matched for node 1: $ts_v1"
 				println("  PASSED (:ignore=$(round(ign_v1, digits=4)), :tie_strength=$(round(ts_v1, digits=4)), :distance=$(round(dst_v1, digits=4)))")
 			catch e
 				println("  FAILED: $e")
@@ -908,48 +905,35 @@ using Network_Credible_Intervals
 		#	Test 15: Mean Inverse Distance Under Weighted Modes
 			println("\nTest 15: mean_inverse_distance under all three modes")
 			try
-				#	:ignore on Weighted Path → BFS Hop Counts
-				#	Ordered pairs in path of length 4: (1,2)d=1, (1,3)d=2, (1,4)d=3,
-				#	(2,3)d=1, (2,4)d=2, (3,4)d=1. Sum 1/d = 1 + 0.5 + 1/3 + 1 + 0.5 + 1 = 4.333...
-				#	Mean = 4.333.../(4*3) = 0.3611..., scaled by log(4) = 1.3863 → 0.2604...
-					mid_ign = mean_inverse_distance(weighted_edges;
-					                              nodes = weighted_nodes,
-					                              directed = true,
-					                              direction = :out,
-					                              edge_interpretation = :ignore,
-					                              scale_by_log_n = false)
-					expected_ign = (1.0 + 0.5 + 1.0/3 + 1.0 + 0.5 + 1.0) / (4 * 3)
-					@assert isapprox(mid_ign, expected_ign; atol = 1e-10) ":ignore MID got $mid_ign, expected $expected_ign"
+				mid_ign = mean_inverse_distance(weighted_edges;
+				                              nodes = weighted_nodes,
+				                              directed = true,
+				                              direction = :out,
+				                              edge_interpretation = :ignore,
+				                              scale_by_log_n = false)
+				expected_ign = (1.0 + 0.5 + 1.0/3 + 1.0 + 0.5 + 1.0) / (4 * 3)
+				@assert isapprox(mid_ign, expected_ign; atol = 1e-10) ":ignore MID got $mid_ign, expected $expected_ign"
 
-				#	:tie_strength → Dijkstra on 1/w; same ordered pairs, weighted distances
-				#	Costs: 1→2 = 0.5, 2→3 = 0.25, 3→4 = 1.0
-				#	d(1,2) = 0.5, d(1,3) = 0.75, d(1,4) = 1.75
-				#	d(2,3) = 0.25, d(2,4) = 1.25
-				#	d(3,4) = 1.0
-				#	Sum 1/d = 2 + 4/3 + 4/7 + 4 + 0.8 + 1
-					mid_ts = mean_inverse_distance(weighted_edges;
-					                              nodes = weighted_nodes,
-					                              directed = true,
-					                              direction = :out,
-					                              edge_interpretation = :tie_strength,
-					                              scale_by_log_n = false)
-					expected_ts = (1.0/0.5 + 1.0/0.75 + 1.0/1.75 + 1.0/0.25 + 1.0/1.25 + 1.0/1.0) / (4 * 3)
-					@assert isapprox(mid_ts, expected_ts; atol = 1e-10) ":tie_strength MID got $mid_ts, expected $expected_ts"
+				mid_ts = mean_inverse_distance(weighted_edges;
+				                              nodes = weighted_nodes,
+				                              directed = true,
+				                              direction = :out,
+				                              edge_interpretation = :tie_strength,
+				                              scale_by_log_n = false)
+				expected_ts = (1.0/0.5 + 1.0/0.75 + 1.0/1.75 + 1.0/0.25 + 1.0/1.25 + 1.0/1.0) / (4 * 3)
+				@assert isapprox(mid_ts, expected_ts; atol = 1e-10) ":tie_strength MID got $mid_ts, expected $expected_ts"
 
-				#	:distance → Dijkstra on raw weights
-				#	d(1,2) = 2, d(1,3) = 6, d(1,4) = 7, d(2,3) = 4, d(2,4) = 5, d(3,4) = 1
-					mid_dist = mean_inverse_distance(weighted_edges;
-					                                nodes = weighted_nodes,
-					                                directed = true,
-					                                direction = :out,
-					                                edge_interpretation = :distance,
-					                                scale_by_log_n = false)
-					expected_dist = (1.0/2.0 + 1.0/6.0 + 1.0/7.0 + 1.0/4.0 + 1.0/5.0 + 1.0/1.0) / (4 * 3)
-					@assert isapprox(mid_dist, expected_dist; atol = 1e-10) ":distance MID got $mid_dist, expected $expected_dist"
+				mid_dist = mean_inverse_distance(weighted_edges;
+				                                nodes = weighted_nodes,
+				                                directed = true,
+				                                direction = :out,
+				                                edge_interpretation = :distance,
+				                                scale_by_log_n = false)
+				expected_dist = (1.0/2.0 + 1.0/6.0 + 1.0/7.0 + 1.0/4.0 + 1.0/5.0 + 1.0/1.0) / (4 * 3)
+				@assert isapprox(mid_dist, expected_dist; atol = 1e-10) ":distance MID got $mid_dist, expected $expected_dist"
 
-				#	All Three Should Differ
-					@assert !isapprox(mid_ign, mid_ts; atol = 1e-6) ":ignore and :tie_strength MID matched: $mid_ign"
-					@assert !isapprox(mid_ign, mid_dist; atol = 1e-6) ":ignore and :distance MID matched"
+				@assert !isapprox(mid_ign, mid_ts; atol = 1e-6) ":ignore and :tie_strength MID matched: $mid_ign"
+				@assert !isapprox(mid_ign, mid_dist; atol = 1e-6) ":ignore and :distance MID matched"
 
 				println("  PASSED (:ignore=$(round(mid_ign, digits=4)), :tie_strength=$(round(mid_ts, digits=4)), :distance=$(round(mid_dist, digits=4)))")
 			catch e
@@ -957,25 +941,31 @@ using Network_Credible_Intervals
 				all_passed = false
 			end
 
-		#	Test 16: Betweenness Still Errors on Weighted Modes (Deferred)
-			println("\nTest 16: betweenness_centrality(:tie_strength) raises ArgumentError (deferred)")
+		#	Test 16: Weighted Betweenness Is Implemented (:tie_strength Reroutes the Geodesic)
+		#	NOTE: This test previously asserted that :tie_strength threw an
+		#	ArgumentError (weighted Brandes was deferred). Weighted Brandes is
+		#	now implemented, so the call returns a result. The thorough
+		#	weighted-betweenness verification (equal-weight σ-split, :distance
+		#	routing, undirected halving) lives in run_weighted_betweenness_tests.
+			println("\nTest 16: betweenness_centrality (:tie_strength on weighted diamond)")
 			try
-				try
-					_ = betweenness_centrality(weighted_edges;
-					                          nodes = weighted_nodes,
-					                          directed = true,
-					                          edge_interpretation = :tie_strength)
-					all_passed = false
-					println("  FAILED: expected ArgumentError, got result")
-				catch e2
-					if e2 isa ArgumentError && occursin("not yet implemented", e2.msg)
-						println("  PASSED (ArgumentError for deferred weighted Brandes)")
-					else
-						rethrow(e2)
-					end
-				end
+				#	Diamond: 1→2 (w=4), 1→3 (w=1), 2→4 (w=4), 3→4 (w=1).
+				#	Under :tie_strength the 1→4 geodesic is unique through node 2
+				#	(branch cost 0.25+0.25=0.5 vs 1.0+1.0=2.0), so B = [0, 1, 0, 0].
+					diamond_edges = DataFrame(src    = ["1", "1", "2", "3"],
+					                         dst    = ["2", "3", "4", "4"],
+					                         weight = [4.0, 1.0, 4.0, 1.0])
+					diamond_nodes = DataFrame(id = string.(1:4), label = string.(1:4))
+					bc_w = sort(betweenness_centrality(diamond_edges;
+					                                  nodes = diamond_nodes,
+					                                  directed = true,
+					                                  edge_interpretation = :tie_strength,
+					                                  normalize = false), :node)
+					expected = [0.0, 1.0, 0.0, 0.0]
+					@assert isapprox(bc_w.betweenness, expected; atol = 1e-10) "Got: $(bc_w.betweenness)"
+				println("  PASSED (weighted Brandes implemented; node 2 = 1.0, node 3 = 0.0)")
 			catch e
-				println("  FAILED: unexpected exception: $e")
+				println("  FAILED: $e")
 				all_passed = false
 			end
 
@@ -1008,7 +998,7 @@ using Network_Credible_Intervals
 			return all_passed
 	end
 	run_synthetic_path_centrality_tests()
-
+	
 #   Moreno Tests
 	function generate_path_measures_csv(network_name::String,
 	                                    networks::Dict,
@@ -1192,6 +1182,187 @@ using Network_Credible_Intervals
                               "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data";
                               direction = :symmetric,
                               directed_path = true)
+
+#	Hand-Computed Tests for Weighted Betweenness Centrality (Dijkstra-Based Brandes)
+	function run_weighted_betweenness_tests()
+		"""
+		Args:
+			(none)
+		Returns:
+			Bool: true if all tests pass, false otherwise
+		Notes:
+			Verifies the weighted Brandes path (edge_interpretation =
+			:tie_strength / :distance) in betweenness_centrality against
+			hand-computed expected values. Each fixture is chosen to exercise
+			a specific risk in the weighted implementation:
+
+				Diamond, asymmetric weights — proves weights change the
+					geodesic structure (unique weighted path vs split binary
+					paths). Exercises the strictly-shorter relaxation branch.
+
+				Diamond, equal weights — proves :tie_strength reproduces the
+					binary 0.5/0.5 split when all weights are equal. Exercises
+					the equal-distance tolerance branch and sigma-splitting in
+					the predecessor test (the riskiest code path).
+
+				Diamond, :distance mode — confirms the :distance transform
+					(cost = w) routes the geodesic the opposite way from
+					:tie_strength (cost = 1/w) on the same graph.
+
+				Directed triangle with a chord — a small graph with a genuine
+					weighted intermediate, checking a non-trivial dependency
+					value and the undirected halving convention.
+
+			Diamond topology: 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4.
+			Only the (1, 4) ordered pair has an interior node on its
+			geodesic; all other ordered pairs are adjacent or unreachable,
+			so betweenness concentrates entirely on nodes 2 and 3.
+		"""
+
+		println("=" ^ 70)
+		println("Weighted betweenness-centrality tests")
+		println("=" ^ 70)
+
+		all_passed = true
+
+		#	Diamond Node Universe (Shared)
+			diamond_nodes = DataFrame(id = string.(1:4), label = string.(1:4))
+
+		#	Test 1: :tie_strength, Asymmetric Weights → Unique Weighted Path
+			println("\nTest 1: :tie_strength on asymmetric diamond (unique geodesic via node 2)")
+			try
+				#	Branch 1-2-4: weights [4, 4] → tie_strength cost 0.25 + 0.25 = 0.50
+				#	Branch 1-3-4: weights [1, 1] → tie_strength cost 1.00 + 1.00 = 2.00
+				#	The 1→4 weighted geodesic is unique through node 2.
+				#	σ(1,4) = 1, the single geodesic passes through node 2:
+				#	  B(2) = 1, B(3) = 0, endpoints B(1) = B(4) = 0.
+					edges = DataFrame(src    = ["1", "1", "2", "3"],
+					                 dst    = ["2", "3", "4", "4"],
+					                 weight = [4.0, 1.0, 4.0, 1.0])
+					bc = sort(betweenness_centrality(edges;
+					                                nodes = diamond_nodes,
+					                                directed = true,
+					                                edge_interpretation = :tie_strength,
+					                                normalize = false), :node)
+					expected = [0.0, 1.0, 0.0, 0.0]
+					@assert isapprox(bc.betweenness, expected; atol = 1e-10) "Got: $(bc.betweenness)"
+				println("  PASSED (node 2 = 1.0, node 3 = 0.0)")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Test 2: :tie_strength, Equal Weights → Reproduces Binary 0.5/0.5 Split
+			println("\nTest 2: :tie_strength on equal-weight diamond (tied geodesics, σ-split)")
+			try
+				#	All weights equal → both 2-hop branches tie exactly.
+				#	σ(1,4) = 2, dependency splits evenly: B(2) = B(3) = 0.5.
+				#	This exercises the equal-distance tolerance branch and the
+				#	predecessor test identifying BOTH branches as shortest.
+					edges = DataFrame(src    = ["1", "1", "2", "3"],
+					                 dst    = ["2", "3", "4", "4"],
+					                 weight = [2.0, 2.0, 2.0, 2.0])
+					bc = sort(betweenness_centrality(edges;
+					                                nodes = diamond_nodes,
+					                                directed = true,
+					                                edge_interpretation = :tie_strength,
+					                                normalize = false), :node)
+					expected = [0.0, 0.5, 0.5, 0.0]
+					@assert isapprox(bc.betweenness, expected; atol = 1e-10) "Got: $(bc.betweenness)"
+				println("  PASSED (nodes 2,3 split at 0.5 each)")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Test 3: :distance Mode Routes the Opposite Way
+			println("\nTest 3: :distance on asymmetric diamond (geodesic via node 3)")
+			try
+				#	Same graph as Test 1, but :distance uses cost = w directly.
+				#	Branch 1-2-4: cost 4 + 4 = 8
+				#	Branch 1-3-4: cost 1 + 1 = 2  ← shorter under :distance
+				#	The 1→4 geodesic is unique through node 3 (opposite of Test 1).
+				#	  B(3) = 1, B(2) = 0.
+					edges = DataFrame(src    = ["1", "1", "2", "3"],
+					                 dst    = ["2", "3", "4", "4"],
+					                 weight = [4.0, 1.0, 4.0, 1.0])
+					bc = sort(betweenness_centrality(edges;
+					                                nodes = diamond_nodes,
+					                                directed = true,
+					                                edge_interpretation = :distance,
+					                                normalize = false), :node)
+					expected = [0.0, 0.0, 1.0, 0.0]
+					@assert isapprox(bc.betweenness, expected; atol = 1e-10) "Got: $(bc.betweenness)"
+				println("  PASSED (node 3 = 1.0, node 2 = 0.0 — opposite of :tie_strength)")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Test 4: Weighted Matches Binary When All Weights Equal (Cross-Check)
+			println("\nTest 4: :tie_strength equals :ignore on equal-weight diamond")
+			try
+				edges = DataFrame(src    = ["1", "1", "2", "3"],
+				                 dst    = ["2", "3", "4", "4"],
+				                 weight = [3.0, 3.0, 3.0, 3.0])
+				bc_w = sort(betweenness_centrality(edges;
+				                                  nodes = diamond_nodes,
+				                                  directed = true,
+				                                  edge_interpretation = :tie_strength,
+				                                  normalize = false), :node)
+				bc_b = sort(betweenness_centrality(edges;
+				                                  nodes = diamond_nodes,
+				                                  directed = true,
+				                                  edge_interpretation = :ignore,
+				                                  normalize = false), :node)
+				@assert isapprox(bc_w.betweenness, bc_b.betweenness; atol = 1e-10) "weighted=$(bc_w.betweenness), binary=$(bc_b.betweenness)"
+				println("  PASSED (equal weights → weighted reproduces binary)")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Test 5: Undirected Halving Convention (Symmetrized Weighted Diamond)
+			println("\nTest 5: :tie_strength undirected diamond (halving convention)")
+			try
+				#	Undirected equal-weight diamond. After symmetrization the two
+				#	2-hop routes 1-2-4 and 1-3-4 tie; the unordered pair {1,4}
+				#	splits across nodes 2 and 3. With the undirected halving each
+				#	interior node carries 0.5. (Adjacent pairs have no interior
+				#	node; node pairs {2,3} route directly through 1 or 4 only if
+				#	a 2-path exists — here 2 and 3 connect via 1 and via 4, both
+				#	length-2, so {2,3} contributes 0.5 each to nodes 1 and 4.)
+				#	Hand-computation below.
+					edges = DataFrame(src    = ["1", "1", "2", "3"],
+					                 dst    = ["2", "3", "4", "4"],
+					                 weight = [2.0, 2.0, 2.0, 2.0])
+					bc = sort(betweenness_centrality(edges;
+					                                nodes = diamond_nodes,
+					                                directed = false,
+					                                edge_interpretation = :tie_strength,
+					                                normalize = false), :node)
+					#	Undirected symmetrized diamond is the 4-cycle 1-2-4-3-1.
+					#	Geodesics with an interior node (unordered pairs):
+					#	  {1,4}: two 2-paths (via 2, via 3) → split 0.5 to nodes 2,3
+					#	  {2,3}: two 2-paths (via 1, via 4) → split 0.5 to nodes 1,4
+					#	All other unordered pairs are adjacent (no interior).
+					#	So each node lies on exactly one split pair at 0.5.
+						expected = [0.5, 0.5, 0.5, 0.5]
+						@assert isapprox(bc.betweenness, expected; atol = 1e-10) "Got: $(bc.betweenness)"
+				println("  PASSED (4-cycle, each node = 0.5)")
+			catch e
+				println("  FAILED: $e")
+				all_passed = false
+			end
+
+		#	Report Overall Result
+			println("\n" * "=" ^ 70)
+			println("Weighted betweenness tests: $(all_passed ? "ALL PASSED" : "SOME FAILED")")
+			println("=" ^ 70)
+
+			return all_passed
+	end
+	run_weighted_betweenness_tests()
 
 #	Helper Function for run_synthetic_bonacich_tests: Build the Star K_{1,3}
 	function _build_star_test_network()

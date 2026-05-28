@@ -1572,6 +1572,135 @@ module network_statistics
 			return nothing
 	end
 
+#	Helper Function for betweenness_centrality: Weighted Brandes Single-Source Pass
+	function _brandes_pass_weighted!(neighbor_starts::Vector{Int},
+									neighbor_data::Vector{Int},
+									neighbor_costs::Vector{Float64},
+									in_neighbor_starts::Vector{Int},
+									in_neighbor_data::Vector{Int},
+									in_neighbor_costs::Vector{Float64},
+									source::Int,
+									betweenness::Vector{Float64},
+									distance::Vector{Float64},
+									sigma::Vector{Float64},
+									stack_order::Vector{Int},
+									delta::Vector{Float64},
+									heap::Vector{Tuple{Float64, Int}},
+									finalized::Vector{Bool})
+		"""
+		Args:
+			neighbor_starts, neighbor_data, neighbor_costs: forward weighted CSR
+				(row pointers, neighbor IDs, parallel Dijkstra costs). Used for
+				the forward shortest-path pass.
+			in_neighbor_starts, in_neighbor_data, in_neighbor_costs: reverse
+				weighted CSR. in_neighbor_costs[ptr] is the cost of the edge
+				FROM in_neighbor_data[ptr] TO the node whose in-list is being
+				scanned. Used to identify shortest-path predecessors in the
+				backward accumulation.
+			source::Int: source node ID (1-indexed)
+			betweenness::Vector{Float64}: per-thread accumulator (added to in place)
+			distance, sigma, stack_order, delta: pre-allocated work buffers
+			heap::Vector{Tuple{Float64,Int}}: pre-allocated Dijkstra heap buffer
+			finalized::Vector{Bool}: pre-allocated Dijkstra finalization buffer
+		Returns:
+			Nothing (betweenness accumulator is updated in place)
+		Notes:
+			Weighted analog of _brandes_pass!. Uses Dijkstra
+			(_dijkstra_distances_and_sigma!) for the forward shortest-path
+			pass instead of BFS, then performs the standard Brandes
+			dependency accumulation in reverse finalization order.
+
+			Predecessor identification. In binary Brandes a node v is a
+			shortest-path predecessor of w iff distance[v] + 1 == distance[w].
+			In the weighted case the analogous test is
+				distance[v] + cost(v -> w) ≈ distance[w]
+			evaluated with a relative tolerance, since accumulated path costs
+			are subject to floating-point rounding. The cost of the edge
+			v -> w is read from the reverse weighted CSR (in_neighbor_costs),
+			which stores, for each in-neighbor v of w, the weight of v -> w.
+
+			Inf guard. If distance[v] is Inf (v unreachable from source), the
+			predecessor sum distance[v] + cost is Inf and cannot match the
+			finite distance[w]; the explicit finite check skips it and avoids
+			Inf - Inf = NaN in the tolerance arithmetic, mirroring the guard
+			in _dijkstra_distances_and_sigma!.
+
+			Dependency accumulation (unchanged in form from binary Brandes):
+				delta[v] += (sigma[v] / sigma[w]) * (1 + delta[w])
+			for each predecessor v of w, processed with w in reverse
+			finalization (stack_order) order. Then betweenness[w] += delta[w]
+			for all w != source.
+
+			For undirected (symmetrized) graphs the forward and reverse
+			weighted CSRs are identical and the same triple may be passed for
+			both. The caller applies the directed/undirected halving
+			convention after reduction, exactly as in the binary path.
+		"""
+
+		#	Tolerance for the Predecessor Relation
+			_BRANDES_REL_EPS = 1e-12
+
+		#	Forward Dijkstra (Shared Kernel): Fills distance, sigma, stack_order
+			n_reached = _dijkstra_distances_and_sigma!(neighbor_starts,
+														neighbor_data,
+														neighbor_costs,
+														source,
+														distance,
+														sigma,
+														stack_order,
+														heap,
+														finalized)
+
+		#	Reset Delta
+			fill!(delta, 0.0)
+
+		#	Backward Accumulation in Reverse Finalization Order
+			@inbounds for idx in n_reached:-1:1
+				w = stack_order[idx]
+				if w == source
+					continue
+				end
+
+				#	Coefficient (1 + delta[w]) / sigma[w], Shared Across Predecessors
+					sigma_w = sigma[w]
+					coef    = (1.0 + delta[w]) / sigma_w
+					d_w     = distance[w]
+
+				#	Scan In-Neighbors v of w; Keep Those on a Shortest Path to w
+					start_ptr = in_neighbor_starts[w]
+					end_ptr   = in_neighbor_starts[w + 1] - 1
+					for ptr in start_ptr:end_ptr
+						v    = in_neighbor_data[ptr]
+						cost = in_neighbor_costs[ptr]
+
+						#	Skip Inf-Cost Edges (Treated as Absent)
+							if !isfinite(cost)
+								continue
+							end
+
+						#	Predecessor Test: distance[v] + cost(v->w) ≈ distance[w]
+						#	Skip unreachable v (distance Inf) to avoid Inf - Inf = NaN.
+							d_v = distance[v]
+							if !isfinite(d_v)
+								continue
+							end
+							pred_dist = d_v + cost
+							scale     = max(abs(pred_dist), abs(d_w), 1.0)
+							tol       = _BRANDES_REL_EPS * scale
+							if abs(pred_dist - d_w) <= tol
+								#	v Is a Shortest-Path Predecessor of w
+									delta[v] += sigma[v] * coef
+							end
+					end
+
+				#	Accumulate Dependency into Betweenness
+					betweenness[w] += delta[w]
+			end
+
+		#	Return (Mutates betweenness)
+			return nothing
+	end
+
 #	Helper Function for closeness_centrality and mean_inverse_distance:
 #	Compute Per-Source Inverse-Distance Sums and Total
 	function _all_pairs_inverse_distance_sum(adj::SparseMatrixCSC{<:Real, <:Integer})
@@ -1987,21 +2116,27 @@ module network_statistics
 	`betweenness_centrality`, `mean_inverse_distance`
 	""" closeness_centrality
 
-#	Betweenness Centrality (Brandes 2001)
+#	Betweenness Centrality (Brandes 2001, Binary or Weighted)
 	function betweenness_centrality(edges::DataFrame;
-	                               nodes::Union{Nothing, DataFrame, AbstractVector{<:AbstractString}} = nothing,
-	                               weighted::Bool = false,
-	                               directed::Bool = true,
-	                               edge_interpretation::Symbol = :ignore,
-	                               normalize::Bool = false,
-	                               agg_func::Function = sum)
+									nodes::Union{Nothing, DataFrame, AbstractVector{<:AbstractString}} = nothing,
+									weighted::Bool = false,
+									directed::Bool = true,
+									edge_interpretation::Symbol = :tie_strength,
+									normalize::Bool = false,
+									agg_func::Function = sum)
 		"""
 		Args:
 			edges::DataFrame: edge list with :src, :dst, optionally :weight
 			nodes::Union{Nothing, DataFrame, Vector}: optional node universe
-			weighted::Bool: API symmetry; ignored when edge_interpretation=:ignore
+			weighted::Bool: API symmetry; actual weight handling is determined
+				by edge_interpretation
 			directed::Bool: treat graph as directed (default = true)
-			edge_interpretation::Symbol: :ignore only in this commit
+			edge_interpretation::Symbol: how to interpret edge weights
+				:tie_strength (default) — weights are intensity; cost = 1/w
+					(weighted Brandes via Dijkstra on inverted weights)
+				:distance     — weights are distances; cost = w
+					(weighted Brandes via Dijkstra on raw weights)
+				:ignore       — binarize before path computation (binary Brandes/BFS)
 			normalize::Bool: normalize to [0, 1] (default = false; SMM uses raw)
 			agg_func::Function: aggregation for parallel edges (default = sum)
 		Returns:
@@ -2012,6 +2147,25 @@ module network_statistics
 			to a thread-local betweenness vector; the per-thread vectors are
 			reduced at the end.
 
+			Three edge-weight semantics:
+				:tie_strength (default) — weights interpreted as intensity;
+					edge cost = 1/w. Shortest paths are weighted geodesics, so
+					betweenness counts weighted-shortest-path traversals.
+					Standard for co-appearance, interaction, shared-attribute
+					networks (Marvel, Balikatan, Scotland, Moreno).
+				:distance — weights interpreted as costs or geographic
+					distances; edge cost = w. Standard for transit and road
+					networks.
+				:ignore — binarize the graph before computing geodesics, which
+					become hop-count shortest paths. Matches the Smith, Morgan,
+					& Moody (2022) Table 1 convention.
+
+			The default is :tie_strength for consistency with
+			closeness_centrality and mean_inverse_distance, and because most
+			networks in this corpus encode weights as tie strength. To match
+			the binarized SMM (2022) convention exactly, pass
+			edge_interpretation=:ignore.
+
 			For directed graphs, betweenness is the number of geodesics
 			s -> v -> t passing through v, summed over ordered (s, t) pairs
 			with s != v != t. For undirected graphs, the adjacency is first
@@ -2020,26 +2174,51 @@ module network_statistics
 			directed-Brandes-then-halve convention is then applied (each
 			unordered pair would otherwise be counted twice).
 
+			Implementation. The :ignore path uses BFS-based Brandes
+			(_brandes_pass!) on the binarized adjacency. The weighted paths
+			use Dijkstra-based Brandes (_brandes_pass_weighted!): the forward
+			pass is the shared _dijkstra_distances_and_sigma! kernel, and the
+			backward dependency accumulation identifies shortest-path
+			predecessors via distance[v] + cost(v -> w) ≈ distance[w] using a
+			relative tolerance with an Inf guard (an unreachable predecessor
+			with distance Inf is skipped to avoid Inf - Inf = NaN). The cost
+			of edge v -> w is read from a reverse weighted CSR built from
+			sparse(adj').
+
+			For weighted symmetric/undirected mode, max(A, A^T) takes the
+			higher of the two directed weights on a mutual pair, consistent
+			with the closeness_centrality convention.
+
 			Normalization (when normalize=true):
 				directed:   B(v) / ((N-1)(N-2))
 				undirected: B(v) / ((N-1)(N-2)/2)
 			These factors are the maximum possible betweenness on a star
 			graph for the respective network type.
 
-			Endpoints are excluded from their own paths per the Freeman
-			convention.
+			Performance:
+				:ignore — BFS Brandes, O(N(N+E)) total
+				:tie_strength / :distance — Dijkstra Brandes,
+					O(N(N+E) log N) total
+			All paths are thread-parallel over source nodes.
 
-			Pass `nodes` to include isolates (betweenness = 0) in the output.
+			Endpoints are excluded from their own paths per the Freeman
+			convention. Pass `nodes` to include isolates (betweenness = 0).
 		"""
 
 		#	Validation
 			if !hasproperty(edges, :src) || !hasproperty(edges, :dst)
 				throw(ArgumentError("edges DataFrame must have src and dst columns"))
 			end
-			if edge_interpretation != :ignore
+			if !(edge_interpretation in (:ignore, :tie_strength, :distance))
 				throw(ArgumentError(
-					"betweenness_centrality: edge_interpretation=$(edge_interpretation) not yet implemented. " *
-					"Pass edge_interpretation=:ignore to binarize before path computation."
+					"betweenness_centrality: edge_interpretation=$(edge_interpretation) not supported. " *
+					"Use :ignore (binary), :tie_strength (weights as intensity), or :distance (weights as cost)."
+				))
+			end
+			if edge_interpretation !== :ignore && !hasproperty(edges, :weight)
+				throw(ArgumentError(
+					"betweenness_centrality: edge_interpretation=$(edge_interpretation) requires a :weight column on edges. " *
+					"Either add weights or pass edge_interpretation=:ignore for binary computation."
 				))
 			end
 
@@ -2056,56 +2235,87 @@ module network_statistics
 				end
 			end
 
-		#	Binarize Edges
-			edges_binary = DataFrame(src = edges.src, dst = edges.dst)
-			edges_binary.weight = ones(Float64, nrow(edges_binary))
-			edges_binary = _aggregate_multi_edges(edges_binary; agg_func = maximum)
-
-		#	Build Sparse Adjacency on Correct Node Universe
-			if nodes === nothing
-				adj, _, idx_to_node = _edgelist_to_sparse_matrix(edges_binary; weighted = false)
+		#	Prepare Edges and Build Sparse Adjacency
+		#	For :ignore, binarize. For :tie_strength and :distance, preserve weights.
+			if edge_interpretation === :ignore
+				edges_for_adj = DataFrame(src = edges.src, dst = edges.dst)
+				edges_for_adj.weight = ones(Float64, nrow(edges_for_adj))
+				edges_for_adj = _aggregate_multi_edges(edges_for_adj; agg_func = maximum)
+				build_weighted = false
 			else
-				adj, _, idx_to_node = _graph_to_sparse_matrix(edges_binary;
-				                                              nodes = nodes,
-				                                              weighted = false)
+				edges_for_adj = DataFrame(src = edges.src, dst = edges.dst, weight = edges.weight)
+				edges_for_adj = _aggregate_multi_edges(edges_for_adj; agg_func = agg_func)
+				build_weighted = true
+			end
+
+			if nodes === nothing
+				adj, _, idx_to_node = _edgelist_to_sparse_matrix(edges_for_adj; weighted = build_weighted)
+			else
+				adj, _, idx_to_node = _graph_to_sparse_matrix(edges_for_adj;
+																nodes    = nodes,
+																weighted = build_weighted)
 			end
 
 		#	Apply Direction Convention (Symmetrize for Undirected)
 			if !directed
-				#	Always symmetrize rather than checking. _is_symmetric(adj;
-				#	directed=false) returns true by convention regardless of
-				#	actual matrix symmetry, so a check would wrongly skip
-				#	symmetrization when an asymmetrically-stored edge list is
-				#	passed with directed=false.
-					adj = max.(adj, adj')
+				adj = max.(adj, adj')
 			end
-
-		#	Build Forward and Reverse CSR Representations
-			fwd_starts, fwd_data = _build_neighbor_lists(adj)
-			rev_starts, rev_data = _build_neighbor_lists(sparse(adj'))
 
 		#	Dimensions
 			N = size(adj, 1)
 
 		#	Thread-Local Betweenness Accumulators
-			n_threads = Threads.nthreads()
+			n_threads          = Threads.nthreads()
 			thread_betweenness = [zeros(Float64, N) for _ in 1:n_threads]
 
-		#	Threaded Single-Source Passes
-			Threads.@threads for s in 1:N
-				#	Per-Thread Work Buffers
-					tid = Threads.threadid()
-					distance    = Vector{Int}(undef, N)
-					sigma       = Vector{Float64}(undef, N)
-					stack_order = Vector{Int}(undef, N)
-					delta       = Vector{Float64}(undef, N)
+		#	Dispatch on edge_interpretation
+			if edge_interpretation === :ignore
+				#	Binary Brandes (BFS-Based)
+				#	Build Forward and Reverse (Binary) CSR Representations
+					fwd_starts, fwd_data = _build_neighbor_lists(adj)
+					rev_starts, rev_data = _build_neighbor_lists(sparse(adj'))
 
-				#	Brandes Single-Source Pass
-					_brandes_pass!(fwd_starts, fwd_data,
-					              rev_starts, rev_data,
-					              s,
-					              thread_betweenness[tid],
-					              distance, sigma, stack_order, delta)
+				#	Threaded Single-Source Passes
+					Threads.@threads for s in 1:N
+						tid         = Threads.threadid()
+						distance    = Vector{Int}(undef, N)
+						sigma       = Vector{Float64}(undef, N)
+						stack_order = Vector{Int}(undef, N)
+						delta       = Vector{Float64}(undef, N)
+						_brandes_pass!(fwd_starts, fwd_data,
+									  rev_starts, rev_data,
+									  s,
+									  thread_betweenness[tid],
+									  distance, sigma, stack_order, delta)
+					end
+			else
+				#	Weighted Brandes (Dijkstra-Based)
+				#	Build Forward and Reverse WEIGHTED CSR Representations, Then
+				#	Transform Weights to Dijkstra Costs (Once, Shared Across Threads).
+					fwd_starts, fwd_data, fwd_weights = _build_weighted_neighbor_lists(adj)
+					rev_starts, rev_data, rev_weights = _build_weighted_neighbor_lists(sparse(adj'))
+					fwd_costs = _transform_weights_for_path_cost(fwd_weights, edge_interpretation)
+					rev_costs = _transform_weights_for_path_cost(rev_weights, edge_interpretation)
+
+				#	Heap Capacity (Bounded by Forward Edge Count, +1 for the Seed)
+					heap_capacity = length(fwd_data) + 1
+
+				#	Threaded Single-Source Passes
+					Threads.@threads for s in 1:N
+						tid         = Threads.threadid()
+						distance    = Vector{Float64}(undef, N)
+						sigma       = Vector{Float64}(undef, N)
+						stack_order = Vector{Int}(undef, N)
+						delta       = Vector{Float64}(undef, N)
+						heap        = Vector{Tuple{Float64, Int}}(undef, heap_capacity)
+						finalized   = Vector{Bool}(undef, N)
+						_brandes_pass_weighted!(fwd_starts, fwd_data, fwd_costs,
+											   rev_starts, rev_data, rev_costs,
+											   s,
+											   thread_betweenness[tid],
+											   distance, sigma, stack_order, delta,
+											   heap, finalized)
+					end
 			end
 
 		#	Reduce Thread-Local Accumulators
@@ -2139,21 +2349,32 @@ module network_statistics
 	**Description**
 	Compute betweenness centrality for each node using Brandes' (2001)
 	algorithm. The betweenness of node $v$ is the number of shortest paths
-	between other node pairs that pass through $v$.
+	between other node pairs that pass through $v$. Supports three weight
+	semantics: tie strength (default), distance, or ignored (binary).
 
 	**Usage**
-	`betweenness_centrality(edges::DataFrame; nodes=nothing, weighted=false, directed=true, edge_interpretation=:ignore, normalize=false, agg_func=sum)`
+	`betweenness_centrality(edges; nodes=nothing, weighted=false, directed=true, edge_interpretation=:tie_strength, normalize=false, agg_func=sum)`
 
 	**Arguments**
-	- `edges::DataFrame`: Edge list with `:src` and `:dst`, optionally `:weight`.
+	- `edges::DataFrame`: Edge list with `:src`, `:dst`, and (for non-`:ignore`
+	  interpretations) `:weight`.
 	- `nodes::Union{Nothing,DataFrame,Vector}`: Optional node universe; pass to
 	  include isolates (`betweenness = 0`).
-	- `weighted::Bool`: API symmetry only; ignored when `edge_interpretation=:ignore`.
+	- `weighted::Bool`: API symmetry only; actual weight handling is controlled
+	  by `edge_interpretation`.
 	- `directed::Bool`: Treat as directed (default `true`).
-	- `edge_interpretation::Symbol`: Only `:ignore` currently supported.
+	- `edge_interpretation::Symbol`: How to interpret edge weights.
+	  - `:tie_strength` (default) — weights are intensity; edge cost = $1/w$
+	    (weighted Brandes via Dijkstra on inverted weights). Standard for
+	    co-appearance, interaction-count, and shared-attribute networks.
+	  - `:distance` — weights are distances/costs; used as-is (weighted Brandes
+	    via Dijkstra on raw weights). Standard for road and transit networks.
+	  - `:ignore` — binarize before computing geodesics (binary Brandes).
+	    Matches the SMM (2022) Table 1 convention; required to reproduce that
+	    table's values.
 	- `normalize::Bool`: Normalize to $[0, 1]$ by dividing by $(N-1)(N-2)$
 	  (directed) or $(N-1)(N-2)/2$ (undirected). Default `false` to match
-	  SMM 2022, which reports raw geodesic counts.
+	  SMM (2022), which reports raw geodesic counts.
 	- `agg_func::Function`: Aggregation for parallel edges (default `sum`).
 
 	**Details**
@@ -2163,9 +2384,25 @@ module network_statistics
 	$\sigma_{st}(v)$ is the number of those passing through $v$. Endpoints are
 	excluded per the Freeman convention.
 
-	Implemented via Brandes (2001) with thread-parallel single-source passes.
-	Each thread maintains its own betweenness accumulator; results are summed
-	at the end. Complexity is $O(N \cdot (N + E))$ for unweighted graphs.
+	When `edge_interpretation = :ignore`, geodesics are hop-count shortest
+	paths found by BFS-based Brandes, reproducing SMM (2022). When
+	`:tie_strength`, each edge of weight $w$ contributes cost $1/w$, so
+	betweenness counts traversals of weighted-shortest paths in which strong
+	ties act as short links. When `:distance`, edges contribute their weight
+	directly. Both weighted modes use a Dijkstra forward pass with
+	shortest-path counting, followed by the standard backward dependency
+	accumulation; shortest-path predecessors are identified by
+	$d(s,v) + c(v,w) \approx d(s,w)$ under a relative tolerance, with
+	unreachable predecessors skipped to avoid degenerate comparisons.
+
+	Implemented with thread-parallel single-source passes; each thread
+	maintains its own betweenness accumulator and the per-thread vectors are
+	summed at the end. Complexity is $O(N(N+E))$ for the binary path and
+	$O(N(N+E)\log N)$ for the weighted paths.
+
+	The default is `:tie_strength` for consistency with `closeness_centrality`
+	and `mean_inverse_distance`. To match the binarized SMM (2022) convention
+	exactly, pass `edge_interpretation = :ignore`.
 
 	For undirected networks the directed implementation counts each unordered
 	pair twice, so the result is divided by 2 at the end (the standard
@@ -2176,14 +2413,26 @@ module network_statistics
 
 	**Examples**
 	```julia
-	using DataFrames
-	edges = DataFrame(src=[1,2,3], dst=[2,3,1])   # directed triangle
-	betweenness_centrality(edges)
+		using DataFrames
+
+		#	Default: weights interpreted as tie strength
+			edges = DataFrame(src=["1","1","2","3"], dst=["2","3","4","4"],
+							weight=[4.0, 1.0, 4.0, 1.0])
+			nodes = DataFrame(id=string.(1:4), label=string.(1:4))
+			betweenness_centrality(edges; nodes=nodes, directed=true)
+
+		#	SMM-style binarized betweenness (matches SMM 2022 Table 1)
+			betweenness_centrality(edges; nodes=nodes, edge_interpretation=:ignore)
+
+		#	Distance semantics (e.g., road network with travel times)
+			betweenness_centrality(edges; nodes=nodes, edge_interpretation=:distance)
 	```
 
 	**References**
 	- Brandes U (2001). "A faster algorithm for betweenness centrality."
 	  *Journal of Mathematical Sociology* 25(2): 163–177.
+	- Brandes U (2008). "On variants of shortest-path betweenness centrality
+	  and their generic computation." *Social Networks* 30(2): 136–145.
 	- Freeman LC (1977). "A set of measures of centrality based on betweenness."
 	  *Sociometry* 40(1): 35–41.
 
