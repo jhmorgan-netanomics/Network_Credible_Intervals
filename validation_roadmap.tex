@@ -94,7 +94,7 @@ The validation rests on three principles.
 
 \section{Network Corpus}
 
-The corpus comprises fourteen networks spanning the four cells of the weighted~$\times$~directed design: four empirical, four synthetic at base specification, two thresholded unweighted variants of empirical networks, and four unweighted synthetic networks. The empirical networks cover real-world structural complexity at sizes ranging from 70 to 1{,}347 nodes. The synthetic networks fill structural cells the empirical corpus does not cover and provide controlled-condition baselines. The unweighted variants ensure the framework's distinctive ability to handle unweighted networks~--- absent in \citet{Bellutta2026}'s Chapter~4 framework~--- is exercised across both directed and undirected settings.
+The corpus comprises sixteen networks spanning the four cells of the weighted~$\times$~directed design: five empirical, four synthetic at base specification, two thresholded unweighted variants of empirical networks, and four unweighted synthetic networks. The empirical networks cover real-world structural complexity at sizes ranging from 70 to 6{,}486 nodes. The synthetic networks fill structural cells the empirical corpus does not cover and provide controlled-condition baselines. The unweighted variants ensure the framework's distinctive ability to handle unweighted networks~--- absent in \citet{Bellutta2026}'s Chapter~4 framework~--- is exercised across both directed and undirected settings. The Marvel co-appearance network ($N = 6{,}486$) was added as a large undirected representative, extending the corpus's size range by nearly a factor of five beyond the next-largest network and providing a large-and-clustered undirected counterpart to the large-and-sparse directed Balikatan case.
 
 \subsection{Empirical Networks}
 
@@ -105,6 +105,8 @@ The corpus comprises fourteen networks spanning the four cells of the weighted~$
 \paragraph{Scotland Interlock (undirected, $N = 108$).} Bipartite director-company affiliation network for Scottish joint stock companies in 1904--1905, derived from \citet{ScottHughes1980}. For this validation, the bipartite network is projected to a one-mode company network: two companies are connected if they share one or more directors, weighted by the number of shared directors. The projection produces 108 nodes with company-level attributes (industry category, total capital). Provides an empirical case with known community structure (industry categories) that can serve as ground truth for Louvain community detection validation.
 
 \paragraph{Balikatan 2022 (directed, $N = 1{,}347$).} Twitter communication network from the Balikatan 2022 US-Philippines military exercise. Edges aggregate mentions, retweets, replies, and quotes between accounts; edge weights are integer interaction counts. Density approximately 0.17\% (sparse), transitivity 0.23, modularity (Leiden) 0.56. Provides the corpus's only large, sparse empirical case with strong community structure. Most relevant for testing the framework's scalability and the value of E/I~binning in a setting where community structure is strong but the network is too large for model-based imputation.
+
+\paragraph{Marvel Universe (undirected, $N = 6{,}486$).} Character co-appearance network derived from Marvel comic book data: two characters are connected if they appear together in the same comic, weighted by the number of shared appearances. With 77{,}227 edges, mean degree 11.9, and transitivity 0.79, it is the corpus's largest and most heavily clustered network, and its weight distribution is the most dispersed (weights range 2--744, Gini 0.54). The largest connected component spans 70\% of nodes. Marvel is the corpus's large-undirected representative: it stress-tests the framework's scalability on a network nearly five times the size of Balikatan, in the undirected-and-clustered regime that complements Balikatan's directed-and-sparse one. Its heavy-tailed degree and weight distributions also make it the most demanding case for the weighted path-based measures and the layered triad census.
 
 \subsection{Synthetic Networks}
 
@@ -130,7 +132,7 @@ The framework's ability to handle unweighted networks is one of its distinctive 
 
 \subsection{Corpus Summary}
 
-The corpus brings together six empirical networks and two parameterized synthetic families spanning four substantive structural conditions. \textbf{Moreno High School} is a friendship network among 70 adolescents collected via standard sociometric instrument, representing the small-but-densely-connected case characteristic of school-based peer studies and providing reciprocity structure with which to test directed-graph measures. \textbf{Balikatan~2022} is a counter-insurgency interaction network derived from joint US–Philippines military exercise records ($N = 1{,}347$, $\lvert E \rvert = 3{,}146$), representing the large-and-sparse case that arises in operational social-network analysis where ties are recorded across many actors but at low density per actor. \textbf{Toledo Crime} is a co-offending network among 77 individuals appearing together in police records, representing the small-and-undirected case typical of administrative-data social networks where tie direction is unavailable or ill-defined. \textbf{Scotland Interlock} is a corporate-board interlock projection on 108 directors with ground-truth community structure available from the original bipartite affiliation data, providing a network where the validation framework's recovered partition can be compared against a known true partition. Each empirical network is included with both its native edge weights and a binary version where weights are stripped; the validation interprets these as separate networks rather than as paired observations. The two synthetic families — a stochastic block model (Synthetic~1) and a preferential attachment generator (Synthetic~2), each emitted in directed and undirected variants — anchor controlled low- and high-centralization endpoints (Gini $0.10$--$0.14$ and $0.37$--$0.38$ respectively), bracketing the empirical centralization range of $0.24$--$0.70$. Together the corpus covers the four cells of the weighted$\times$directed design and the full range of low-to-high degree centralization, plus extreme cases at both the large-sparse (Balikatan) and small-tree-like (Toledo, bicomponent fraction $0.27$) ends of the topology space.
+The corpus brings together five empirical networks and two parameterized synthetic families spanning four substantive structural conditions. \textbf{Moreno High School} is a friendship network among 70 adolescents collected via standard sociometric instrument, representing the small-but-densely-connected case characteristic of school-based peer studies and providing reciprocity structure with which to test directed-graph measures. \textbf{Balikatan~2022} is a counter-insurgency interaction network derived from joint US–Philippines military exercise records ($N = 1{,}347$, $\lvert E \rvert = 3{,}146$), representing the large-and-sparse case that arises in operational social-network analysis where ties are recorded across many actors but at low density per actor. \textbf{Marvel Universe} is a character co-appearance network ($N = 6{,}486$, $\lvert E \rvert = 77{,}227$), representing the large-and-clustered undirected case: it is the corpus's largest network by a wide margin, with high transitivity (0.79) and a heavy-tailed weight distribution (Gini 0.54), and it complements Balikatan by occupying the opposite topology corner (dense and clustered rather than sparse). \textbf{Toledo Crime} is a co-offending network among 77 individuals appearing together in police records, representing the small-and-undirected case typical of administrative-data social networks where tie direction is unavailable or ill-defined. \textbf{Scotland Interlock} is a corporate-board interlock projection on 108 directors with ground-truth community structure available from the original bipartite affiliation data, providing a network where the validation framework's recovered partition can be compared against a known true partition. Each empirical network is included with both its native edge weights and a binary version where weights are stripped; the validation interprets these as separate networks rather than as paired observations. The two synthetic families — a stochastic block model (Synthetic~1) and a preferential attachment generator (Synthetic~2), each emitted in directed and undirected variants — anchor controlled low- and high-centralization endpoints, bracketing the empirical centralization range. Together the corpus covers the four cells of the weighted$\times$directed design and the full range of low-to-high degree centralization, plus extreme cases at the large-sparse (Balikatan), large-clustered (Marvel), and small-tree-like (Toledo, bicomponent fraction $0.27$) corners of the topology space.
 
 \begin{table}[h]
 \centering
@@ -145,6 +147,8 @@ Toledo Crime (collapsed)   & Empirical       & 77       & Undirected & Weighted 
 Toledo (unweighted)        & Threshold       & 77       & Undirected & Unweighted & 106     & 0.46 & Unweighted undirected \\
 Scotland Interlock (proj.) & Empirical       & 108      & Undirected & Weighted   & 276     & 0.48 & Comm.\ truth available \\
 Balikatan 2022             & Empirical       & 1{,}347  & Directed   & Weighted   & 3{,}146 & 0.70 & Large directed sparse \\
+Marvel Universe            & Empirical       & 6{,}486  & Undirected & Weighted   & 77{,}227 & 0.54 & Large undirected clustered \\
+Marvel (unweighted)        & Threshold       & 6{,}486  & Undirected & Unweighted & 77{,}227 & 0.54 & Unweighted undir.\ at scale \\
 Synthetic 1 (directed)     & SBM             & 600      & Directed   & Weighted   & 8{,}277 & 0.10 & Large directed controlled \\
 Synthetic 1 (undirected)   & SBM sym.        & 600      & Undirected & Weighted   & 4{,}138 & 0.14 & Large undirected controlled \\
 Synthetic 1 (dir., unwt.)  & SBM bin.        & 600      & Directed   & Unweighted & 8{,}253 & 0.10 & Unwt.\ dir.\ at scale \\
@@ -155,109 +159,355 @@ Synthetic 2 (dir., unwt.)  & PA bin.         & 250      & Directed   & Unweighte
 Synthetic 2 (undir., unwt.) & PA bin.\ sym.  & 250      & Undirected & Unweighted & 497     & 0.37 & Unwt.\ high-cent.\ undir. \\
 \bottomrule
 \end{tabular}
-\caption{Validation network corpus, 14 networks across the four weighted~$\times$~directed cells. Edge counts ($\lvert E \rvert$) and Gini coefficients are computed from the assembled GraphML files. Gini coefficient of the unweighted-degree distribution: $<0.20$ indicates low centralization (uniform degree); $>0.35$ indicates high centralization (hub-skewed degree). The empirical corpus spans 0.24--0.70, covering the full range from uniform to highly hub-skewed. Synthetic~1 anchors the low-centralization endpoint (Gini $0.10$--$0.14$); Synthetic~2 anchors the high-centralization endpoint (Gini $0.37$--$0.38$). Together the corpus tests the validation framework across a broad swath of the structural-coverage space.}
+\caption{Validation network corpus, 16 networks across the four weighted~$\times$~directed cells. Edge counts ($\lvert E \rvert$) and Gini coefficients are computed from the assembled GraphML files. The Gini column reports the coefficient of the unweighted-degree distribution for the synthetic and unweighted-empirical rows, and of the edge-weight distribution for the weighted-empirical rows where noted; $<0.20$ indicates low centralization (uniform degree), $>0.35$ indicates high centralization (hub-skewed degree). The empirical corpus spans the full range from uniform to highly hub-skewed and adds Marvel at the large-clustered extreme. Synthetic~1 anchors the low-centralization endpoint (Gini $0.10$--$0.14$); Synthetic~2 anchors the high-centralization endpoint (Gini $0.37$--$0.38$). Together the corpus tests the validation framework across a broad swath of the structural-coverage space.}
 \label{tab:corpus}
 \end{table}
 
-The fourteen GraphML files reside in the project's processed-data directory and have been validated by round-trip serialization tests (write to GraphML, load from GraphML, compare against in-memory representation): all node and edge attributes, weights, and graph-level metadata round-trip cleanly. The synthetic networks additionally satisfy their design specifications: Synthetic~1 has Leiden modularity 0.50 with six recovered communities at $\gamma = 1.0$, matching the six planted blocks; Synthetic~2 has maximum degree 43 and a top-five degree distribution of (43, 38, 35, 18, 13), confirming the hub-spoke structure expected of preferential attachment.
+The sixteen GraphML files reside in the project's processed-data directory and have been validated by round-trip serialization tests (write to GraphML, load from GraphML, compare against in-memory representation): all node and edge attributes, weights, and graph-level metadata round-trip cleanly. The synthetic networks additionally satisfy their design specifications: Synthetic~1 has Leiden modularity 0.50 with six recovered communities at $\gamma = 1.0$, matching the six planted blocks; Synthetic~2 has maximum degree 43 and a top-five degree distribution of (43, 38, 35, 18, 13), confirming the hub-spoke structure expected of preferential attachment.
 
 \subsection{Phase 0: Preliminary Corpus Characterization}
 \label{sec:phase0}
 
-As a preliminary step before the main validation runs, Phase~0 computes descriptive statistics for all networks in the corpus using the measures from \citet{SmithMorganMoody2022}: in/out/symmetric degree centrality, closeness, betweenness, Bonacich power, the corresponding centralizations, transitivity, mean inverse distance, component and bicomponent structure, and the ranked-cluster tau statistic. Phase~0 produces an empirical analog of \citet{SmithMorganMoody2022}'s Table~1 for the validation corpus.
+As a preliminary step before the main validation runs, Phase~0 computes descriptive statistics for all networks in the corpus using the measures from \citet{SmithMorganMoody2022}: in/out/symmetric degree centrality, closeness, betweenness, Bonacich power, the corresponding centralizations, transitivity, mean inverse distance, component and bicomponent structure, and the ranked-cluster tau statistic. Phase~0 produces an empirical analog of \citet{SmithMorganMoody2022}'s Table~1 for the validation corpus, extended with weighted and triad-census characterizations that the framework's distinctive capabilities require.
 
-Tables~\ref{tab:phase0-directed} and \ref{tab:phase0-undirected} present the completed Phase~0 statistics, split by directedness because several measures (most notably tau, which depends on the mutual-asymmetric dyad distinction) are only well-defined for directed graphs. Within each table, the empirical networks appear in the leftmost columns and the synthetic networks in the rightmost columns, separated by a vertical rule. This grouping makes the design argument legible at a glance: the empirical networks span a wide range of structural conditions (degree centralization, density, transitivity, component fragmentation), and the synthetic networks anchor controlled low- and high-centralization endpoints of that range. Reading horizontally across an empirical-then-synthetic row shows whether the empirical variation lies within, outside, or astride the synthetic controls --- important context for interpreting the validation results in later sections.
+Phase~0 reporting is organized into the opening corpus inventory (Table~\ref{tab:corpus}) plus eight descriptive tables. The first four split the centrality-and-topology battery across the $2 \times 2$ of directedness $\times$ weighting (Tables~\ref{tab:phase0-undir-binary}--\ref{tab:phase0-dir-weighted}); the next two report the static (unweighted) triad census split by directedness (Tables~\ref{tab:phase0-triad-static-dir}--\ref{tab:phase0-triad-static-undir}); the last two report the weighted layered triad census, again split by directedness (Tables~\ref{tab:phase0-triad-weighted-dir}--\ref{tab:phase0-triad-weighted-undir}). This structure supersedes the single binarized table of earlier drafts, which relied on a binarization-invariance footnote to fold weighted and unweighted variants into one column. Separating binary from weighted explicitly is necessary now that the framework computes genuinely weighted path-based measures (closeness, betweenness, and mean inverse distance under tie-strength edge semantics), whose values differ from their binarized counterparts and could not be represented in a binarization-invariant table. The triad census is split by directedness because the directed and undirected cases have different sets of non-zero Davis--Leinhardt classes (sixteen versus four) and dramatically different $\tau$-grid scales, which would render uninformatively if pooled.
 
-All Phase~0 measures are computed on the binarized adjacency matrix to match the convention of \citet{SmithMorganMoody2022}'s Table~1 and to ensure cross-network comparability. As a consequence, the weighted and unweighted variants of each empirical network produce identical Phase~0 statistics and are reported as a single column per network. The validation runs in later sections will use both variants as distinct inputs (since edge weights can affect imputation behavior even when post-binarization summaries agree), and the synthetic generators emit two independent realizations per design specification --- shown here as draws~1 and 2 --- to capture generator-level sampling variability.
+Within each of the four measure tables, the empirical networks appear in the leftmost columns and the synthetic networks in the rightmost columns, separated by a vertical rule. This grouping makes the design argument legible at a glance: the empirical networks span a wide range of structural conditions, and the synthetic networks anchor controlled low- and high-centralization endpoints of that range. Reading horizontally across an empirical-then-synthetic row shows whether the empirical variation lies within, outside, or astride the synthetic controls.
+
+\paragraph{Binary versus weighted reporting conventions.} The two binary tables (\ref{tab:phase0-undir-binary}, \ref{tab:phase0-dir-binary}) compute every measure on the binarized adjacency, matching the convention of \citet{SmithMorganMoody2022}'s Table~1 and ensuring cross-network comparability; the weighted and unweighted variants of a network are binarization-invariant and so each network appears once. The two weighted tables (\ref{tab:phase0-undir-weighted}, \ref{tab:phase0-dir-weighted}) report measures that depend on edge weights and therefore include only the genuinely weighted networks: the unweighted variants would collapse to their binary values (every weight equal to one), so they are omitted rather than shown as redundant or degenerate rows. Two weight-handling conventions are worth making explicit, because they differ across the table families. First, the weight-distribution summaries (min, max, median, IQR, Gini) are computed on the \emph{aggregated directed edge weights} for directed networks and on the \emph{nonzero weights of the symmetrized adjacency's upper triangle} for undirected networks~--- the latter matching the graph that the undirected weighted path-based measures actually traverse, where reciprocal arcs are combined by $\max(A, A^\top)$. Second, the weighted path-based measures symmetrize undirected graphs by $\max(A, A^\top)$, whereas the weighted triad census symmetrizes by sum ($W + W^\top$) before thresholding, following $s$-core semantics; the two table families therefore treat undirected edge weights differently by design, and values should not be expected to align across them.
 
 \begin{table}[!htbp]
 \centering
 \footnotesize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{l r r | r r r r}
+\begin{tabular}{l r r r | r r}
 \toprule
-& \multicolumn{2}{c|}{\textit{Empirical}} & \multicolumn{4}{c}{\textit{Synthetic}} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-7}
-Measure & Moreno & Bali & SBM-d.1 & SBM-d.2 & PA-d.1 & PA-d.2 \\
+& \multicolumn{3}{c|}{\textit{Empirical}} & \multicolumn{2}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-6}
+Measure & Marvel & Scot & Toledo & SBM-u & PA-u \\
 \midrule
-\multicolumn{7}{l}{\textit{Centrality}} \\
-In-Degree        & 5.23 (3.64)  & 2.34 (2.70)  & 13.76 (3.52) & 13.79 (3.59) & 1.99 (4.65) & 1.99 (4.28) \\
-Out-Degree       & 5.23 (2.04)  & 2.34 (18.55) & 13.76 (3.36) & 13.79 (3.64) & 1.99 (0.14) & 1.99 (0.14) \\
-Symmetric Degree & 10.46 (4.56) & 4.64 (19.11) & 27.51 (4.98) & 27.59 (5.12) & 3.98 (4.55) & 3.98 (4.20) \\
-Closeness        & 0.45 (0.06)  & 0.23 (0.12)  & 0.45 (0.02)  & 0.45 (0.02)  & 0.32 (0.05) & 0.31 (0.04) \\
-Betweenness      & 0.04 (0.05)  & 0.00 (0.00)  & 0.00 (0.00)  & 0.00 (0.00)  & 0.00 (0.00) & 0.00 (0.00) \\
-Bonacich Power   & 0.39 (0.19)  & 0.02 (0.04)  & 0.58 (0.11)  & 0.60 (0.11)  & 0.10 (0.11) & 0.11 (0.11) \\
+\multicolumn{6}{l}{\textit{Centrality}, mean (SD)} \\
+Degree         & 11.91 (31.71) & 2.56 (2.31) & 1.38 (1.70) & 7.05 (1.75) & 1.99 (2.28) \\
+Closeness      & 0.19 (0.12)   & 0.26 (0.14) & 0.34 (0.07) & 0.38 (0.02) & 0.32 (0.05) \\
+Betweenness    & 0.00 (0.00)   & 0.01 (0.02) & 0.03 (0.10) & 0.00 (0.00) & 0.01 (0.03) \\
+Bonacich Power & 0.03 (0.07)   & 0.19 (0.19) & 0.14 (0.14) & 0.51 (0.13) & 0.10 (0.11) \\
 \addlinespace
-\multicolumn{7}{l}{\textit{Centralization}} \\
-In-Degree        & 3.64 & 2.70  & 3.52 & 3.59 & 4.65 & 4.28 \\
-Out-Degree       & 2.04 & 18.55 & 3.36 & 3.64 & 0.14 & 0.14 \\
-Symmetric Degree & 4.56 & 19.11 & 4.98 & 5.12 & 4.55 & 4.20 \\
-Closeness        & 0.06 & 0.12  & 0.02 & 0.02 & 0.05 & 0.04 \\
-Betweenness      & 0.05 & 0.00  & 0.00 & 0.00 & 0.00 & 0.00 \\
-Bonacich Power   & 0.19 & 0.04  & 0.11 & 0.11 & 0.11 & 0.11 \\
+\multicolumn{6}{l}{\textit{Centralization} (SD of node scores)} \\
+Degree         & 31.71 & 2.31  & 1.70  & 1.75  & 2.28 \\
+Closeness      & 0.13  & 0.14  & 0.07  & 0.02  & 0.05 \\
+Betweenness    & 0.00  & 0.02  & 0.10  & 0.00  & 0.03 \\
+Bonacich Power & 0.07  & 0.19  & 0.14  & 0.13  & 0.11 \\
 \addlinespace
-\multicolumn{7}{l}{\textit{Topology}} \\
-Component Size   & 70   & 1087    & 600    & 600    & 250    & 250    \\
-Bicomponent Size & 70   & 662     & 600    & 600    & 250    & 250    \\
-Distance         & 0.45 & 0.23    & 0.45   & 0.45   & 0.32   & 0.31   \\
-Transitivity     & 0.40 & 0.23    & 0.05   & 0.05   & 0.06   & 0.05   \\
-Tau$_{RC}$       & 8.73 & 2535.93 & $-6.82$ & $-4.41$ & 63.03  & 52.05  \\
+\multicolumn{6}{l}{\textit{Topology}} \\
+Component (prop.)   & 0.70 & 0.80 & 1.00 & 1.00 & 1.00 \\
+Bicomponent (prop.) & 0.65 & 0.73 & 0.27 & 1.00 & 1.00 \\
+Mean Inv.\ Distance & 0.05 & 0.06 & 0.05 & 0.13 & 0.02 \\
+Transitivity        & 0.79 & 0.46 & 0.42 & 0.06 & 0.10 \\
 \bottomrule
 \end{tabular}
-\caption{Phase~0 descriptive statistics for the directed networks in the validation corpus, split into empirical (left) and synthetic (right) groups. Each column is a single network; weighted and unweighted variants of an empirical network are not shown separately because the Phase~0 measures are binarization-invariant by construction. For each synthetic generator, two independent draws (.1 and .2) are reported. Cells in the centrality block show mean (SD) of the node-level scores; centralization is the standard deviation of the node-level scores, expressed at the network level, following \citet{SmithMorganMoody2022}. Component and bicomponent sizes are reported as raw counts of nodes in the largest (bi)component. Distance is mean inverse geodesic distance. Tau$_{RC}$ is the standardized deviation of the observed ranked-cluster-weighted triad count from its U$\mid$MAN null expectation, computed by Monte Carlo with 500 samples; its magnitude scales with $\sqrt{N}$ for very-sparse networks, which explains the large Balikatan value. The validation framework is evaluated on all 14~networks in the corpus, including the U/W variants suppressed here.}
-\label{tab:phase0-directed}
+\caption{Phase~0 Table~1 --- undirected, binary. Centrality and topology measures computed on the binarized adjacency for the undirected networks, empirical (left) and synthetic (right). Each column is a single network; weighted and unweighted variants are binarization-invariant and so appear once. Centrality cells show mean (SD) of node-level scores; centralization is the network-level standard deviation of those scores, following \citet{SmithMorganMoody2022}. Component and bicomponent sizes are reported as proportions of the node set in the largest (bi)component. Marvel anchors the large-clustered extreme (transitivity 0.79, $N = 6{,}486$); Synthetic~1 (SBM-u) and Synthetic~2 (PA-u) anchor the low- and high-centralization synthetic endpoints.}
+\label{tab:phase0-undir-binary}
 \end{table}
 
 \begin{table}[!htbp]
 \centering
 \footnotesize
 \setlength{\tabcolsep}{4pt}
-\begin{tabular}{l r r | r r r r}
+\begin{tabular}{l r r | r r}
 \toprule
-& \multicolumn{2}{c|}{\textit{Empirical}} & \multicolumn{4}{c}{\textit{Synthetic}} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-7}
-Measure & Scot & Toledo & SBM-u.1 & SBM-u.2 & PA-u.1 & PA-u.2 \\
+& \multicolumn{2}{c|}{\textit{Empirical}} & \multicolumn{2}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Measure & Moreno & Bali & SBM-d & PA-d \\
 \midrule
-\multicolumn{7}{l}{\textit{Centrality}} \\
-Degree         & 2.56 (2.31) & 1.38 (1.70) & 7.05 (1.75) & 6.90 (1.73) & 1.99 (2.28) & 1.99 (2.10) \\
-Closeness      & 0.26 (0.14) & 0.34 (0.07) & 0.38 (0.02) & 0.38 (0.02) & 0.32 (0.05) & 0.31 (0.04) \\
-Betweenness    & 0.01 (0.02) & 0.03 (0.10) & 0.00 (0.00) & 0.00 (0.00) & 0.01 (0.03) & 0.01 (0.03) \\
-Bonacich Power & 0.19 (0.19) & 0.14 (0.14) & 0.51 (0.13) & 0.56 (0.14) & 0.10 (0.11) & 0.11 (0.11) \\
+\multicolumn{5}{l}{\textit{Centrality}, mean (SD)} \\
+In-Degree        & 5.23 (3.64)  & 2.34 (2.70)  & 13.76 (3.52) & 1.99 (4.65) \\
+Out-Degree       & 5.23 (2.04)  & 2.34 (18.55) & 13.76 (3.36) & 1.99 (0.14) \\
+Symmetric Degree & 10.46 (4.56) & 4.64 (19.11) & 27.51 (4.98) & 3.98 (4.55) \\
+Closeness        & 0.45 (0.06)  & 0.23 (0.12)  & 0.45 (0.02)  & 0.32 (0.05) \\
+Betweenness      & 0.04 (0.05)  & 0.00 (0.00)  & 0.00 (0.00)  & 0.00 (0.00) \\
+Bonacich Power   & 0.39 (0.19)  & 0.02 (0.04)  & 0.58 (0.11)  & 0.10 (0.11) \\
 \addlinespace
-\multicolumn{7}{l}{\textit{Centralization}} \\
-Degree         & 2.31 & 1.70 & 1.75 & 1.73 & 2.28 & 2.10 \\
-Closeness      & 0.14 & 0.07 & 0.02 & 0.02 & 0.05 & 0.04 \\
-Betweenness    & 0.02 & 0.10 & 0.00 & 0.00 & 0.03 & 0.03 \\
-Bonacich Power & 0.19 & 0.14 & 0.13 & 0.14 & 0.11 & 0.11 \\
+\multicolumn{5}{l}{\textit{Centralization} (SD of node scores)} \\
+In-Degree        & 3.64 & 2.70  & 3.52 & 4.65 \\
+Out-Degree       & 2.04 & 18.55 & 3.36 & 0.14 \\
+Symmetric Degree & 4.56 & 19.11 & 4.98 & 4.55 \\
+Closeness        & 0.06 & 0.12  & 0.02 & 0.05 \\
+Betweenness      & 0.05 & 0.00  & 0.00 & 0.00 \\
+Bonacich Power   & 0.19 & 0.04  & 0.11 & 0.11 \\
 \addlinespace
-\multicolumn{7}{l}{\textit{Topology}} \\
-Component Size   & 86   & 77   & 600  & 600  & 250  & 250  \\
-Bicomponent Size & 79   & 21   & 600  & 600  & 250  & 250  \\
-Distance         & 0.05 & 0.05 & 0.13 & 0.13 & 0.02 & 0.02 \\
-Transitivity     & 0.46 & 0.42 & 0.06 & 0.06 & 0.09 & 0.07 \\
+\multicolumn{5}{l}{\textit{Topology}} \\
+Component (prop.)   & 1.00 & 0.81    & 1.00    & 1.00  \\
+Bicomponent (prop.) & 1.00 & 0.49    & 1.00    & 1.00  \\
+Mean Inv.\ Distance & 0.45 & 0.23    & 0.45    & 0.32  \\
+Transitivity        & 0.40 & 0.23    & 0.05    & 0.06  \\
+Tau$_{RC}$          & 8.73 & 2535.93 & $-6.82$ & 63.03 \\
 \bottomrule
 \end{tabular}
-\caption{Phase~0 descriptive statistics for the undirected networks in the validation corpus, split into empirical (left) and synthetic (right) groups. Each column is a single network; weighted and unweighted variants of an empirical network are not shown separately because the Phase~0 measures are binarization-invariant by construction. For each synthetic generator, two independent draws (.1 and .2) are reported. For undirected graphs in-degree, out-degree, and symmetric degree are identical by construction and are reported as a single Degree row. Tau$_{RC}$ is omitted because the U$\mid$MAN null model requires the distinction between mutual and asymmetric dyads, which is undefined for undirected graphs. Cells in the centrality block show mean (SD) of the node-level scores; centralization is the standard deviation of the node-level scores. The validation framework is evaluated on all 14~networks in the corpus, including the U/W variants suppressed here.}
-\label{tab:phase0-undirected}
+\caption{Phase~0 Table~2 --- directed, binary. Measures computed on the binarized adjacency for the directed networks, empirical (left) and synthetic (right). Centrality cells show mean (SD); centralization is the network-level SD of node scores. Component and bicomponent sizes are proportions of the node set. Mean inverse distance is the mean reciprocal geodesic distance over ordered pairs. Tau$_{RC}$ is the standardized deviation of the observed ranked-cluster-weighted triad count from its U$\mid$MAN null expectation, by Monte Carlo with 500 samples; its magnitude scales with $\sqrt{N}$ for very-sparse networks, explaining the large Balikatan value. Tau$_{RC}$ is defined only for directed graphs (it requires the mutual--asymmetric dyad distinction) and so appears in this table but not Table~\ref{tab:phase0-undir-binary}.}
+\label{tab:phase0-dir-binary}
+\end{table}
+
+\begin{table}[!htbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l r r r | r r}
+\toprule
+& \multicolumn{3}{c|}{\textit{Empirical}} & \multicolumn{2}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-6}
+Measure & Marvel & Scot & Toledo & SBM-u & PA-u \\
+\midrule
+\multicolumn{6}{l}{\textit{Weight distribution}} \\
+Minimum & 2.00   & 1.00 & 1.00 & 1.00 & 1.00 \\
+Maximum & 744.00 & 8.00 & 5.00 & 9.00 & 6.00 \\
+Median  & 3.00   & 1.00 & 2.00 & 3.00 & 2.00 \\
+IQR     & 3.00   & 0.00 & 2.00 & 2.00 & 2.00 \\
+Gini    & 0.54   & 0.24 & 0.26 & 0.26 & 0.26 \\
+\addlinespace
+\multicolumn{6}{l}{\textit{Centrality}, mean (SD)} \\
+Strength            & 73.81 (333.28) & 3.45 (3.63) & 2.90 (4.14) & 20.65 (5.88) & 3.92 (4.24) \\
+Wtd.\ Closeness     & 1.28 (1.18)    & 0.30 (0.17) & 0.67 (0.24) & 1.30 (0.09)  & 0.60 (0.12) \\
+Wtd.\ Betweenness   & 0.00 (0.00)    & 0.01 (0.02) & 0.03 (0.10) & 0.00 (0.00)  & 0.01 (0.03) \\
+Bonacich Power      & 0.03 (0.07)    & 0.19 (0.19) & 0.14 (0.14) & 0.56 (0.14)  & 0.11 (0.11) \\
+\addlinespace
+\multicolumn{6}{l}{\textit{Centralization} (SD of node scores)} \\
+Strength          & 333.28 & 3.63 & 4.14 & 5.88 & 4.24 \\
+Wtd.\ Closeness   & 1.18   & 0.17 & 0.24 & 0.09 & 0.12 \\
+Wtd.\ Betweenness & 0.00   & 0.03 & 0.10 & 0.00 & 0.04 \\
+Bonacich Power    & 0.07   & 0.19 & 0.14 & 0.14 & 0.11 \\
+\addlinespace
+\multicolumn{6}{l}{\textit{Topology}} \\
+Wtd.\ Mean Inv.\ Distance & 0.28 & 0.07 & 0.09 & 0.40 & 0.04 \\
+\bottomrule
+\end{tabular}
+\caption{Phase~0 Table~3 --- undirected, weighted. Weighted measures for the genuinely weighted undirected networks; unweighted variants are omitted because their weighted measures collapse to the binary values of Table~\ref{tab:phase0-undir-binary}. Weighted closeness, betweenness, and mean inverse distance use tie-strength edge semantics (Dijkstra on $1/w$, so stronger ties are shorter). Strength is weight-summed degree. The weight-distribution block (min, max, median, IQR, Gini) is computed on the nonzero weights of the symmetrized adjacency's upper triangle ($\max(A, A^\top)$), the graph the undirected weighted measures traverse. Marvel's dispersed weights (max 744, Gini 0.54) drive its high mean strength and weighted closeness relative to the binary case.}
+\label{tab:phase0-undir-weighted}
+\end{table}
+
+\begin{table}[!htbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l r r | r r}
+\toprule
+& \multicolumn{2}{c|}{\textit{Empirical}} & \multicolumn{2}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Measure & Moreno & Bali & SBM-d & PA-d \\
+\midrule
+\multicolumn{5}{l}{\textit{Weight distribution}} \\
+Minimum & 1.00 & 1.00  & 1.00  & 1.00 \\
+Maximum & 2.00 & 31.00 & 10.00 & 6.00 \\
+Median  & 1.00 & 1.00  & 3.00  & 2.00 \\
+IQR     & 1.00 & 0.00  & 2.00  & 2.00 \\
+Gini    & 0.17 & 0.27  & 0.26  & 0.26 \\
+\addlinespace
+\multicolumn{5}{l}{\textit{Centrality}, mean (SD)} \\
+In-Strength       & 7.23 (5.38)  & 3.35 (6.75)  & 41.53 (11.78) & 3.92 (8.60) \\
+Out-Strength      & 7.23 (2.65)  & 3.35 (30.26) & 41.53 (12.04) & 3.92 (1.43) \\
+Total Strength    & 14.46 (6.93) & 6.62 (32.79) & 83.07 (17.00) & 7.83 (8.48) \\
+Wtd.\ Closeness   & 0.59 (0.08)  & 0.35 (0.20)  & 1.69 (0.09)   & 0.60 (0.12) \\
+Wtd.\ Betweenness & 0.04 (0.05)  & 0.00 (0.00)  & 0.00 (0.00)   & 0.00 (0.00) \\
+Bonacich Power    & 0.39 (0.19)  & 0.02 (0.04)  & 0.60 (0.11)   & 0.11 (0.11) \\
+\addlinespace
+\multicolumn{5}{l}{\textit{Centralization} (SD of node scores)} \\
+In-Strength       & 5.38 & 6.75  & 11.78 & 8.60 \\
+Out-Strength      & 2.65 & 30.26 & 12.04 & 1.43 \\
+Total Strength    & 6.93 & 32.80 & 17.00 & 8.48 \\
+Wtd.\ Closeness   & 0.08 & 0.20  & 0.09  & 0.12 \\
+Wtd.\ Betweenness & 0.05 & 0.00  & 0.00  & 0.00 \\
+Bonacich Power    & 0.19 & 0.04  & 0.11  & 0.11 \\
+\addlinespace
+\multicolumn{5}{l}{\textit{Topology}} \\
+Wtd.\ Mean Inv.\ Distance & 0.59 & 0.35 & 1.69 & 0.60 \\
+\bottomrule
+\end{tabular}
+\caption{Phase~0 Table~4 --- directed, weighted. Weighted measures for the genuinely weighted directed networks; unweighted variants are omitted (their weighted measures collapse to Table~\ref{tab:phase0-dir-binary}). Weighted path-based measures use tie-strength semantics (Dijkstra on $1/w$). In-, out-, and total strength are the weight-summed in-, out-, and total degree. The weight-distribution block is computed on the aggregated directed edge weights. Moreno's narrow weight range (1--2, recording single vs.\ double nominations) yields the lowest weight Gini; Balikatan's interaction counts are the most dispersed in the out-direction (out-strength centralization 30.26), reflecting a few very high-volume broadcasting accounts.}
+\label{tab:phase0-dir-weighted}
+\end{table}
+
+\begin{table}[!htbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l r r | r r}
+\toprule
+& \multicolumn{2}{c|}{\textit{Empirical}} & \multicolumn{2}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+DL Class & Moreno & Bali & SBM-d & PA-d \\
+\midrule
+003   & 37{,}827 & $4.03\times10^{8}$ & 31{,}233{,}805 & 2{,}453{,}719 \\
+012   & 9{,}822 & 3{,}602{,}267 & 4{,}204{,}617 & 115{,}292 \\
+102   & 5{,}175 & 38{,}837 & 158{,}702 & 0 \\
+021D  & 170 & 225{,}413 & 47{,}815 & 196 \\
+021U  & 311 & 3{,}865 & 49{,}106 & 2{,}886 \\
+021C  & 323 & 14{,}258 & 101{,}315 & 849 \\
+111D  & 430 & 127 & 7{,}329 & 0 \\
+111U  & 214 & 3{,}334 & 6{,}997 & 0 \\
+030T  & 82 & 3{,}400 & 6{,}648 & 58 \\
+030C  & 5 & 2 & 2{,}369 & 0 \\
+201   & 67 & 15 & 227 & 0 \\
+120D  & 89 & 65 & 277 & 0 \\
+120U  & 41 & 669 & 247 & 0 \\
+120C  & 36 & 3 & 684 & 0 \\
+210   & 92 & 9 & 61 & 0 \\
+300   & 56 & 5 & 1 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Phase~0 Table~5a --- static triad census (directed networks), Davis--Leinhardt class counts. A single Batagelj--Mrvar census on the binarized graph; each cell is the raw count of triples in that class. All sixteen DL classes appear; counts span several orders of magnitude and are reported with thousand separators (scientific notation for cells $\geq 10^8$). The closed-triangle count (class 300) matches the unweighted triangle count $T_{\max}$ used by the layered census in Table~\ref{tab:phase0-triad-weighted-dir}.}
+\label{tab:phase0-triad-static-dir}
+\end{table}
+
+\begin{table}[!htbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l r r r | r r}
+\toprule
+& \multicolumn{3}{c|}{\textit{Empirical}} & \multicolumn{2}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-6}
+DL Class & Marvel & Scot & Toledo & SBM-u & PA-u \\
+\midrule
+003   & $4.50\times10^{10}$ & 176{,}906 & 65{,}795 & 33{,}349{,}744 & 2{,}453{,}752 \\
+102   & $4.74\times10^{8}$ & 25{,}513 & 6{,}789 & 2{,}413{,}690 & 115{,}292 \\
+201   & 11{,}718{,}673 & 1{,}468 & 537 & 55{,}644 & 3{,}904 \\
+300   & 1{,}028{,}453 & 269 & 29 & 1{,}122 & 52 \\
+\bottomrule
+\end{tabular}
+\caption{Phase~0 Table~5b --- static triad census (undirected networks), Davis--Leinhardt class counts. Only the four undirected isomorphism classes $\{003, 102, 201, 300\}$ are non-zero on undirected graphs; the twelve asymmetric DL classes are zero by construction and omitted. Counts are computed by the dyad-driven Batagelj--Mrvar kernel applied to the symmetrized adjacency, validated against an external Pajek reference on Balikatan and against the reference triple-loop kernel on Scotland. Marvel's $300 = 1{,}028{,}453$ closed triangles match the unweighted triangle count $T_{\max}$ used by the layered census in Table~\ref{tab:phase0-triad-weighted-undir}.}
+\label{tab:phase0-triad-static-undir}
+\end{table}
+
+\begin{table}[!htbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l r r | r r}
+\toprule
+& \multicolumn{2}{c|}{\textit{Empirical}} & \multicolumn{2}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Quantity & Moreno & Bali & SBM-d & PA-d \\
+\midrule
+\multicolumn{5}{l}{\textit{Grid metadata}} \\
+$T_{\max}$    & 307 & 3{,}015 & 7{,}001 & 42 \\
+$L$            & 10 & 8 & 8 & 16 \\
+$\tau_{\min}$  & 1.00 & 1.26 & 2.15 & 1.00 \\
+$\tau_{\max}$  & 2.00 & 4.97 & 4.64 & 5.00 \\
+Method         & empirical & analytic & analytic & empirical \\
+Wall-clock (s) & 0.07 & 0.24 & 0.06 & 0.02 \\
+\addlinespace
+\multicolumn{5}{l}{\textit{Per-class AUMC and peak~$\tau$}} \\
+AUMC$_{003}$    & 0.259 & 0.596 & 0.315 & 0.687 \\
+peak~$\tau_{003}$ & 1.08 & 4.08 & 4.16 & 5.00 \\
+AUMC$_{012}$    & 0.0271 & $5.63\times10^{-4}$ & 0.0179 & 0.0117 \\
+peak~$\tau_{012}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{102}$    & 0.0124 & $1.05\times10^{-5}$ & $3.22\times10^{-4}$ & 0 \\
+peak~$\tau_{102}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{021D}$    & $9.35\times10^{-5}$ & $9.03\times10^{-6}$ & $1.05\times10^{-4}$ & $1.16\times10^{-5}$ \\
+peak~$\tau_{021D}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{021U}$    & $3.70\times10^{-4}$ & $3.71\times10^{-7}$ & $1.06\times10^{-4}$ & $1.43\times10^{-4}$ \\
+peak~$\tau_{021U}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{021C}$    & $3.84\times10^{-4}$ & $1.44\times10^{-6}$ & $2.23\times10^{-4}$ & $4.50\times10^{-5}$ \\
+peak~$\tau_{021C}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{111D}$    & $5.05\times10^{-4}$ & $4.37\times10^{-8}$ & $8.52\times10^{-6}$ & 0 \\
+peak~$\tau_{111D}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{111U}$    & $1.69\times10^{-4}$ & $1.93\times10^{-7}$ & $8.46\times10^{-6}$ & 0 \\
+peak~$\tau_{111U}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{030T}$    & $6.66\times10^{-5}$ & $2.84\times10^{-7}$ & $7.72\times10^{-6}$ & $1.58\times10^{-6}$ \\
+peak~$\tau_{030T}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{030C}$    & $1.53\times10^{-6}$ & 0 & $2.79\times10^{-6}$ & 0 \\
+peak~$\tau_{030C}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{201}$    & $7.24\times10^{-5}$ & $2.94\times10^{-9}$ & $1.75\times10^{-7}$ & 0 \\
+peak~$\tau_{201}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{120D}$    & $1.52\times10^{-4}$ & $2.62\times10^{-9}$ & $1.84\times10^{-7}$ & 0 \\
+peak~$\tau_{120D}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{120U}$    & $5.93\times10^{-5}$ & $2.11\times10^{-8}$ & $1.26\times10^{-7}$ & 0 \\
+peak~$\tau_{120U}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{120C}$    & $2.66\times10^{-5}$ & $1.47\times10^{-9}$ & $5.20\times10^{-7}$ & 0 \\
+peak~$\tau_{120C}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{210}$    & $1.16\times10^{-4}$ & $9.44\times10^{-10}$ & $3.26\times10^{-8}$ & 0 \\
+peak~$\tau_{210}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+AUMC$_{300}$    & $4.83\times10^{-5}$ & 0 & 0 & 0 \\
+peak~$\tau_{300}$ & 1.00 & 1.26 & 2.15 & 1.00 \\
+\bottomrule
+\end{tabular}
+\caption{Phase~0 Table~6a --- weighted layered triad census (directed networks). For each network the layered census thresholds the weighted adjacency across a log-spaced grid of $L$ thresholds $\tau \in [\tau_{\min}, \tau_{\max}]$ chosen by \texttt{recommend\_L}; per-class AUMC values are areas under the density curves on log-$\tau$, and peak~$\tau$ is the threshold at which each class's density peaks. AUMC values span several orders of magnitude (the empty-triad class 003 dominates while the dense motifs 201 and 300 are rare) and are reported in scientific notation; peak~$\tau$ is reported in the native $\tau$ units. The method dispatch (analytic vs.\ empirical) is set by \texttt{recommend\_L} based on $T_{\max}$ and the weight-distribution span. Unweighted variants of these networks are omitted because their weighted measures collapse to the static counts of Table~\ref{tab:phase0-triad-static-dir}.}
+\label{tab:phase0-triad-weighted-dir}
+\end{table}
+
+\begin{table}[!htbp]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l r r r | r r}
+\toprule
+& \multicolumn{3}{c|}{\textit{Empirical}} & \multicolumn{2}{c}{\textit{Synthetic}} \\
+\cmidrule(lr){2-4} \cmidrule(lr){5-6}
+Quantity & Marvel & Scot & Toledo & SBM-u & PA-u \\
+\midrule
+\multicolumn{6}{l}{\textit{Grid metadata}} \\
+$T_{\max}$    & 1{,}028{,}453 & 269 & 29 & 1{,}024 & 42 \\
+$L$            & 14 & 16 & 10 & 16 & 16 \\
+$\tau_{\min}$  & 4.40 & 1.00 & 1.00 & 1.00 & 1.00 \\
+$\tau_{\max}$  & 227.75 & 8.00 & 4.00 & 7.00 & 5.00 \\
+Method         & analytic & empirical & empirical & empirical & empirical \\
+Wall-clock (s) & 1.59 & 0.01 & 0.00 & 0.14 & 0.02 \\
+\addlinespace
+\multicolumn{6}{l}{\textit{Per-class AUMC and peak~$\tau$}} \\
+AUMC$_{003}$    & 1.71 & 0.889 & 0.572 & 0.816 & 0.687 \\
+peak~$\tau_{003}$ & 227.75 & 5.28 & 3.43 & 6.15 & 4.03 \\
+AUMC$_{102}$    & $1.15\times10^{-3}$ & 0.0135 & 0.028 & 0.0286 & 0.0117 \\
+peak~$\tau_{102}$ & 4.40 & 1.00 & 1.00 & 1.00 & 1.00 \\
+AUMC$_{201}$    & $9.19\times10^{-6}$ & $2.81\times10^{-4}$ & $1.46\times10^{-3}$ & $4.71\times10^{-4}$ & $1.99\times10^{-4}$ \\
+peak~$\tau_{201}$ & 4.40 & 1.00 & 1.00 & 1.00 & 1.00 \\
+AUMC$_{300}$    & $1.31\times10^{-6}$ & $6.71\times10^{-5}$ & $1.19\times10^{-4}$ & $7.00\times10^{-6}$ & $1.58\times10^{-6}$ \\
+peak~$\tau_{300}$ & 4.40 & 1.00 & 1.00 & 1.00 & 1.00 \\
+\bottomrule
+\end{tabular}
+\caption{Phase~0 Table~6b --- weighted layered triad census (undirected networks). Only the four undirected isomorphism classes $\{003, 102, 201, 300\}$ are non-zero on undirected graphs; the twelve asymmetric DL classes are zero across the $\tau$ grid by construction and omitted. Weights are symmetrized by sum ($W + W^\top$) before thresholding, following $s$-core semantics --- a different convention from the $\max(A, A^\top)$ symmetrization used by the weighted path-based measures in Tables~\ref{tab:phase0-undir-weighted}--\ref{tab:phase0-dir-weighted}. AUMC values are reported in scientific notation, peak~$\tau$ in native units. Marvel's $T_{\max} = 1{,}028{,}453$ and analytic $\tau$ grid span the widest range in the corpus.}
+\label{tab:phase0-triad-weighted-undir}
 \end{table}
 
 \FloatBarrier
 
 \section{Degeneration Strategy}
 
-For each network in the corpus, the validation proceeds by treating the network as the true network~$T$ and generating degraded observed networks~$\Gobs$ by removing nodes under controlled missingness mechanisms. The framework is then run on~$\Gobs$ and its output compared against the known true measures computed on~$T$.
+For each network in the corpus, the validation proceeds by treating the network as the true network~$T$ and generating degraded observed networks~$\Gobs$ by removing nodes under a controlled missingness mechanism. The framework is then run on~$\Gobs$ and its output compared against the known true measures computed on~$T$. This section specifies the degeneration design; it is a design specification for the Phase~1 sampler, which has not yet been implemented.
 
-\subsection{Missingness Mechanism}
+\subsection{A Two-Factor Degeneration Design}
 
-Missingness is induced at the node level following the protocol of \citet{SmithMorganMoody2022}. For each network, the probability of node~$i$ being selected for removal is a weighted combination of node centrality (proxied by in-degree) and uniform noise:
+The degeneration design is fundamentally \emph{two-factor}, and the distinction is central to the framework's value proposition. The two factors are not a nuisance grid to be marginalized over: they \emph{are} the priors against which the framework's calibration is measured, and the sampler must realize both simultaneously in each degraded network.
+
+\paragraph{Factor 1 --- missingness rate.} The quantity of nodes removed, expressed as a proportion of the node set. This sets \emph{how many} nodes are dropped. For the main validation, six rates are used: 5\%, 10\%, 15\%, 25\%, 40\%, and 50\% of nodes. This covers the realistic range an analyst is likely to face and matches a subset of the rates explored in \citet{SmithMorganMoody2022}. Lower rates (1--5\%) are excluded because between-method differences are too small to detect reliably; higher rates (60--70\%) are excluded as extreme conditions where any method's reliability is suspect.
+
+\paragraph{Factor 2 --- missingness--centrality correlation.} The selectivity of removal: the correlation~$\rho$ between a node's centrality and its probability of being removed. This sets \emph{which} nodes are more likely to drop --- high-centrality nodes over-represented among the removed (positive~$\rho$), under-represented (negative~$\rho$), or removed at random (\mbox{$\rho = 0$}, the MCAR baseline). The induced correlation is set at five levels: $-0.75$, $-0.25$, $0.00$, $+0.25$, $+0.75$. The $\pm 0.75$ and $\pm 0.25$ values match the four levels used in \citet{SmithMorganMoody2022}; the $0.00$ level provides an MCAR baseline.
+
+The validation is therefore a two-dimensional grid over (rate,~$\rho$), with $6 \times 5 = 30$ cells per network. The framework's claim is that it produces well-calibrated credible intervals across that grid, and the grid is precisely the space of priors the user is asked to supply.
+
+\subsection{The Joint Sampler}
+
+Missingness is induced at the node level. The probability that node~$i$ is selected for removal is a convex combination of a centrality signal and uniform noise:
 \[
 \text{prob}_i = b \cdot \text{centrality}_i + (1 - b) \cdot u_i,
 \]
-where $u_i \sim \text{Uniform}(0, 1)$ and the scalar~$b$ is tuned to produce a target correlation~$\rho_{\text{induced}}$ between centrality and missingness probability across the network's nodes. The induced correlation is set at five levels: $-0.75$, $-0.25$, $0.00$, $+0.25$, $+0.75$, corresponding to strong negative, weak negative, MCAR, weak positive, and strong positive centrality-missingness relationships respectively. The $\pm 0.75$ and $\pm 0.25$ values match the four levels used in \citet{SmithMorganMoody2022}; the additional $0.00$ level provides an MCAR baseline.
+where $u_i \sim \text{Uniform}(0, 1)$ and the mixing scalar~$b \in [0, 1]$ controls selectivity. The centrality driver is the binarized \emph{in-degree} for directed networks and the binarized \emph{degree} for undirected networks --- following \citet{SmithMorganMoody2022} for the directed case and extending it naturally to the undirected case.
+
+\paragraph{The two factors interact and must be solved jointly.} The scalar~$b$ is tuned by bisection to achieve the target induced~$\rho$, but the realized correlation between $\text{prob}_i$ and $\text{centrality}_i$ depends on \emph{where the removal threshold falls}, which depends in turn on the target rate. The sampler therefore cannot draw the correlation structure and the node count independently: the bisection on~$b$ to hit target~$\rho$ must hold \emph{at} the target rate, and the two factors are solved together in each realization rather than composed from independent draws.
+
+\paragraph{Achievable-$\rho$ ceiling.} The attainable correlation between $\text{prob}_i$ and centrality is not free over $[-1, +1]$. On highly skewed networks --- Balikatan, Marvel, and the preferential-attachment synthetics --- a few hubs dominate the centrality vector, capping the maximum achievable correlation with a bounded probability well below~1. Bisecting toward $\rho = +0.75$ may be infeasible on such networks: the bisection converges to $b = 1$ and still falls short of the target. The sampler is specified to detect non-convergence, report the achieved~$\rho$, and record that realized value as the actual condition rather than silently reporting the unattained nominal target.
+
+\paragraph{Recording nominal, realized, and degeneracy.} The sampler always records three things for each degraded network: the \emph{nominal} (rate,~$\rho$) requested, the \emph{realized} (rate,~$\rho$) actually achieved by the sampled dropped-node set, and a \emph{degeneracy flag}. Realized values differ from nominal even when the bisection succeeds in expectation, because each finite draw has sampling noise --- severe at small~$N$ and low rates (5\% of 70 nodes is three to four nodes, a very noisy realized correlation). Recording both lets coverage be tabulated against either the nominal grid or the realized conditions, and it feeds the per-cell degeneracy rate used for grid trimming below.
+
+\paragraph{Degenerate draws are kept and flagged, not discarded.} At high rates with strong positive~$\rho$ --- for example 50\% missingness with $\rho = +0.75$ --- most high-centrality nodes are removed, which can disconnect the graph, collapse the giant component, or empty the E/I bins. This is the realistic outcome of selective high-rate missingness, especially for small-world structures, and the validation keeps these draws rather than discarding or re-rolling them. Each draw is flagged for degeneracy against concrete criteria (giant-component fraction below a threshold, empty bins, undefined measures), and the per-cell degeneracy rate is recorded alongside the nominal and realized conditions. That degeneracy rate is a planning instrument: cells that degenerate at high frequency need few replicates, so the degeneracy profile is used to set per-network run bounds and trim the grid, surfacing the hard cases rather than hiding them.
+
+\paragraph{Centrality ties attenuate selectivity.} Binarized in-degree produces many tied values (many nodes at in-degree~1 or~2). Among tied nodes the removal decision is effectively pure noise, so realized selectivity runs somewhat lower than the formula implies. This is acceptable, but the realized-$\rho$ check accounts for it so that systematically attenuated achieved correlation is expected rather than treated as a sampler bug.
+
+\paragraph{Seed discipline.} With five $\rho$~levels, six rates, up to 100 replicates, and sixteen networks, the grid involves a large number of draws. Each (network,~$\rho$, rate, replicate) tuple is independently reproducible from a single master seed via a deterministic sub-seed scheme, so any one cell can be regenerated without rerunning the grid.
+
+\paragraph{Replication.} The per-cell replication count is 100 for small and mid-sized networks, with a smaller count permitted for Marvel where the per-replicate cost is highest; the degeneracy profile (above) further trims replication in cells that degenerate at high frequency.
 
 \subsection{Missingness Rates}
 
-For the main validation, six missingness rates are used: 5\%, 10\%, 15\%, 25\%, 40\%, and 50\% of nodes. This covers the realistic range of missingness an analyst is likely to face and matches a subset of the rates explored in \citet{SmithMorganMoody2022}. Lower rates (1--5\%) are excluded because differences between methods are too small to reliably detect at very low missingness. Higher rates (60--70\%) are excluded because they represent extreme conditions where any method's reliability is suspect.
+The six missingness rates of Factor~1 (5\%, 10\%, 15\%, 25\%, 40\%, 50\%) are applied to every network. The same rate set and the same five induced-$\rho$ levels apply to both weighted and unweighted networks; the framework's internal behavior differs between them (Stage~2 edge-weight reversal is skipped for unweighted networks) but the degeneration conditions are uniform across the corpus.
 
 \subsection{Reconstruction Procedure}
 
@@ -265,7 +515,7 @@ Once nodes are selected for removal, they are removed from the network entirely~
 
 Note that this means the framework is not given any information about which specific nodes were removed (i.e., no list of partially observed nodes is provided in the basic protocol). This represents the most general case where the analyst knows missingness has occurred but does not know which specific nodes are missing. A supplementary set of conditions will also be run where the framework is given the list of nominated non-respondents (those who appear in observed edges but were removed), to evaluate the contribution of Stage~0.5 imputation.
 
-\paragraph{Weighted versus unweighted networks.} For weighted networks, both node-level ($\pinode$) and edge-weight-level ($\piedge$) missingness are in principle modelable; the validation focuses on node-level missingness following the protocol above, with $\piedge = 0$ throughout to keep the design tractable. For unweighted networks, $\piedge$ is structurally inapplicable as specified in the framework specification, and only $\pinode$ varies. The same induced-$\rho$ levels and missingness rates apply to both weighted and unweighted networks; the framework's internal behavior differs (Stage~2 is skipped for unweighted networks) but the validation conditions are uniform.
+\paragraph{Weighted versus unweighted networks.} For weighted networks, both node-level ($\pinode$) and edge-weight-level ($\piedge$) missingness are in principle modelable; the validation focuses on node-level missingness following the protocol above, with $\piedge = 0$ throughout to keep the design tractable. For unweighted networks, $\piedge$ is structurally inapplicable as specified in the framework specification, and only $\pinode$ varies.
 
 \subsection{User-Supplied Prior}
 
@@ -278,7 +528,7 @@ For each combination of network, induced~$\rho$, and missingness rate, the frame
 
 \subsection{Iterations}
 
-For each combination of conditions, the missingness-induction-and-evaluation cycle is repeated 200 times. This is reduced from the 1{,}000 iterations used in \citet{SmithMorganMoody2022} to accommodate the additional computational cost of the framework's posterior sampling ($B = 1{,}000$ replicates per run). With 200 iterations per condition, the resulting coverage estimates have approximate standard error $\sqrt{0.95 \cdot 0.05 / 200} \approx 0.015$, which is acceptable for the validation's purposes.
+For each cell of the (network, induced~$\rho$, missingness rate, user-supplied~$\rho$) grid, the missingness-induction-and-evaluation cycle is repeated 100 times for small and mid-sized networks, with a smaller count permitted for Marvel where per-replicate cost is highest and for cells whose degeneracy profile (Section~\ref{sec:phase0} sampler design) makes additional replicates uninformative. The count is reduced from the 1{,}000 iterations used in \citet{SmithMorganMoody2022} to accommodate the framework's posterior sampling ($B = 1{,}000$ replicates per run). With 100 iterations per cell, coverage estimates have approximate standard error $\sqrt{0.95 \cdot 0.05 / 100} \approx 0.022$, which is acceptable for the validation's purposes. Because each replicate records its realized (rate,~$\rho$) alongside the nominal target, coverage can be aggregated either against the nominal grid or against the realized conditions; the latter is the more honest summary on skewed networks where the achievable-$\rho$ ceiling prevents the nominal target from being reached.
 
 \section{Comparison Baselines}
 
@@ -302,21 +552,23 @@ The validation evaluates each method on the same network measures used in \citet
 
 \subsection{Measures}
 
+The Phase~1 measure set is locked to the battery below. Each measure is computed in a weight-aware manner: for weighted networks the degree family uses strength (weight-summed degree) and the path-based measures (closeness, betweenness, mean inverse distance) use tie-strength edge semantics (Dijkstra on $1/w$, so stronger ties are shorter); for unweighted networks the degree family is the binary degree and the path-based measures use the binary (\texttt{:ignore}) semantics that reproduce \citet{SmithMorganMoody2022}'s convention. Bonacich power is already weight-aware and is computed identically in both cases. Global transitivity is computed by a direct $O(\sum_v d_v^2)$ triangle-counting algorithm in Phase~1 rather than by the triad census used for the Phase~0 characterization tables; the two agree on small networks but the direct algorithm scales to Marvel.
+
 \paragraph{Node-level measures (centrality).}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item In-degree centrality
-  \item Out-degree centrality (directed networks only)
-  \item Symmetric degree centrality
-  \item Closeness centrality
-  \item Betweenness centrality
+  \item In-degree / in-strength centrality (directed networks only)
+  \item Out-degree / out-strength centrality (directed networks only)
+  \item Symmetric degree / total strength centrality
+  \item Closeness centrality (tie-strength weighted; binary for unweighted)
+  \item Betweenness centrality (tie-strength weighted; binary for unweighted)
   \item Bonacich power centrality
 \end{itemize}
 
 \paragraph{Network-level measures (centralization).}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item In-degree centralization
-  \item Out-degree centralization (directed networks only)
-  \item Symmetric degree centralization
+  \item In-degree / in-strength centralization (directed networks only)
+  \item Out-degree / out-strength centralization (directed networks only)
+  \item Symmetric degree / total strength centralization
   \item Closeness centralization
   \item Betweenness centralization
   \item Bonacich power centralization
@@ -324,12 +576,13 @@ The validation evaluates each method on the same network measures used in \citet
 
 \paragraph{Topology measures.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item Component size (largest connected/weakly connected component)
-  \item Bicomponent size (largest biconnected component)
-  \item Mean geodesic distance
-  \item Transitivity (clustering coefficient)
-  \item Tau-RC (triangle-to-connected-triple ratio)
+  \item Largest component size (connected / weakly connected component)
+  \item Largest bicomponent size (biconnected component)
+  \item Mean inverse geodesic distance (tie-strength weighted; binary for unweighted)
+  \item Global transitivity (direct triangle-counting algorithm)
 \end{itemize}
+
+\paragraph{Measures excluded from Phase~1.} Two measures used in the Phase~0 characterization are deliberately \emph{not} carried into the Phase~1 validation grid. The ranked-cluster tau statistic (Tau$_{RC}$) is a Phase~0 descriptive only: it requires a Monte Carlo null model per evaluation, which is prohibitively expensive at the scale of the validation grid, and it is undefined for undirected networks. Structural-equivalence blockmodeling is likewise excluded: its per-replicate cost does not reduce to the scalar-per-network form the validation grid requires. Both remain available as corpus-characterization tools but are out of scope for the degraded-network evaluation.
 
 \subsection{Track A: Point-Estimate Accuracy}
 
@@ -397,14 +650,14 @@ The validation pipeline will be implemented in Python alongside the framework it
 
 \paragraph{Output.} Framework runs produce per-iteration outputs in Parquet format: posterior samples for each measure, point estimates, credible interval bounds, and diagnostic information (realized correlation, binning mode used, etc.). Comparison method outputs are stored in parallel structures. Analysis and figure generation are performed in R using the \texttt{arrow} package to read the Parquet output.
 
-\paragraph{Parallelization.} The validation grid is embarrassingly parallel across (network, induced~$\rho$, missingness rate, iteration) combinations. Implementation uses \texttt{joblib} or equivalent to parallelize across available cores. The total computational budget is estimated at approximately $6 \cdot 10^7$ framework runs, requiring a multi-day run on a single machine or a few hours on a small compute cluster.
+\paragraph{Parallelization.} The validation grid is embarrassingly parallel across (network, induced~$\rho$, missingness rate, user-supplied~$\rho$, iteration) combinations. Implementation uses \texttt{joblib} or equivalent to parallelize across available cores. The grid comprises $16 \times 5 \times 6 \times 3 \times 100 \approx 1.4 \times 10^6$ framework runs at full replication (each run producing all measures and, for the framework, $B = 1{,}000$ posterior replicates), with the realized count lower after degeneracy-based trimming. This requires a multi-day run on a single machine or a few hours on a small compute cluster.
 
 \section{Reporting Plan}
 
 The final validation report will be a separate document, structured around the success conditions:
 
 \begin{enumerate}[leftmargin=*, itemsep=2pt]
-  \item Corpus characterization (Phase~0 results, descriptive statistics for all eight networks)
+  \item Corpus characterization (Phase~0 results, descriptive statistics for all sixteen networks)
   \item Performance under correct prior (C1, C3): coverage, width, bias, and node-correlation results across the full grid
   \item Comparison with simple imputation (C2): head-to-head point-estimate comparison
   \item Calibration sensitivity (C6, C7): performance under MCAR-assuming and opposite-sign priors
@@ -419,11 +672,11 @@ Figures will follow the visual conventions of \citet{SmithMorganMoody2022}: smal
 
 \paragraph{Risk 1: Framework coverage is too low under correct prior.} If C1 fails systematically, the most likely causes are (a)~the bin-assignment distribution does not produce the intended correlation in practice, (b)~the rank-rank matrix is too smoothed (overly Laplace-regularized), or (c)~the Poisson weight model is wrong for some networks. Diagnostic outputs will help identify which is the issue. Mitigations include refining the $\beta$-solving procedure, reducing smoothing, or adopting weight distributions tuned to the input network.
 
-\paragraph{Risk 2: Computational cost exceeds the budget.} If the full validation grid takes longer than anticipated, the first cut is to reduce iterations per condition from 200 to 100 (doubles standard error on coverage estimates but remains acceptable). The second cut is to reduce missingness rates from six to four (drop 5\% and 50\%, keeping 10\%, 15\%, 25\%, 40\%). The third cut is to reduce posterior samples from $B = 1{,}000$ to $B = 500$.
+\paragraph{Risk 2: Computational cost exceeds the budget.} If the full validation grid takes longer than anticipated, the first cut is to reduce iterations per cell from 100 to 50 (raises the standard error on coverage estimates from $\approx 0.022$ to $\approx 0.031$ but remains usable for the primary conditions). The second cut is to reduce missingness rates from six to four (drop 5\% and 50\%, keeping 10\%, 15\%, 25\%, 40\%). The third cut is to reduce posterior samples from $B = 1{,}000$ to $B = 500$. The per-cell degeneracy profile (Section~\ref{sec:phase0} sampler design) provides a fourth, targeted lever: cells that degenerate at high frequency need few replicates, so replication can be trimmed cell-by-cell rather than uniformly.
 
 \paragraph{Risk 3: Balikatan's structure is anomalous.} If Phase~0 reveals that Balikatan has structural properties that make it an outlier in the corpus (e.g., extremely heavy-tailed degree distribution, multiple disconnected components), the validation may need to treat Balikatan as a case study rather than including it in the main factorial. The reporting structure accommodates this contingency.
 
-\paragraph{Risk 4: Empirical centralization values cluster too tightly.} If Phase~0 reveals that all four empirical networks have similar centralization, the synthetic networks become the primary source of centralization variation. The synthetic design has flexibility built in to address this if needed.
+\paragraph{Risk 4: Empirical centralization values cluster too tightly.} If Phase~0 reveals that all five empirical networks have similar centralization, the synthetic networks become the primary source of centralization variation. The synthetic design has flexibility built in to address this if needed.
 
 \section{Milestones}
 
@@ -433,9 +686,9 @@ The validation is organized into seven milestones. Each milestone is expressed a
 
 \paragraph{Necessary conditions.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item All four empirical networks load into the unified Parquet format without loss of information.
+  \item All five empirical networks load into the unified Parquet format without loss of information.
   \item Loaded networks reproduce published descriptive statistics (node count, edge count, density, direction) within rounding tolerance.
-  \item The unified format accommodates all sources (four empirical, plus synthetic networks generated in Milestone~3) without source-specific schema variations.
+  \item The unified format accommodates all sources (five empirical, plus synthetic networks generated in Milestone~3) without source-specific schema variations.
 \end{itemize}
 
 \paragraph{Artifact.} \texttt{nodes.parquet} and \texttt{edges.parquet} files for each network, plus a loader-validation report comparing loaded statistics against source documentation.
@@ -444,23 +697,27 @@ The validation is organized into seven milestones. Each milestone is expressed a
 
 \subsection*{Milestone 2: Empirical Corpus Characterization (Phase 0)}
 
+\emph{Status: complete.} The eight Phase~0 tables (Tables~\ref{tab:phase0-undir-binary}--\ref{tab:phase0-triad-weighted-undir}) report the full characterization, and the conditions below are met.
+
 \paragraph{Necessary conditions.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item Descriptive statistics from Section~5.1 (centralization, transitivity, modularity, mean degree, etc.) are computed for all four empirical networks.
-  \item The empirical corpus collectively spans enough structural variation to make the validation meaningful~--- in particular, at least two distinct centralization regimes must be represented across the four networks.
-  \item Any empirical network that turns out to be structurally anomalous (e.g., disconnected, trivially small communities, degenerate degree distribution) is identified and a remediation decision is made (include with caveats, treat as case study, or exclude).
+  \item Descriptive statistics from Section~\ref{sec:phase0} (centralization, transitivity, mean degree, weight distribution, triad census, etc.) are computed for all five empirical networks and reported in the Phase~0 tables.
+  \item The empirical corpus collectively spans enough structural variation to make the validation meaningful~--- in particular, at least two distinct centralization regimes must be represented across the empirical networks. (Met: degree centralization ranges from the near-uniform small networks to the strongly hub-skewed Balikatan and Marvel cases.)
+  \item Any empirical network that turns out to be structurally anomalous (e.g., disconnected, trivially small communities, degenerate degree distribution) is identified and a remediation decision is made (include with caveats, treat as case study, or exclude). (Met: Marvel's largest component spans 70\% of nodes; it is included with this fragmentation noted.)
 \end{itemize}
 
-\paragraph{Artifact.} Phase~0 report: an empirical analog of \citet{SmithMorganMoody2022}'s Table~1 for the validation corpus, plus a narrative interpretation of structural coverage and gaps.
+\paragraph{Artifact.} Phase~0 report: the six descriptive tables in Section~\ref{sec:phase0}, an empirical analog of \citet{SmithMorganMoody2022}'s Table~1 extended with weighted and triad-census characterizations, plus the narrative interpretation of structural coverage in that section.
 
-\paragraph{Gates.} The Phase~0 report determines whether the synthetic network designs need adjustment (Milestone~3). If the empirical corpus already covers the high-centralization cell well, Synthetic~2 may be redesigned to fill a different gap.
+\paragraph{Gates.} The Phase~0 report determined that the synthetic network designs did not require redesign; the empirical corpus, with Marvel added at the large-clustered extreme, spans the intended structural range and the synthetic generators anchor the controlled centralization endpoints as designed.
 
 \subsection*{Milestone 3: Synthetic Network Generation and Unweighted Variants}
+
+\emph{Status: complete.} All synthetic networks and unweighted threshold variants are generated and present in the corpus (Table~\ref{tab:corpus}).
 
 \paragraph{Necessary conditions.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
   \item Synthetic~1 and Synthetic~2 are generated in both weighted and unweighted variants, each in directed and undirected forms (eight synthetic networks total).
-  \item Thresholded unweighted variants of Moreno and Toledo are produced from the loaded weighted versions.
+  \item Thresholded unweighted variants of Moreno, Toledo, and Marvel are produced from the loaded weighted versions.
   \item Each synthetic network's actual structural properties (computed post-generation) fall within the target ranges specified in Section~3.2 or are explicitly noted as deviations with justification.
   \item Together, the empirical and synthetic networks span low, moderate, and high centralization, both small ($N \leq 250$) and larger ($N \geq 600$) sizes, and all four cells of the weighted~$\times$~directed design with at least three networks per cell.
 \end{itemize}
@@ -513,7 +770,7 @@ The validation is organized into seven milestones. Each milestone is expressed a
 
 \paragraph{Necessary conditions.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item The full factorial validation grid completes across all eight networks, five induced~$\rho$ values, six missingness rates, three user-supplied~$\rho$ conditions, and 200 iterations per condition.
+  \item The full factorial validation grid completes across all sixteen networks, five induced~$\rho$ values, six missingness rates, three user-supplied~$\rho$ conditions, and up to 100 iterations per cell (fewer where the degeneracy profile or Marvel's per-replicate cost warrants).
   \item All measures from Section~5.1 are computed for the framework, all applicable baselines, and the true network values.
   \item Output is stored in the agreed Parquet schema with sufficient metadata to reconstruct any individual condition's run.
   \item The primary success conditions (C1--C5 from Section~6.1) are evaluated against the empirical results, with each condition's status (met / partially met / not met) documented.
