@@ -505,6 +505,67 @@ where $u_i \sim \text{Uniform}(0, 1)$ and the mixing scalar~$b \in [0, 1]$ contr
 
 \paragraph{Replication.} The per-cell replication count is 100 for small and mid-sized networks, with a smaller count permitted for Marvel where the per-replicate cost is highest; the degeneracy profile (above) further trims replication in cells that degenerate at high frequency.
 
+\paragraph{API and cached centrality.} The sampler is structured as four functions. The centrality vector for a network is computed once and cached, since binarized in-degree (directed) or binarized degree (undirected) is a property of the input network that does not change across $(\rho, \text{rate})$ targets. The internal routines are \texttt{\_centrality\_correlation\_for\_b}, which evaluates the realized correlation between $\text{prob}_i$ and centrality for a given $b$; the bisection routine that solves for $b$ given a target~$\rho$ to within tolerance $10^{-3}$; and \texttt{\_sample\_missingness}, which produces the dropped-node set given centrality, target rate, $b$, and a seed. The public API exposes \texttt{generate\_missingness\_mask} (wrapping the three internals and returning the complete replicate record), \texttt{apply\_missingness} (constructing the degraded network from the original and a dropped-node set), and \texttt{build\_degeneration\_corpus} (orchestrating the full grid).
+
+\subsection{Recording Schema and Storage}
+
+Each replicate emits a complete record sufficient to reconstruct the degraded network and to support both nominal-grid and realized-condition analyses downstream. The record is the dropped-node index set together with realized-condition scalars and degeneracy flags; the full degraded network itself is \emph{not} stored.
+
+\paragraph{Dropped-node sets, not degraded networks.} The full grid involves up to 48{,}000 degraded networks (sixteen networks $\times$ five $\rho$ $\times$ six rates $\times$ 100 replicates), and storing each as a GraphML file would be prohibitive at Marvel scale and wasteful at every scale. The dropped-node index set, by contrast, is a vector of integers, a few kilobytes per replicate at most. Combined with the original network it reconstructs the degraded network exactly when \texttt{apply\_missingness} is called at measurement time. This is the standard lazy-materialization pattern: store the difference from the canonical, not the result.
+
+\paragraph{Per-replicate record.} Each replicate's record carries:
+\begin{itemize}[leftmargin=*, itemsep=2pt]
+  \item \texttt{dropped\_nodes}: the vector of removed node indices.
+  \item \texttt{nominal}: the target $(\rho, \text{rate})$ for the cell.
+  \item \texttt{realized\_rate}: the actual fraction removed (deterministic given target rate and~$N$).
+  \item \texttt{realized\_rho}: the correlation between $\text{prob}_i$ and centrality actually achieved by the sampled dropped-node set.
+  \item \texttt{bisection\_status}: a three-way symbol indicating how the bisection terminated:
+    \begin{itemize}[leftmargin=*, itemsep=0pt, topsep=2pt]
+      \item \texttt{:converged} --- the bisection hit target~$\rho$ within tolerance;
+      \item \texttt{:ceiling\_hit} --- bisection reached $b = 1$ without attaining target~$\rho$ (the achievable-$\rho$ ceiling);
+      \item \texttt{:failed\_other} --- numerical or unexpected failure mode.
+    \end{itemize}
+  \item \texttt{sampler\_degeneracy}: the degeneracy fields described in Section~\ref{sec:degeneracy} below.
+  \item \texttt{seed}: the deterministic sub-seed used for this replicate.
+\end{itemize}
+
+\paragraph{Three-source degeneracy flags.} A degraded network can be degenerate for reasons the sampler can detect (topological collapse from dropped-node selection alone), for reasons the measurement code detects (non-finite or undefined measure values), or for reasons the framework detects (empty E/I bins, $\beta$-solver non-convergence). Each source flags its own degeneracies in its own record field: \texttt{sampler\_degeneracy} (this section), \texttt{measure\_degeneracy} (populated when the measure battery runs), and \texttt{framework\_degeneracy} (populated when the framework runs). No code is forced to import another's internal state to detect degeneracies, and downstream summaries can filter on any combination of flags.
+
+\subsection{Degeneracy Detection}
+\label{sec:degeneracy}
+
+The sampler is responsible for detecting and recording topological degeneracies --- those determinable from the dropped-node set alone, without invoking the measure code or the framework. Three quantities are computed, and the locked thresholds applied below.
+
+\paragraph{Giant-component fraction (of remaining nodes).} The largest connected component of the degraded network, expressed as a fraction of the \emph{remaining} (not original) node set. The threshold is 0.30: below this, the degraded network has fragmented into pieces too small to support a global network analysis in the operational sense. The denominator is remaining-nodes rather than original-nodes because the question is whether what survives is structurally coherent, not how much of the original survives. Recorded as a continuous value alongside the threshold-derived Boolean.
+
+\paragraph{Remaining node count.} The number of nodes left after removal. The threshold is~25: below this, centralization standard deviations become too noisy and the framework's binning has too few nodes per bin for the procedure to be meaningful. The 50\% rate cell on Moreno (N=70) leaves 35 nodes, comfortably above this floor; the threshold catches catastrophic cases (extreme high-rate cells on the smallest networks) without firing on the design grid.
+
+\paragraph{Remaining edge count.} The number of edges left after removal. The threshold is~1: a network with zero edges is degenerate by any reasonable definition. Possible at very high rates on sparse small networks (e.g., Toledo at 50\% with strongly positive~$\rho$).
+
+\paragraph{Continuous values are the primary record.} All three quantities are recorded as their raw continuous values, with the threshold-derived Booleans (\texttt{gc\_collapse}, \texttt{too\_small}, \texttt{no\_edges}, and the disjunctive \texttt{any\_topo\_degenerate}) as convenience-summary views. This permits post-hoc re-thresholding without re-running the sampler: if the chosen thresholds turn out to be too strict or too lenient on the realized corpus, the cell-level degeneracy rates can be recomputed from the recorded continuous values rather than from a re-run of 48{,}000 draws.
+
+\paragraph{Layer separation.} The sampler does \emph{not} attempt to detect measurement-time degeneracies (non-finite closeness on a fragmented network, zero-variance centralization, Bonacich non-convergence) or framework-internal degeneracies (empty E/I bins, $\beta$-solver failure). Those belong to the measure code and the framework respectively, recorded in their own degeneracy fields when each runs. The sampler's contract is narrow: it returns dropped nodes and topological flags. Composition of the three flag sources happens at analysis time, not in the sampler.
+
+\subsection{Sampler Validation Harness}
+
+Before running the sampler against the corpus, a seven-test harness verifies that it does what its API claims. The harness follows the convention of the Phase~0 test suites (e.g., \texttt{run\_synthetic\_path\_centrality\_tests}): a single driver function that runs all checks, prints a one-line status per check, and returns a Boolean for use in regression. Each check is callable in isolation for debugging.
+
+\paragraph{Test 1: Bisection convergence on a tractable network.} On Scotland (undirected, $N=108$, moderate skew), target $\rho = +0.25$. Draw 100 replicates. Assert that the mean realized $\rho$ across the 100 draws matches target within tolerance $0.02$. Single-replicate realized~$\rho$ is noisy, especially at low rates; the test is on the mean across many seeds, not on any single draw. Status reported as $|\text{mean realized}~\rho - \text{target}| < 0.02$.
+
+\paragraph{Test 2: Exact rate hit per replicate.} Across a small grid of (rate, $\rho$) pairs covering the design grid, every replicate's realized rate must equal $\lfloor \text{target\_rate} \cdot N \rfloor$ or $\lceil \text{target\_rate} \cdot N \rceil$ exactly (depending on the rounding convention chosen). Asserted per-replicate, not on the mean. A bug where the $\rho$-targeting accidentally perturbed the rate would be subtle in mean terms but caught immediately by an exact-per-replicate check.
+
+\paragraph{Test 3: Achievable-$\rho$ ceiling detection.} On PA-d unweighted (in-degree Gini~4.65, near the corpus's high-skew extreme), target $\rho = +0.95$. The sampler is expected to fail to converge: the bisection should reach $b = 1$ and still fall short of the target. The test asserts (a) \texttt{bisection\_status} is set to \texttt{:ceiling\_hit}, (b) \texttt{realized\_rho} is less than the target, and (c) the realized~$\rho$ is the actual achieved correlation, not the unattained nominal value. This is the most consequential test in the harness: a sampler that silently reports nominal targets it did not achieve poisons all downstream calibration analysis.
+
+\paragraph{Test 4: Seed reproducibility.} Two calls to \texttt{generate\_missingness\_mask} with identical (network, target\_rate, target\_rho, seed) produce bit-identical dropped-node sets. Two calls with different seeds (everything else equal) produce different sets. Trivial to test but catches the entire class of sub-seed plumbing bugs.
+
+\paragraph{Test 5: MCAR baseline.} Target $\rho = 0$. The bisection should produce $b \approx 0$, the dropped-node distribution should be approximately uniform across centrality strata, and the mean realized~$\rho$ across 100 replicates should be near zero. This is the sanity check that \mbox{$\rho = 0$} actually corresponds to MCAR in practice.
+
+\paragraph{Test 6: Centrality ties handled gracefully.} On a constructed 50-node 4-regular ring (every node has degree~4), target $\rho = +0.5$. Draw 100 replicates and assert (a) no crashes, (b) mean realized~$\rho$ is positive but attenuated relative to target (the expected behavior when most centrality values are tied and the formula's selectivity collapses into uniform noise within ties), and (c) the attenuation is reported via \texttt{bisection\_status = :converged} with \texttt{realized\_rho} below target --- distinguishing ``the sampler succeeded but the network couldn't support the target'' from ``the sampler failed.''
+
+\paragraph{Test 7: Degeneracy flagging fires on stress cells.} On Toledo at 50\% missingness with target $\rho = +0.75$ (a deliberate stress cell), draw 100 replicates. Assert that a meaningful fraction --- at least 20\% --- trip \texttt{any\_topo\_degenerate}, and that the flag fires when and only when the recorded continuous quantities cross their thresholds. This tests the degeneracy-detection plumbing: that the code is wired in, computes the right quantities, and trips at the right thresholds. A silent failure here would produce clean grid summaries hiding a real failure mode.
+
+\paragraph{Small-network default, Marvel opt-in.} The harness runs by default on Scotland, Moreno, Toledo, PA-d unweighted, and the constructed 4-regular ring --- all small enough that the 100-replicate inner loops complete in seconds. Marvel is excluded from the default suite: sampler correctness is network-size-invariant (if it works on Scotland it works on Marvel, just slower), so the default suite preserves the property that it can actually be run every time. A separate opt-in \texttt{test\_phase1\_sampler\_marvel\_scaling} confirms behavior on Marvel at one or two cells when needed, but is not part of regression.
+
 \subsection{Missingness Rates}
 
 The six missingness rates of Factor~1 (5\%, 10\%, 15\%, 25\%, 40\%, 50\%) are applied to every network. The same rate set and the same five induced-$\rho$ levels apply to both weighted and unweighted networks; the framework's internal behavior differs between them (Stage~2 edge-weight reversal is skipped for unweighted networks) but the degeneration conditions are uniform across the corpus.
