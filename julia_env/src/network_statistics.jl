@@ -1170,14 +1170,75 @@ module network_statistics
 			return costs
 	end
 
+#	Helper Function for Weighted Path-Based Measures: Min-Heap Sift-Up (1-Indexed)
+	function _heap_sift_up!(heap::Vector{Tuple{Float64, Int}}, i::Int)
+		"""
+		Args:
+			heap::Vector{Tuple{Float64,Int}}: heap buffer, valid in 1:i
+			i::Int: index of the just-inserted element to sift toward the root
+		Returns:
+			Nothing (heap mutated in place)
+		Notes:
+			Restores the min-heap property after inserting at position i.
+			Tuples compare lexicographically, so (distance, node) orders by
+			distance with a stable node tiebreak.
+		"""
+		@inbounds while i > 1
+			parent = i >> 1
+			if heap[i] < heap[parent]
+				heap[i], heap[parent] = heap[parent], heap[i]
+				i = parent
+			else
+				break
+			end
+		end
+		return nothing
+	end
+
+#	Helper Function for Weighted Path-Based Measures: Min-Heap Sift-Down (1-Indexed)
+	function _heap_sift_down!(heap::Vector{Tuple{Float64, Int}}, heap_size::Int)
+		"""
+		Args:
+			heap::Vector{Tuple{Float64,Int}}: heap buffer, valid in 1:heap_size
+			heap_size::Int: number of valid elements after the root was replaced
+		Returns:
+			Nothing (heap mutated in place)
+		Notes:
+			Restores the min-heap property after the root has been overwritten
+			by the former last element (standard pop procedure). Operates on
+			the first heap_size entries only.
+		"""
+		i = 1
+		@inbounds while true
+			l = 2 * i
+			r = l + 1
+			smallest = i
+			if l <= heap_size && heap[l] < heap[smallest]
+				smallest = l
+			end
+			if r <= heap_size && heap[r] < heap[smallest]
+				smallest = r
+			end
+			if smallest != i
+				heap[i], heap[smallest] = heap[smallest], heap[i]
+				i = smallest
+			else
+				break
+			end
+		end
+		return nothing
+	end
+
 #	Helper Function for Weighted Path-Based Measures: Single-Source Dijkstra
 	function _dijkstra_distances_and_sigma!(neighbor_starts::Vector{Int},
-												neighbor_data::Vector{Int},
-												neighbor_costs::Vector{Float64},
-												source::Int,
-												distance::Vector{Float64},
-												sigma::Vector{Float64},
-												stack_order::Vector{Int})
+											neighbor_data::Vector{Int},
+											neighbor_costs::Vector{Float64},
+											source::Int,
+											distance::Vector{Float64},
+											sigma::Vector{Float64},
+											stack_order::Vector{Int},
+											heap::Vector{Tuple{Float64, Int}},
+											finalized::Vector{Bool})
 		"""
 		Args:
 			neighbor_starts::Vector{Int}: CSR row pointers (length n+1)
@@ -1185,9 +1246,15 @@ module network_statistics
 			neighbor_costs::Vector{Float64}: parallel edge costs from
 				_transform_weights_for_path_cost
 			source::Int: source node ID (1-indexed)
-			distance::Vector{Float64}: pre-allocated, filled with Inf for unreachable
-			sigma::Vector{Float64}: pre-allocated, filled with shortest-path counts
-			stack_order::Vector{Int}: pre-allocated, filled with finalization order
+			distance::Vector{Float64}: pre-allocated work buffer (reset here);
+				filled with shortest weighted distances (Inf if unreachable)
+			sigma::Vector{Float64}: pre-allocated work buffer (reset here);
+				filled with shortest-path counts
+			stack_order::Vector{Int}: pre-allocated; filled with finalization order
+			heap::Vector{Tuple{Float64,Int}}: pre-allocated heap buffer of
+				capacity >= length(neighbor_data) + 1; used via an explicit
+				heap_size counter, never push!/pop!
+			finalized::Vector{Bool}: pre-allocated work buffer (reset here)
 		Returns:
 			Int: number of reachable nodes, including the source
 		Notes:
@@ -1199,105 +1266,81 @@ module network_statistics
 							  (Dijkstra closes nodes in this order, analogous to
 							  BFS layer order)
 
-			Uses a binary heap (min-heap) of (distance, node_id) tuples for
-			the priority queue. Pops the closest unfinalized node each
-			iteration; finalizes it; relaxes outgoing edges.
+			All work buffers are passed in by the caller and reset at the top
+			of this function, matching the buffer-passing convention used by
+			_bfs_distances_and_sigma! and _brandes_pass!. The heap is a
+			fixed-capacity Vector indexed by an explicit heap_size counter;
+			entries are written by index and the heap property is maintained
+			by _heap_sift_up! / _heap_sift_down!. No push!/pop!, no per-source
+			allocation, no nested closures.
 
-			Shortest-path counting (sigma) follows the standard rule:
-				if dist[v] + cost(v, w) < dist[w]:    # strictly shorter
-					dist[w] = dist[v] + cost(v, w)
-					sigma[w] = sigma[v]
-					(re-push w with new distance)
-				elif dist[v] + cost(v, w) == dist[w]: # equally short
-					sigma[w] += sigma[v]
+			Lazy deletion: a node may appear multiple times in the heap with
+			decreasing keys (deferred relaxation). Stale entries are skipped
+			via the `finalized` flag; only the first finalization of a node
+			counts.
 
-			Floating-point equality is tested against an explicit tolerance
-			(_DIJKSTRA_EPS) scaled by the magnitude of the distances being
-			compared. This is necessary because accumulated path costs are
-			subject to floating-point rounding.
+			Heap capacity: each strictly-improving relaxation writes one heap
+			entry, bounded by the number of finite-cost edges. A buffer of
+			length (length(neighbor_data) + 1) is always sufficient. The +1
+			covers the initial source seed.
 
-			Each finalized node is pushed onto stack_order in the order it's
-			closed by the heap. Multiple heap entries per node are normal
-			(deferred relaxation); only the first finalization counts.
+			Shortest-path counting (sigma):
+				First discovery (old_dist == Inf): always strictly shorter;
+					relax unconditionally, set sigma[w] = sigma[v], insert.
+				Subsequent visit, strictly shorter (dist[v]+cost < dist[w]-tol):
+					relax, set sigma[w] = sigma[v], insert.
+				Subsequent visit, equally short (within tol):
+					accumulate sigma[w] += sigma[v].
+
+			The first-discovery case MUST bypass the tolerance arithmetic.
+			When old_dist == Inf, the relative tolerance scale = max(|new|,
+			|old|, 1) is Inf, so tol = eps * Inf = Inf, and old_dist - tol =
+			Inf - Inf = NaN. The comparison new_dist < NaN is then false,
+			which would wrongly reject every first relaxation and leave all
+			non-source nodes unreachable. Testing old_dist == Inf explicitly
+			(an exact comparison; fill!(distance, Inf) sets it precisely)
+			avoids the NaN trap. Once a node has a finite tentative distance,
+			the relative-tolerance comparison is well-defined.
+
+			Floating-point equality (for the equal-distance sigma branch)
+			uses a relative tolerance scaled by the magnitude of the
+			distances being compared, since accumulated path costs are
+			subject to rounding.
 
 			Inf-cost edges are skipped (treated as absent), supporting the
-			:tie_strength transformation that maps zero weights to Inf.
+			:tie_strength transformation that maps zero/non-positive weights
+			to Inf.
 		"""
 
 		#	Dimensions and Reset
 			n = length(distance)
 			fill!(distance, Inf)
 			fill!(sigma, 0.0)
+			fill!(finalized, false)
 
 		#	Initialize Source
 			distance[source] = 0.0
 			sigma[source]    = 1.0
 
-		#	Binary Min-Heap of (distance, node_id) Tuples
-		#	Using a Vector with hand-rolled heap operations to avoid pulling
-		#	in DataStructures.jl for this single use. Tuples compare
-		#	lexicographically, so (distance, node) gives min-distance order
-		#	with stable node tiebreak.
-			heap = Tuple{Float64, Int}[]
-			sizehint!(heap, n)
-			push!(heap, (0.0, source))
-
-		#	Stack-Order Tracking
-			n_finalized = 0
-			finalized = falses(n)
-
 		#	Tolerance for Equal-Distance Comparison
-		#	Scale with the magnitude of the larger distance to handle both
-		#	small and large absolute path costs robustly.
 			_DIJKSTRA_REL_EPS = 1e-12
 
-		#	Heap Operations (Min-Heap, 1-Indexed)
-			function _heap_push!(h, item)
-				push!(h, item)
-				i = length(h)
-				@inbounds while i > 1
-					parent = i >> 1
-					if h[i] < h[parent]
-						h[i], h[parent] = h[parent], h[i]
-						i = parent
-					else
-						break
-					end
-				end
-			end
+		#	Seed the Heap (Explicit Size Counter, No push!)
+			heap_size = 1
+			@inbounds heap[1] = (0.0, source)
 
-			function _heap_pop!(h)
-				top = h[1]
-				last_item = pop!(h)
-				if !isempty(h)
-					h[1] = last_item
-					i = 1
-					len = length(h)
-					@inbounds while true
-						l = 2 * i
-						r = l + 1
-						smallest = i
-						if l <= len && h[l] < h[smallest]
-							smallest = l
-						end
-						if r <= len && h[r] < h[smallest]
-							smallest = r
-						end
-						if smallest != i
-							h[i], h[smallest] = h[smallest], h[i]
-							i = smallest
-						else
-							break
-						end
-					end
-				end
-				return top
-			end
+		#	Finalization Counter
+			n_finalized = 0
 
 		#	Main Dijkstra Loop
-			@inbounds while !isempty(heap)
-				#	Pop Closest Unfinalized Node
-					(d_v, v) = _heap_pop!(heap)
+			@inbounds while heap_size > 0
+				#	Pop Closest Node (Root): Save It, Move Last to Root, Shrink, Sift Down
+					(d_v, v) = heap[1]
+					heap[1] = heap[heap_size]
+					heap_size -= 1
+					if heap_size > 0
+						_heap_sift_down!(heap, heap_size)
+					end
 
 				#	Skip Stale Heap Entries
 					if finalized[v]
@@ -1325,20 +1368,35 @@ module network_statistics
 						new_dist = d_v + cost
 						old_dist = distance[w]
 
-						#	Tolerance for Equal-Distance Comparison
-							scale = max(abs(new_dist), abs(old_dist), 1.0)
-							tol   = _DIJKSTRA_REL_EPS * scale
+						if old_dist == Inf
+							#	First Discovery: Any Finite new_dist Is Strictly
+							#	Shorter. Bypass the tolerance arithmetic, which
+							#	would otherwise yield Inf - Inf = NaN and reject
+							#	the relaxation.
+								distance[w]     = new_dist
+								sigma[w]        = sigma_v
+								heap_size      += 1
+								heap[heap_size] = (new_dist, w)
+								_heap_sift_up!(heap, heap_size)
+						else
+							#	Subsequent Visit: Relative-Tolerance Comparison
+							#	(both distances finite, so tol is well-defined)
+								scale = max(abs(new_dist), abs(old_dist), 1.0)
+								tol   = _DIJKSTRA_REL_EPS * scale
 
-						if new_dist < old_dist - tol
-							#	Strictly Shorter Path
-								distance[w] = new_dist
-								sigma[w]    = sigma_v
-								_heap_push!(heap, (new_dist, w))
-						elseif new_dist < old_dist + tol
-							#	Equally Short Path
-								sigma[w] += sigma_v
+								if new_dist < old_dist - tol
+									#	Strictly Shorter Path: Relax and Insert
+										distance[w]     = new_dist
+										sigma[w]        = sigma_v
+										heap_size      += 1
+										heap[heap_size] = (new_dist, w)
+										_heap_sift_up!(heap, heap_size)
+								elseif new_dist < old_dist + tol
+									#	Equally Short Path: Accumulate Path Count
+										sigma[w] += sigma_v
+								end
+								#	Otherwise: strictly longer, ignore
 						end
-						#	Otherwise: new_dist > old_dist, ignore
 					end
 			end
 
@@ -1605,14 +1663,13 @@ module network_statistics
 			(for closeness) and the global total (for mean inverse distance).
 			Unreachable pairs contribute 0.
 
-			Threaded over source nodes. Each thread maintains its own work
-			buffers (distance, sigma, stack_order); results are combined
-			into the final vectors.
-
-			Treats the adjacency as weighted with the given semantic
-			interpretation. Weights are transformed to Dijkstra costs via
-			_transform_weights_for_path_cost. The CSR conversion happens
-			once before the threaded loop and is shared across threads.
+			Threaded over source nodes. Each source iteration allocates its
+			own work buffers (distance, sigma, stack_order, heap, finalized)
+			and passes them to _dijkstra_distances_and_sigma!. The heap is a
+			fixed-capacity buffer (length(neighbor_data) + 1) used via an
+			explicit size counter, never grown. The weighted CSR conversion
+			and cost transform happen once before the threaded loop and are
+			shared (read-only) across threads.
 
 			For directed graphs, the per-source sum reflects the out-direction
 			(d(i, j) = directed weighted shortest path from i to j). The
@@ -1623,11 +1680,16 @@ module network_statistics
 		#	Dimensions
 			n = size(adj, 1)
 
-		#	Build Weighted CSR Once (Shared Across Threads)
+		#	Build Weighted CSR Once (Shared, Read-Only Across Threads)
 			neighbor_starts, neighbor_data, neighbor_weights = _build_weighted_neighbor_lists(adj)
 
-		#	Transform Weights to Dijkstra Costs
+		#	Transform Weights to Dijkstra Costs (Shared, Read-Only)
 			neighbor_costs = _transform_weights_for_path_cost(neighbor_weights, edge_interpretation)
+
+		#	Heap Capacity: One Entry per Finite-Cost Relaxation, Bounded by Edge Count
+		#	The +1 covers the initial source seed. Sufficient for the lazy-deletion
+		#	heap, which inserts at most once per strictly-improving relaxation.
+			heap_capacity = length(neighbor_data) + 1
 
 		#	Per-Source Output and Thread-Local Total Accumulators
 			per_source_sum = zeros(Float64, n)
@@ -1636,11 +1698,16 @@ module network_statistics
 
 		#	Threaded Loop Over Sources
 			Threads.@threads for s in 1:n
-				#	Per-Thread Work Buffers
-					tid = Threads.threadid()
+				#	Per-Thread Work Buffers (Allocated per Source Iteration)
+				#	Allocate-per-iteration rather than threadid()-indexed pools,
+				#	since Threads.threadid() is not stable across yields. Matches
+				#	the buffer-allocation pattern of _all_pairs_inverse_distance_sum.
+					tid         = Threads.threadid()
 					distance    = Vector{Float64}(undef, n)
 					sigma       = Vector{Float64}(undef, n)
 					stack_order = Vector{Int}(undef, n)
+					heap        = Vector{Tuple{Float64, Int}}(undef, heap_capacity)
+					finalized   = Vector{Bool}(undef, n)
 
 				#	Single-Source Dijkstra
 					n_reached = _dijkstra_distances_and_sigma!(neighbor_starts,
@@ -1649,7 +1716,9 @@ module network_statistics
 																s,
 																distance,
 																sigma,
-																stack_order)
+																stack_order,
+																heap,
+																finalized)
 
 				#	Sum 1/d Over Reachable Non-Source Nodes
 					local_sum = 0.0
@@ -1662,7 +1731,7 @@ module network_statistics
 					end
 
 				#	Write per-Source Result and Update Thread Total
-					per_source_sum[s] = local_sum
+					per_source_sum[s]   = local_sum
 					thread_totals[tid] += local_sum
 			end
 
