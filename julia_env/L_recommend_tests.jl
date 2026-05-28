@@ -1089,6 +1089,145 @@
     println("L = $(marvel_rec.L), τ ∈ [$(marvel_rec.tau_min), $(marvel_rec.tau_max)]")
     println("T_max = $(marvel_rec.T_max)")
 
+#	Diagnose the Undirected Triad Census Kernel: Correctness + Collapse-Route Speed
+	function diagnose_undirected_triad_kernel(networks::Dict;
+	                                         run_marvel::Bool = true)
+		"""
+		Args:
+			networks::Dict: corpus keyed by name → (edges, nodes, metadata)
+			run_marvel::Bool: whether to run the Marvel collapse-route timing
+				(default true)
+		Returns:
+			NamedTuple: (routes_agree, collapse_seconds)
+				routes_agree::Bool: collapse route matches the honest undirected
+					census on the four undirected classes {003,102,201,300},
+					with all twelve asymmetric classes zero (validated on
+					Scotland, N=108, where both paths are cheap)
+				collapse_seconds::Float64: Marvel collapse-route wall-clock
+					(NaN if run_marvel = false or Marvel absent)
+		Notes:
+			Decides whether to route the undirected static (binary) triad
+			census through the subquadratic directed Batagelj-Mrvar kernel with
+			reciprocity_collapse = true, instead of the O(N^3) honest undirected
+			triple-loop kernel.
+
+			Deliberately does NOT time the honest undirected census on Marvel:
+			that path is the known-slow O(N^3) kernel and timing it would only
+			reconfirm what we already know. Correctness of the collapse route is
+			established on Scotland (Section 1); speed at scale is established by
+			timing ONLY the collapse route on Marvel (Section 2). Correct +
+			fast ⇒ route undirected static census through collapse.
+
+			This is shared library code (Phase 0 and Large Graph Similarity), so
+			the eventual fix belongs in the library — either making the public
+			undirected binary path delegate to the collapse route internally, or
+			writing a proper subquadratic undirected BM kernel — rather than in
+			caller-side workarounds.
+		"""
+
+		println("=" ^ 70)
+		println("Undirected triad census kernel diagnostic")
+		println("=" ^ 70)
+
+		#	Shared Tiny Graph for JIT Warmup
+			tiny_e = DataFrame(src = ["a","b","c"], dst = ["b","c","a"])
+			tiny_n = DataFrame(id = ["a","b","c"], label = ["a","b","c"])
+
+		#	================================================================
+		#	Section 1: Correctness on Scotland (N=108)
+		#	Both paths are cheap at this size, so we can validate the collapse
+		#	route against the honest undirected census directly.
+		#	================================================================
+			println("\n[1] Correctness check on Scotland (N=108)")
+
+			routes_agree = false
+			if haskey(networks, "scotland_interlock_unweighted")
+				s_e = networks["scotland_interlock_unweighted"].edges
+				s_n = networks["scotland_interlock_unweighted"].nodes
+
+				undir    = triad_census(s_e; nodes = s_n, graph_type = :undirected)
+				collapse = triad_census(s_e; nodes = s_n, graph_type = :directed,
+				                       reciprocity_collapse = true)
+
+				u = Dict(string(r.triad) => Int(r.count) for r in eachrow(undir))
+				c = Dict(string(r.triad) => Int(r.count) for r in eachrow(collapse))
+
+				#	Four Undirected Classes Must Match
+					undirected_classes = ("003", "102", "201", "300")
+					four_match = true
+					println("    undirected classes (must match):")
+					for cls in undirected_classes
+						uv = get(u, cls, 0); cv = get(c, cls, 0)
+						m = uv == cv
+						four_match &= m
+						println("      $cls:  undirected=$uv  collapsed=$cv  match=$m")
+					end
+
+				#	Twelve Asymmetric Classes Must Be Zero on Both
+					asym_classes = ("012", "021D", "021U", "021C", "111D", "111U",
+					               "030T", "030C", "120D", "120U", "120C", "210")
+					asym_ok = true
+					for cls in asym_classes
+						uv = get(u, cls, 0); cv = get(c, cls, 0)
+						ok = (uv == 0) && (cv == 0)
+						asym_ok &= ok
+						ok || println("      $cls:  undirected=$uv  collapsed=$cv  NONZERO!")
+					end
+					asym_ok && println("    all twelve asymmetric classes zero on both")
+
+				routes_agree = four_match && asym_ok
+				println("    verdict: ", routes_agree ? "ROUTES AGREE" : "ROUTES DISAGREE")
+			else
+				println("    SKIPPED (scotland_interlock_unweighted not in corpus)")
+			end
+
+		#	================================================================
+		#	Section 2: Collapse-Route Timing on Marvel (N=6486)
+		#	We time ONLY the rewired collapse route. The honest undirected
+		#	census is the known-slow O(N^3) path and is intentionally not run.
+		#	================================================================
+			collapse_seconds = NaN
+
+			if run_marvel && haskey(networks, "marvel_universe_unweighted")
+				println("\n[2] Collapse-route timing on Marvel (N=6486)")
+				mu_e = networks["marvel_universe_unweighted"].edges
+				mu_n = networks["marvel_universe_unweighted"].nodes
+
+				#	Warm Up the Collapse Path on the Tiny Graph (Absorb JIT)
+					triad_census(tiny_e; nodes = tiny_n, graph_type = :directed,
+					            reciprocity_collapse = true)
+
+				#	Time ONLY the Collapse Route
+					local tc_collapse
+					collapse_seconds = @elapsed begin
+						tc_collapse = triad_census(mu_e; nodes = mu_n,
+						                          graph_type = :directed,
+						                          reciprocity_collapse = true)
+					end
+					println("    collapse route: $(round(collapse_seconds, digits=3))s")
+
+				#	Sanity Spot-Check: the Four Undirected Classes Are Populated
+					c = Dict(string(r.triad) => Int(r.count) for r in eachrow(tc_collapse))
+					println("    Marvel collapse counts:  " *
+					        join(["$cls=$(get(c, cls, 0))" for cls in ("003","102","201","300")],
+					             "   "))
+			else
+				println("\n[2] Collapse-route Marvel timing — SKIPPED",
+				        run_marvel ? " (marvel_universe_unweighted not in corpus)" : " (run_marvel=false)")
+			end
+
+		#	Overall Verdict
+			println("\n" * "=" ^ 70)
+			println("Diagnostic complete: ",
+			        routes_agree ? "collapse route VALID" : "collapse route INVALID",
+			        isfinite(collapse_seconds) ? " — Marvel $(round(collapse_seconds, digits=2))s" : "")
+			println("=" ^ 70)
+
+			return (routes_agree     = routes_agree,
+			        collapse_seconds  = collapse_seconds)
+	end
+	diagnose_undirected_triad_kernel(networks)
+
 ################
 #   PLOTTING   #
 ################

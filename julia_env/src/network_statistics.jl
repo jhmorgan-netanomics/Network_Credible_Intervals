@@ -5957,12 +5957,12 @@ module network_statistics
 				context to avoid oversubscription, or to obtain a strictly serial
 				reference run.
 			show_progress::Bool: show a per-τ progress bar (default false). Useful
-				for long-running undirected runs on large graphs where the kernel
-				is O(N^3) per τ and total wall-clock can reach tens of minutes.
-				When parallel=true, progress is ticked from inside the threaded
-				loop under a ReentrantLock; ordering of tick events reflects
-				completion order, not τ-grid order, but the final result is
-				still folded in τ order and is bit-identical to a serial run.
+				for long-running weighted runs on large graphs where total
+				wall-clock can reach minutes. When parallel=true, progress is
+				ticked from inside the threaded loop under a ReentrantLock;
+				ordering of tick events reflects completion order, not τ-grid
+				order, but the final result is still folded in τ order and is
+				bit-identical to a serial run.
 			progress_desc::Union{Nothing,String}: optional description shown on
 				the progress bar (default nothing, which produces "Triad census
 				τ-grid (graph_type=..., L=...)"). Set explicitly when displaying
@@ -5973,9 +5973,22 @@ module network_statistics
 			Threading model. Each τ in the log-spaced grid runs an independent
 			BM census on its own thresholded adjacency: no shared mutable state,
 			no accumulator races, no false sharing. The outer τ loop is therefore
-			the safe and natural threading target. The BM kernels themselves
-			(_triad_census_bm_directed, _triad_census_bm_undirected) stay serial
-			under this scheme.
+			the safe and natural threading target. The BM kernel itself
+			(_triad_census_bm_directed) stays serial under this scheme.
+
+			Census kernel. Both the directed and undirected per-τ censuses use
+			the subquadratic dyad-driven directed BM kernel
+			(_triad_census_bm_directed). For the undirected case,
+			_prepare_binary_for_mode returns a canonicalized symmetric 0/1
+			matrix; on a symmetric adjacency every dyad is reciprocal or empty,
+			so the directed kernel populates only the four undirected classes
+			{003, 102, 201, 300} and zeros the twelve asymmetric classes —
+			identical output to the O(N^3) triple-loop kernel
+			(_triad_census_bm_undirected), but subquadratic. The triple-loop
+			kernel is retained as the reference implementation for regression
+			testing; it is no longer on this path. This is the same
+			directed-kernel-on-symmetric-matrix equivalence the binary
+			undirected path in triad_census relies on.
 
 			Determinism. Threading uses Threads.@threads :static, which assigns
 			loop iterations to threads in a fixed, deterministic partition
@@ -6041,8 +6054,16 @@ module network_statistics
 							res = _triad_census_bm_directed(Ab)
 							counts_by_tau[t] = res.counts
 						else
-							#	Use normalizer to accept either Vector or NamedTuple
-								counts_by_tau[t] = _bm_undir_counts16(Ab)
+							#	Undirected: Ab is a canonicalized symmetric 0/1 matrix
+							#	(see _prepare_binary_for_mode). Run the subquadratic
+							#	dyad-driven directed BM kernel on it rather than the
+							#	O(N^3) triple-loop kernel. On a symmetric adjacency the
+							#	directed kernel populates only {003,102,201,300} and
+							#	zeros the twelve asymmetric classes — identical output,
+							#	subquadratic cost. Same equivalence the binary
+							#	undirected path in triad_census relies on.
+								res = _triad_census_bm_directed(Ab)
+								counts_by_tau[t] = res.counts
 						end
 						#	Thread-Safe Progress Tick
 							if show_progress
@@ -6060,7 +6081,10 @@ module network_statistics
 							res = _triad_census_bm_directed(Ab)
 							counts_by_tau[t] = res.counts
 						else
-							counts_by_tau[t] = _bm_undir_counts16(Ab)
+							#	Undirected: subquadratic directed kernel on the
+							#	canonicalized symmetric matrix (see threaded branch).
+								res = _triad_census_bm_directed(Ab)
+								counts_by_tau[t] = res.counts
 						end
 						#	Serial Progress Tick (No Lock Needed)
 							if show_progress
@@ -6146,6 +6170,22 @@ module network_statistics
 			results are bit-identical across thread counts thanks to :static
 			scheduling and pre-allocated per-τ result storage.
 
+			Undirected binary kernel. The undirected binary census is computed
+			by feeding the symmetrized 0/1 adjacency to the subquadratic,
+			dyad-driven directed BM kernel (_triad_census_bm_directed), NOT the
+			O(N^3) triple-loop kernel (_triad_census_bm_undirected). On a
+			symmetric adjacency every dyad is reciprocal or empty, so the
+			directed kernel's DL classification populates only the four
+			undirected classes {003, 102, 201, 300} and leaves the twelve
+			asymmetric classes at zero — identical output to the triple-loop
+			kernel, but subquadratic. This is the same reciprocity-collapse
+			equivalence the directed path uses for Pajek semantics. The
+			triple-loop kernel (_triad_census_bm_undirected) is retained as the
+			reference implementation for regression testing (see
+			test_undirected_triad_kernel_equivalence) but is no longer on the
+			public path. Validated on Scotland (exact match across all four
+			classes) and Marvel (300 = 1,028,453 in seconds vs minutes).
+
 			See _triad_census_layered for the full threading contract.
 		"""
 
@@ -6176,7 +6216,15 @@ module network_statistics
 							return DataFrame(triad = res.labels, count = res.counts)
 
 					else
-						#	Undirected binary: symmetrize by max, zero diag, run undirected BM
+						#	Undirected binary: symmetrize by max, zero diag, then run the
+						#	SUBQUADRATIC directed BM kernel on the symmetric matrix.
+						#	On a symmetric 0/1 adjacency every dyad is reciprocal or
+						#	empty, so _triad_census_bm_directed populates exactly the
+						#	four undirected classes {003, 102, 201, 300} and zeros the
+						#	twelve asymmetric classes — identical to the O(N^3)
+						#	triple-loop kernel but subquadratic. The triple-loop
+						#	kernel (_triad_census_bm_undirected) is kept as the
+						#	regression reference, not used here.
 							adj, _, _ = isnothing(nodes) ?
 								_graph_to_sparse_matrix(edges; weighted=false) :
 								_graph_to_sparse_matrix(edges; nodes=nodes, weighted=false)
@@ -6185,9 +6233,9 @@ module network_statistics
 							n = size(Au, 1); @inbounds for i in 1:n; Au[i,i] = 0.0; end
 							dropzeros!(Au)
 
-						#	Normalize to a consistent Vector{Int} (counts16)
-							counts16 = _bm_undir_counts16(Au)
-							return DataFrame(triad = _dl_labels(), count = counts16)
+						#	Run directed BM on the symmetric matrix (subquadratic route)
+							res = _triad_census_bm_directed(Au)
+							return DataFrame(triad = res.labels, count = res.counts)
 					end
 
 			else
@@ -6255,9 +6303,13 @@ module network_statistics
 
 	*Binary path.* Builds a $0/1$ loopless adjacency. For directed graphs with
 	`reciprocity_collapse=true`, mutual arcs are first collapsed to single
-	ties. The resulting matrix is fed to `_triad_census_bm_directed` (directed)
-	or `_triad_census_bm_undirected` (undirected). The kernels implement
-	Batagelj–Mrvar (2001), dyad-driven, subquadratic for sparse inputs.
+	ties. The directed census is fed to `_triad_census_bm_directed`. The
+	undirected census symmetrizes by $\max(A, A^\top)$ and feeds the resulting
+	symmetric matrix to the *same* directed kernel: on a symmetric adjacency
+	every dyad is reciprocal or empty, so the DL classification populates only
+	$\{003, 102, 201, 300\}$ and zeros the twelve asymmetric classes. Both
+	binary paths therefore use the dyad-driven Batagelj–Mrvar (2001) kernel,
+	subquadratic for sparse inputs.
 
 	*Weighted path.* Delegates to `_triad_census_layered`, which thresholds
 	the weighted adjacency at each $\tau$ in a log-spaced grid and runs the
@@ -6283,7 +6335,9 @@ module network_statistics
 	single tie. The result is that asymmetric DL classes (012, 021D, 021U,
 	021C, 111D, 111U, 030T, 030C, 120D, 120U, 120C, 210) all report zero
 	counts, leaving only the four classes $\{003, 102, 201, 300\}$. This
-	reproduces Pajek's triad-census output on directed inputs.
+	reproduces Pajek's triad-census output on directed inputs. The undirected
+	binary path relies on this same equivalence internally to use the
+	subquadratic directed kernel.
 
 	**Value**
 
@@ -6304,43 +6358,45 @@ module network_statistics
 
 	**Examples**
 	```julia
-		using DataFrames
+			using DataFrames
 
-		#	Binary directed triad census
-			edges = DataFrame(src = ["a","b","c","a"],
-							dst = ["b","c","a","c"])
-			result = triad_census(edges; graph_type=:directed)
-			result  # DataFrame with 16 rows, counts for each DL class
+			#	Binary directed triad census
+				edges = DataFrame(src = ["a","b","c","a"],
+								dst = ["b","c","a","c"])
+				result = triad_census(edges; graph_type=:directed)
+				result  # DataFrame with 16 rows, counts for each DL class
 
-		#	Pajek-style: collapse mutual arcs first
-			result = triad_census(edges; graph_type=:directed,
-										reciprocity_collapse=true)
+			#	Pajek-style: collapse mutual arcs first
+				result = triad_census(edges; graph_type=:directed,
+											reciprocity_collapse=true)
 
-		#	Undirected binary
-			undir = DataFrame(src = ["a","a","b"],
-							dst = ["b","c","c"])
-			result = triad_census(undir; graph_type=:undirected)
+			#	Undirected binary
+				undir = DataFrame(src = ["a","a","b"],
+								dst = ["b","c","c"])
+				result = triad_census(undir; graph_type=:undirected)
 
-		#	Weighted layered census (threaded, with per-τ progress bar)
-			w = DataFrame(src = ["a","a","b","b","c"],
-						dst = ["b","c","c","a","a"],
-						weight = [3.0, 1.0, 5.0, 2.0, 4.0])
-			layered = triad_census(w; weighted=true, graph_type=:directed,
-										L=20, tau_min=0.5, tau_max=5.0,
-										show_progress=true)
+			#	Weighted layered census (threaded, with per-τ progress bar)
+				w = DataFrame(src = ["a","a","b","b","c"],
+							dst = ["b","c","c","a","a"],
+							weight = [3.0, 1.0, 5.0, 2.0, 4.0])
+				layered = triad_census(w; weighted=true, graph_type=:directed,
+											L=20, tau_min=0.5, tau_max=5.0,
+											show_progress=true)
 
-		#	Strict serial run
-			layered_serial = triad_census(w; weighted=true, L=20,
-												parallel=false)
+			#	Strict serial run
+				layered_serial = triad_census(w; weighted=true, L=20,
+													parallel=false)
 	```
 	**Performance Notes**
-	The binary directed kernel is subquadratic for sparse graphs (dyad-driven
-	BM). The undirected binary kernel is currently a triple loop over node
-	triples ($O(N^3)$) — adequate for small networks but the gating cost on
-	Marvel-scale undirected runs ($N = 6{,}486$). Threading does not change
-	this asymptotic complexity; for the weighted layered path, threading
-	gives near-linear speedup in the τ loop, which is the dominant cost when
-	$L \cdot n_{\text{thresholds}}$ is large.
+	Both binary kernels are subquadratic for sparse graphs (dyad-driven BM).
+	The undirected binary census reuses the directed kernel on the symmetrized
+	$0/1$ adjacency rather than a triple loop over node triples, so it is
+	subquadratic at Marvel scale ($N = 6{,}486$): the symmetric-matrix route
+	computes the four undirected classes in seconds. The retained triple-loop
+	kernel `_triad_census_bm_undirected` is $O(N^3)$ and is kept only as a
+	regression reference; it is not on the public path. For the weighted
+	layered path, threading gives near-linear speedup in the $\tau$ loop,
+	which is the dominant cost when $L \cdot n_{\text{thresholds}}$ is large.
 
 	**See Also**
 	`_triad_census_layered`, `_triad_census_bm_directed`,

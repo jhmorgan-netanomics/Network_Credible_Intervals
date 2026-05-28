@@ -19,8 +19,19 @@
 using CSV
 using DataFrames
 using Printf
+using SparseArrays
 using Statistics
 using Network_Credible_Intervals
+using Network_Credible_Intervals.network_community_detection: _edgelist_to_sparse_matrix,
+                                                                  _graph_to_sparse_matrix,
+                                                                  _aggregate_multi_edges,
+                                                                  _is_symmetric
+using Network_Credible_Intervals.network_statistics: _tau_grid,
+                                                     _prepare_binary_for_mode,
+                                                     _bm_undir_counts16,
+                                                     _dl_labels,
+                                                     _to_density_16!,
+													 _aumc_logtau
 
 #######################
 #   IMPORT DATASETS   #
@@ -2594,6 +2605,182 @@ using Network_Credible_Intervals
 				t_threaded         = t_threaded)
 	end
 
+#	Validate the Layered Undirected Census: Directed-Kernel Route vs Triple-Loop Reference
+	function test_layered_undirected_kernel_equivalence(networks::Dict;
+	                                                   network_name::String = "scotland_interlock_weighted",
+	                                                   L::Int = 20,
+	                                                   tau_min::Union{Symbol,Float64} = :auto,
+	                                                   tau_max::Union{Symbol,Float64} = :auto)
+		"""
+		Args:
+			networks::Dict: corpus keyed by name → (edges, nodes, metadata)
+			network_name::String: undirected weighted network to test on
+				(default "scotland_interlock_weighted", small enough that the
+				O(N^3) reference route is cheap)
+			L::Int: τ grid size (default 20)
+			tau_min, tau_max::Union{Symbol,Float64}: τ bounds (default :auto)
+		Returns:
+			Bool: true if the directed-kernel route matches the triple-loop
+				reference on all per-τ counts and the full AUMC summary
+		Notes:
+			Regression guard for the weighted layered undirected census after
+			switching its per-τ kernel from the O(N^3) triple loop
+			(_bm_undir_counts16 / _triad_census_bm_undirected) to the
+			subquadratic dyad-driven directed kernel (_triad_census_bm_directed)
+			applied to the canonicalized symmetric matrix.
+
+			The production path (_triad_census_layered with graph_type =
+			:undirected, reached via triad_census(weighted=true)) now uses the
+			directed kernel. This test reconstructs the OLD route inline — same
+			τ grid, same per-τ symmetric matrix from _prepare_binary_for_mode,
+			but classified with _bm_undir_counts16 — and asserts that the two
+			routes agree on:
+				(a) every per-τ, per-class count, and
+				(b) every per-class AUMC_density and peak_tau in the summary.
+
+			Both routes consume the identical Ab matrix per τ, so any
+			discrepancy isolates a genuine kernel-classification difference
+			rather than a matrix-prep or grid difference. Run serially
+			(parallel = false) to keep the comparison deterministic and simple.
+
+			Scotland is the default because it is undirected, weighted, and
+			small (N=108) — the triple-loop reference runs in well under a
+			second across the whole τ grid, so the test is cheap to run as a
+			permanent regression check.
+		"""
+
+		println("=" ^ 70)
+		println("Layered undirected census: directed-kernel route vs triple-loop reference")
+		println("Network: $network_name")
+		println("=" ^ 70)
+
+		#	Guard: Network Present
+			if !haskey(networks, network_name)
+				println("  SKIPPED ($network_name not in corpus)")
+				return false
+			end
+
+			edges = networks[network_name].edges
+			nodes = networks[network_name].nodes
+
+		#	------------------------------------------------------------
+		#	Production Route: Current _triad_census_layered (Directed Kernel)
+		#	------------------------------------------------------------
+			println("\n[A] Production route (_triad_census_layered, directed kernel per τ)...")
+			prod_result = _triad_census_layered(edges;
+			                                    graph_type = :undirected,
+			                                    nodes = nodes,
+			                                    L = L,
+			                                    tau_min = tau_min,
+			                                    tau_max = tau_max,
+			                                    parallel = false)
+			println("    done ($(nrow(prod_result.per_tau)) per-τ rows, " *
+			        "L=$(prod_result.meta.L))")
+
+		#	------------------------------------------------------------
+		#	Reference Route: Rebuild the Old Triple-Loop Path Inline
+		#	Mirrors _triad_census_layered's serial loop exactly, but classifies
+		#	each per-τ matrix with _bm_undir_counts16 (the O(N^3) reference).
+		#	------------------------------------------------------------
+			println("[B] Reference route (inline, _bm_undir_counts16 per τ)...")
+
+			#	Build the Same Weighted Adjacency and τ Grid the Production Path Uses
+				Aw, _, _ = _graph_to_sparse_matrix(edges; nodes = nodes, weighted = true)
+				n = size(Aw, 1)
+				AU = Aw .+ Aw'
+				@inbounds for i in 1:n; AU[i, i] = 0.0; end
+				dropzeros!(AU)
+				wvec  = collect(nonzeros(AU))
+				tgrid = _tau_grid(wvec; L = L, tau_min = tau_min, tau_max = tau_max)
+				Ntau  = length(tgrid)
+
+			#	Per-τ Census via the Triple-Loop Reference Kernel
+				ref_counts_by_tau = Vector{Vector{Int}}(undef, Ntau)
+				for t in 1:Ntau
+					Ab = _prepare_binary_for_mode(Aw, tgrid[t], :undirected, false)
+					ref_counts_by_tau[t] = _bm_undir_counts16(Ab)
+				end
+				println("    done ($Ntau τ values)")
+
+		#	------------------------------------------------------------
+		#	Compare (a): Per-τ, Per-Class Counts
+		#	------------------------------------------------------------
+			println("\n[1] Per-τ count agreement:")
+			labels16 = _dl_labels()
+			counts_match = true
+			max_count_delta = 0
+
+			#	Index the Production per_tau Table by (τ-position, class) for Lookup
+			#	Production per_tau is in τ-major, DL-order blocks of 16 rows.
+				for t in 1:Ntau
+					#	Extract Production Counts for this τ Block
+						lo = (t - 1) * 16 + 1
+						hi = t * 16
+						prod_counts = prod_result.per_tau.count[lo:hi]
+						ref_counts  = ref_counts_by_tau[t]
+						for k in 1:16
+							d = abs(prod_counts[k] - ref_counts[k])
+							max_count_delta = max(max_count_delta, d)
+							if d != 0
+								counts_match = false
+								println("    MISMATCH τ-idx $t, class $(labels16[k]): " *
+								        "prod=$(prod_counts[k]) ref=$(ref_counts[k])")
+							end
+						end
+				end
+			println("    max per-τ count delta: $max_count_delta  → ",
+			        counts_match ? "MATCH" : "MISMATCH")
+
+		#	------------------------------------------------------------
+		#	Compare (b): AUMC Summary (Reconstruct Reference Summary from ref counts)
+		#	------------------------------------------------------------
+			println("\n[2] AUMC summary agreement:")
+
+			#	Build Reference Densities and Summary the Same Way the Layered Code Does
+				ref_summary_aumc    = Dict{String, Float64}()
+				ref_summary_peaktau = Dict{String, Float64}()
+				#	Per-class density series across τ
+					for (ki, tri) in enumerate(labels16)
+						dens_series = Float64[]
+						for t in 1:Ntau
+							dens = _to_density_16!(ref_counts_by_tau[t], n)
+							push!(dens_series, dens[ki])
+						end
+						ref_summary_aumc[tri]    = _aumc_logtau(collect(tgrid), dens_series)
+						mx                       = argmax(dens_series)
+						ref_summary_peaktau[tri] = tgrid[mx]
+					end
+
+			#	Compare Against Production Summary
+				aumc_match = true
+				max_aumc_delta = 0.0
+				for tri in labels16
+					prod_row = prod_result.summary[prod_result.summary.triad .== tri, :]
+					pa = prod_row.AUMC_density[1]
+					ra = ref_summary_aumc[tri]
+					d  = abs(pa - ra)
+					max_aumc_delta = max(max_aumc_delta, d)
+					if !isapprox(pa, ra; atol = 1e-12, rtol = 1e-9)
+						aumc_match = false
+						println("    AUMC MISMATCH $tri: prod=$pa ref=$ra (Δ=$d)")
+					end
+				end
+			println("    max AUMC delta: $max_aumc_delta  → ",
+			        aumc_match ? "MATCH" : "MISMATCH")
+
+		#	------------------------------------------------------------
+		#	Verdict
+		#	------------------------------------------------------------
+			all_ok = counts_match && aumc_match
+			println("\n" * "=" ^ 70)
+			println("Verdict: ", all_ok ? "ROUTES EQUIVALENT — fix validated" :
+			                               "ROUTES DIFFER — investigate before trusting")
+			println("=" ^ 70)
+
+			return all_ok
+	end
+	test_layered_undirected_kernel_equivalence(networks)
+
 #	Test: Binary Triad Census vs Pajek Reference (Balikatan Directed w/ Reciprocity Collapse)
 	function test_pajek_reference_triad_census(edges::DataFrame,
 												observed_vec_path::String;
@@ -3464,7 +3651,7 @@ using Network_Credible_Intervals
 #   CONSTRUCT NETWORK SUMMARY TABLE   #
 #######################################
 
-#	Helper Function: Single-Source Mean of a DataFrame Column
+#	Helper Function: Network Centralization (SD of Node Scores)
 #	(Centralizes the std-vs-undefined logic for centralization output)
 	function _network_centralization(scores::AbstractVector{<:Real})
 		"""
@@ -3485,521 +3672,819 @@ using Network_Credible_Intervals
 		return std(scores)
 	end
 
-#	Compute Phase 0 Statistics for a Single Network
-	function compute_phase_0_statistics(edges::DataFrame,
+#	DESCRIPTIVE NETWORK STATISTICS: CENTRALITY, CENTRALIZATION, TOPOLOGY
+
+#	Helper Function for Phase 0 Weighted Tables: Edge-Weight Distribution Summary
+	function _weight_distribution_summary(weights::AbstractVector{<:Real})
+		"""
+		Args:
+			weights::AbstractVector{<:Real}: edge weights to summarize. For
+				directed networks these are the aggregated directed edge
+				weights; for undirected networks they are the nonzero weights
+				of the symmetrized adjacency's upper triangle (each undirected
+				edge counted once).
+		Returns:
+			NamedTuple: (w_min, w_max, w_median, w_iqr, w_gini)
+				w_min, w_max: extrema of the weight distribution
+				w_median: median weight
+				w_iqr: interquartile range (Q3 - Q1)
+				w_gini: Gini coefficient of the weights (inequality of tie
+					strength across edges)
+		Notes:
+			Consolidates the weight-distribution block reported in the
+			weighted Phase 0 tables. Returns all-zeros for an empty weight
+			vector so degenerate networks produce a well-formed row.
+
+			The IQR uses the default (linear-interpolation) quantile
+			convention. Gini reuses the project's gini_coefficient helper,
+			which is the same routine used for the degree-distribution Gini
+			elsewhere in Phase 0.
+		"""
+
+		#	Empty Guard
+			if isempty(weights)
+				return (w_min = 0.0, w_max = 0.0, w_median = 0.0,
+				        w_iqr = 0.0, w_gini = 0.0)
+			end
+
+		#	Coerce to Float64 for Quantile Arithmetic
+			w = Float64.(weights)
+
+		#	Distribution Summary
+			w_min    = minimum(w)
+			w_max    = maximum(w)
+			w_median = median(w)
+			w_q1     = quantile(w, 0.25)
+			w_q3     = quantile(w, 0.75)
+			w_iqr    = w_q3 - w_q1
+			w_gini   = length(w) > 1 ? gini_coefficient(w) : 0.0
+
+		#	Return Summary
+			return (w_min = w_min, w_max = w_max, w_median = w_median,
+			        w_iqr = w_iqr, w_gini = w_gini)
+	end
+
+#	Helper Function for Phase 0 Weighted Tables: Symmetrized Upper-Triangle Weights
+	function _symmetrized_edge_weights(edges::DataFrame,
+	                                  nodes::DataFrame;
+	                                  agg_func::Function = sum)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst, :weight
+			nodes::DataFrame: node universe with :id, :label
+			agg_func::Function: multi-edge aggregation before symmetrization
+				(default = sum)
+		Returns:
+			Vector{Float64}: nonzero weights of the symmetrized adjacency's
+				upper triangle (each undirected edge counted once)
+		Notes:
+			Builds the same symmetrized weighted adjacency that the undirected
+			weighted path-based measures traverse (max(A, A^T) on the weighted
+			adjacency), then extracts the upper-triangle nonzeros so each
+			undirected edge contributes a single weight to the distribution
+			summary. This keeps the reported weight distribution consistent
+			with the graph the weighted measures actually used.
+		"""
+
+		#	Aggregate Multi-Edges, Build Weighted Adjacency
+			edges_agg = DataFrame(src = edges.src, dst = edges.dst, weight = edges.weight)
+			edges_agg = _aggregate_multi_edges(edges_agg; agg_func = agg_func)
+			adj, _, _ = _graph_to_sparse_matrix(edges_agg; nodes = nodes, weighted = true)
+
+		#	Symmetrize (max(A, A^T)) — Matches the Undirected Weighted Measures
+			adjs = max.(adj, adj')
+
+		#	Extract Upper-Triangle Nonzeros (Each Undirected Edge Once)
+			n = size(adjs, 1)
+			rows = rowvals(adjs)
+			vals = nonzeros(adjs)
+			out  = Float64[]
+			@inbounds for j in 1:n
+				for ptr in nzrange(adjs, j)
+					i = rows[ptr]
+					if i < j && vals[ptr] != 0
+						push!(out, Float64(vals[ptr]))
+					end
+				end
+			end
+
+		#	Return Upper-Triangle Weights
+			return out
+	end
+
+#	Compute Phase 0 Binary-Measure Row for a Single Network
+	function compute_phase_0_binary_row(edges::DataFrame,
 	                                   nodes::DataFrame;
 	                                   network_name::String = "(unnamed)",
 	                                   directed::Bool = true,
 	                                   bonacich_normalize::Symbol = :max,
 	                                   tau_n_samples::Int = 500,
-	                                   tau_seed::Int = 20260101,
-	                                   binarize_degrees::Bool = true)
+	                                   tau_seed::Int = 20260101)
 		"""
 		Args:
 			edges::DataFrame: edge list with :src, :dst, optionally :weight
 			nodes::DataFrame: node universe with :id, :label
 			network_name::String: identifier for the result row
-			directed::Bool: whether to treat the graph as directed (default = true)
-			bonacich_normalize::Symbol: Bonacich normalization to apply for
-				comparable scales across networks (default = :max maps each
-				network's Bonacich to [0, 1] by dividing by its own maximum;
-				other options :l2, :none — see bonacich_centrality docs)
-			tau_n_samples::Int: Monte Carlo samples for tau (default = 500)
-			tau_seed::Int: RNG seed for tau (default = 20260101)
-			binarize_degrees::Bool: when true (default), in/out/total degree are
-				computed on the binarized adjacency (tie counts, not weight
-				sums). This matches the binarization convention of every other
-				Phase 0 measure (closeness, betweenness, Bonacich, components,
-				transitivity, tau) and ensures that paired weighted/unweighted
-				versions of the same network produce identical descriptive
-				statistics. Set to false only if weight-summed degree is
-				specifically desired.
+			directed::Bool: directed schema (in/out/sym degree + tau) vs
+				undirected schema (sym degree only, no tau)
+			bonacich_normalize::Symbol: Bonacich normalization (default :max)
+			tau_n_samples::Int: Monte Carlo samples for tau (directed only)
+			tau_seed::Int: RNG seed for tau
 		Returns:
-			DataFrame: single-row data frame matching Phase 0 schema
+			DataFrame: single-row data frame with the binary Phase 0 schema
+				for the requested directedness. Directed rows carry in/out/
+				symmetric degree, their centralizations, and tau_rc; undirected
+				rows carry only symmetric degree and omit tau.
 		Notes:
-			Runs the full Phase 0 measure battery on one network:
-				- Degree family (in / out / symmetric)
-				- Closeness (symmetric direction, normalized)
-				- Betweenness (directed, normalized)
-				- Bonacich power centrality (symmetric, normalized as specified)
-				- Centralization for each centrality (SD of node scores)
-				- Largest component proportion
-				- Largest bicomponent proportion
-				- Mean inverse distance (unscaled)
-				- Global transitivity
-				- Tau statistic with ranked-clusters weighting (directed only;
-				  returns 0.0 for undirected networks since tau is undefined)
+			Binary-measure half of the Phase 0 tables (Tables 1 and 2). All
+			path-based measures use edge_interpretation = :ignore and degrees
+			use weighted = false, matching the SMM (2022) Table 1 binarization
+			convention. This is the explicit binarized override of the
+			closeness/betweenness/MID :tie_strength default.
 
-			For undirected networks, in-degree and out-degree are identical to
-			the symmetric degree by construction.
+			Columns common to both directedness modes:
+				network_name, n_nodes, n_edges, directed,
+				mean/sd symmetric_degree, mean/sd closeness, mean/sd
+				betweenness, mean/sd bonacich, centralizations for symmetric
+				degree / closeness / betweenness / bonacich,
+				largest_component_proportion, largest_bicomponent_proportion,
+				mean_inverse_distance, global_transitivity.
+
+			Directed mode additionally carries:
+				mean/sd indegree, mean/sd outdegree, centralization_indegree,
+				centralization_outdegree, tau_rc.
+
+			Closeness and betweenness use direction = :symmetric and the
+			directed/undirected betweenness convention respectively; both are
+			normalized to [0, 1] for cross-network comparability.
 		"""
 
-		#	Network Dimensions
+		#	Dimensions
 			n_nodes = nrow(nodes)
 			n_edges = nrow(edges)
 
-		#	Empty-Edge Guard: Return All-Zeros Row
-			if n_edges == 0 || n_nodes == 0
-				return DataFrame(
-					network_name                       = [network_name],
-					n_nodes                            = [n_nodes],
-					n_edges                            = [n_edges],
-					directed                           = [directed],
-					mean_indegree                      = [0.0],
-					sd_indegree                        = [0.0],
-					mean_outdegree                     = [0.0],
-					sd_outdegree                       = [0.0],
-					mean_symmetric_degree              = [0.0],
-					sd_symmetric_degree                = [0.0],
-					mean_closeness                     = [0.0],
-					sd_closeness                       = [0.0],
-					mean_betweenness                   = [0.0],
-					sd_betweenness                     = [0.0],
-					mean_bonacich                      = [0.0],
-					sd_bonacich                        = [0.0],
-					centralization_indegree            = [0.0],
-					centralization_outdegree           = [0.0],
-					centralization_symmetric_degree    = [0.0],
-					centralization_closeness           = [0.0],
-					centralization_betweenness         = [0.0],
-					centralization_bonacich            = [0.0],
-					largest_component_proportion       = [n_nodes > 0 ? 1.0 / n_nodes : 0.0],
-					largest_bicomponent_proportion     = [n_nodes > 0 ? 1.0 / n_nodes : 0.0],
-					mean_inverse_distance              = [0.0],
-					global_transitivity                = [0.0],
-					tau_rc                             = [0.0]
-				)
-			end
+		#	Common Empty/Degenerate Path: Compute Zeros, Assemble per Schema
+			degenerate = (n_edges == 0 || n_nodes == 0)
 
-		#	--- Degree Family ---
-		#	Binarize by default so degree statistics match the convention of
-		#	the other Phase 0 measures (which all use edge_interpretation = :ignore).
-		#	Without binarization, paired weighted/unweighted versions of the same
-		#	network produce different rows in the degree columns, breaking
-		#	cross-network comparability.
-			use_weights = !binarize_degrees
-			in_deg  = in_degree(edges;    nodes = nodes, weighted = use_weights)
-			out_deg = out_degree(edges;   nodes = nodes, weighted = use_weights)
-			sym_deg = total_degree(edges; nodes = nodes, weighted = use_weights, directed = directed)
-
-			in_vals  = Float64.(in_deg.in_degree)
-			out_vals = Float64.(out_deg.out_degree)
-			sym_vals = Float64.(sym_deg.total_degree)
-
-		#	--- Closeness (Symmetric, Normalized) ---
-			cc_df = closeness_centrality(edges;
-			                            nodes = nodes,
-			                            directed = directed,
-			                            direction = :symmetric,
-			                            edge_interpretation = :ignore,
-			                            normalize = true)
-			cc_vals = Float64.(cc_df.closeness)
-
-		#	--- Betweenness (Normalized to [0, 1] for Cross-Network Comparability) ---
-			bc_df = betweenness_centrality(edges;
-			                              nodes = nodes,
-			                              directed = directed,
-			                              edge_interpretation = :ignore,
-			                              normalize = true)
-			bc_vals = Float64.(bc_df.betweenness)
-
-		#	--- Bonacich (Symmetric, Normalized for Cross-Network Comparability) ---
-			bn_df = bonacich_centrality(edges;
-			                           nodes = nodes,
-			                           directed = directed,
-			                           direction = :symmetric,
-			                           edge_interpretation = :ignore,
-			                           normalize = bonacich_normalize)
-			bn_vals = Float64.(bn_df.bonacich)
-
-		#	--- Topology Measures ---
-			lcp = largest_component_proportion(edges; nodes = nodes, directed = directed)
-			lbp = largest_bicomponent_proportion(edges; nodes = nodes, directed = directed)
-			mid_val = mean_inverse_distance(edges;
-			                               nodes = nodes,
-			                               directed = directed,
-			                               direction = :symmetric,
-			                               edge_interpretation = :ignore,
-			                               scale_by_log_n = false)
-			if directed
-				gcc = global_clustering_coefficient(edges;
-				                                  directed = true,
-				                                  method = :transitivity)
+		#	Symmetric Degree (Both Modes), In/Out (Directed Only) — Binarized
+			if !degenerate
+				sym_deg = total_degree(edges; nodes = nodes, weighted = false, directed = directed)
+				sym_vals = Float64.(sym_deg.total_degree)
 			else
-				gcc = global_clustering_coefficient(edges;
-				                                  directed = false,
-				                                  method = :average,
-				                                  average_mode = :local_clustering)
+				sym_vals = Float64[]
 			end
 
-		#	--- Tau (Directed Only) ---
-			if directed
-				tau_df = tau_statistic(edges;
-				                      nodes = nodes,
-				                      weighting = :RC,
-				                      n_samples = tau_n_samples,
-				                      directed = true,
-				                      seed = tau_seed)
-				tau_val = tau_df.tau[1]
+			if directed && !degenerate
+				in_deg  = in_degree(edges;  nodes = nodes, weighted = false)
+				out_deg = out_degree(edges; nodes = nodes, weighted = false)
+				in_vals  = Float64.(in_deg.in_degree)
+				out_vals = Float64.(out_deg.out_degree)
 			else
-				tau_val = 0.0
+				in_vals  = Float64[]
+				out_vals = Float64[]
 			end
 
-		#	Assembling Result Row
-			return DataFrame(
+		#	Path-Based and Topology Measures (Binarized)
+			if !degenerate
+				cc_vals = Float64.(closeness_centrality(edges;
+				                                       nodes = nodes,
+				                                       directed = directed,
+				                                       direction = :symmetric,
+				                                       edge_interpretation = :ignore,
+				                                       normalize = true).closeness)
+				bc_vals = Float64.(betweenness_centrality(edges;
+				                                         nodes = nodes,
+				                                         directed = directed,
+				                                         edge_interpretation = :ignore,
+				                                         normalize = true).betweenness)
+				bn_vals = Float64.(bonacich_centrality(edges;
+				                                      nodes = nodes,
+				                                      directed = directed,
+				                                      direction = :symmetric,
+				                                      edge_interpretation = :ignore,
+				                                      normalize = bonacich_normalize).bonacich)
+				lcp = largest_component_proportion(edges; nodes = nodes, directed = directed)
+				lbp = largest_bicomponent_proportion(edges; nodes = nodes, directed = directed)
+				mid_val = mean_inverse_distance(edges;
+				                               nodes = nodes,
+				                               directed = directed,
+				                               direction = :symmetric,
+				                               edge_interpretation = :ignore,
+				                               scale_by_log_n = false)
+				if directed
+					gcc = global_clustering_coefficient(edges; directed = true, method = :transitivity)
+				else
+					gcc = global_clustering_coefficient(edges; directed = false,
+					                                    method = :average, average_mode = :local_clustering)
+				end
+			else
+				cc_vals = Float64[]; bc_vals = Float64[]; bn_vals = Float64[]
+				lcp = n_nodes > 0 ? 1.0 / n_nodes : 0.0
+				lbp = n_nodes > 0 ? 1.0 / n_nodes : 0.0
+				mid_val = 0.0
+				gcc = 0.0
+			end
+
+		#	Tau (Directed, Non-Degenerate Only)
+			tau_val = 0.0
+			if directed && !degenerate
+				tau_val = tau_statistic(edges; nodes = nodes, weighting = :RC,
+				                       n_samples = tau_n_samples, directed = true,
+				                       seed = tau_seed).tau[1]
+			end
+
+		#	Mean/SD Helpers (Empty-Safe)
+			_m(v)  = isempty(v) ? 0.0 : mean(v)
+			_sd(v) = length(v) > 1 ? std(v) : 0.0
+
+		#	Assemble Common Columns
+			row = DataFrame(
+				network_name                    = [network_name],
+				n_nodes                         = [n_nodes],
+				n_edges                         = [n_edges],
+				directed                        = [directed],
+				mean_symmetric_degree           = [_m(sym_vals)],
+				sd_symmetric_degree             = [_sd(sym_vals)],
+				mean_closeness                  = [_m(cc_vals)],
+				sd_closeness                    = [_sd(cc_vals)],
+				mean_betweenness                = [_m(bc_vals)],
+				sd_betweenness                  = [_sd(bc_vals)],
+				mean_bonacich                   = [_m(bn_vals)],
+				sd_bonacich                     = [_sd(bn_vals)],
+				centralization_symmetric_degree = [_network_centralization(sym_vals)],
+				centralization_closeness        = [_network_centralization(cc_vals)],
+				centralization_betweenness      = [_network_centralization(bc_vals)],
+				centralization_bonacich         = [_network_centralization(bn_vals)],
+				largest_component_proportion    = [lcp],
+				largest_bicomponent_proportion  = [lbp],
+				mean_inverse_distance           = [mid_val],
+				global_transitivity             = [gcc]
+			)
+
+		#	Append Directed-Only Columns (In/Out Degree + Tau)
+			if directed
+				row.mean_indegree             = [_m(in_vals)]
+				row.sd_indegree               = [_sd(in_vals)]
+				row.mean_outdegree            = [_m(out_vals)]
+				row.sd_outdegree              = [_sd(out_vals)]
+				row.centralization_indegree   = [_network_centralization(in_vals)]
+				row.centralization_outdegree  = [_network_centralization(out_vals)]
+				row.tau_rc                    = [tau_val]
+			end
+
+			return row
+	end
+
+#	Compute Phase 0 Weighted-Measure Row for a Single Network
+	function compute_phase_0_weighted_row(edges::DataFrame,
+	                                     nodes::DataFrame;
+	                                     network_name::String = "(unnamed)",
+	                                     directed::Bool = true,
+	                                     bonacich_normalize::Symbol = :max,
+	                                     agg_func::Function = sum)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst, :weight
+			nodes::DataFrame: node universe with :id, :label
+			network_name::String: identifier for the result row
+			directed::Bool: directed schema (in/out/total strength) vs
+				undirected schema (total strength only)
+			bonacich_normalize::Symbol: Bonacich normalization (default :max)
+			agg_func::Function: multi-edge aggregation (default = sum)
+		Returns:
+			DataFrame: single-row data frame with the weighted Phase 0 schema
+				for the requested directedness.
+		Notes:
+			Weighted-measure half of the Phase 0 tables (Tables 3 and 4).
+			Strength is the weight-summed degree (weighted = true). Closeness,
+			betweenness, and mean inverse distance use edge_interpretation =
+			:tie_strength (Dijkstra on 1/w), the default weight semantics for
+			this corpus. Bonacich is weight-aware via its own edge handling.
+
+			Weight-distribution block (w_min, w_max, w_median, w_iqr, w_gini):
+				directed   — computed on the aggregated directed edge weights
+				undirected — computed on the nonzero weights of the symmetrized
+				             adjacency's upper triangle (each undirected edge
+				             once), matching the graph the undirected weighted
+				             measures traverse.
+			This directed/undirected distinction is documented in the table
+			descriptions in the validation roadmap.
+
+			Columns common to both directedness modes:
+				network_name, n_nodes, n_edges, directed,
+				w_min, w_max, w_median, w_iqr, w_gini,
+				mean/sd total_strength, mean/sd weighted_closeness,
+				mean/sd weighted_betweenness, mean/sd bonacich,
+				centralizations for total_strength / weighted_closeness /
+				weighted_betweenness / bonacich,
+				mean_inverse_distance_weighted.
+
+			Directed mode additionally carries:
+				mean/sd in_strength, mean/sd out_strength,
+				centralization_in_strength, centralization_out_strength.
+
+			NOTE: weighted betweenness uses Dijkstra-based Brandes, O(N(N+E)
+			log N) per source. This is acceptable for the one-time Phase 0
+			characterization (including Marvel) but is deliberately excluded
+			from the Phase 1 simulation measure set.
+		"""
+
+		#	Dimensions
+			n_nodes = nrow(nodes)
+			n_edges = nrow(edges)
+			degenerate = (n_edges == 0 || n_nodes == 0)
+
+		#	Weight-Distribution Source (Directed vs Symmetrized Undirected)
+			if !degenerate
+				if directed
+					edges_agg = DataFrame(src = edges.src, dst = edges.dst, weight = edges.weight)
+					edges_agg = _aggregate_multi_edges(edges_agg; agg_func = agg_func)
+					wsrc = Float64.(edges_agg.weight)
+				else
+					wsrc = _symmetrized_edge_weights(edges, nodes; agg_func = agg_func)
+				end
+			else
+				wsrc = Float64[]
+			end
+			wsum = _weight_distribution_summary(wsrc)
+
+		#	Strength (Weight-Summed Degree): Total (Both), In/Out (Directed)
+			if !degenerate
+				tot_str = total_degree(edges; nodes = nodes, weighted = true, directed = directed)
+				tot_vals = Float64.(tot_str.total_degree)
+			else
+				tot_vals = Float64[]
+			end
+
+			if directed && !degenerate
+				in_str  = in_degree(edges;  nodes = nodes, weighted = true)
+				out_str = out_degree(edges; nodes = nodes, weighted = true)
+				in_vals  = Float64.(in_str.in_degree)
+				out_vals = Float64.(out_str.out_degree)
+			else
+				in_vals  = Float64[]
+				out_vals = Float64[]
+			end
+
+		#	Weighted Path-Based Measures (:tie_strength)
+			if !degenerate
+				cc_vals = Float64.(closeness_centrality(edges;
+				                                       nodes = nodes,
+				                                       directed = directed,
+				                                       direction = :symmetric,
+				                                       edge_interpretation = :tie_strength,
+				                                       normalize = true).closeness)
+				bc_vals = Float64.(betweenness_centrality(edges;
+				                                         nodes = nodes,
+				                                         directed = directed,
+				                                         edge_interpretation = :tie_strength,
+				                                         normalize = true).betweenness)
+				bn_vals = Float64.(bonacich_centrality(edges;
+				                                      nodes = nodes,
+				                                      directed = directed,
+				                                      direction = :symmetric,
+				                                      edge_interpretation = :ignore,
+				                                      normalize = bonacich_normalize).bonacich)
+				mid_val = mean_inverse_distance(edges;
+				                               nodes = nodes,
+				                               directed = directed,
+				                               direction = :symmetric,
+				                               edge_interpretation = :tie_strength,
+				                               scale_by_log_n = false)
+			else
+				cc_vals = Float64[]; bc_vals = Float64[]; bn_vals = Float64[]
+				mid_val = 0.0
+			end
+
+		#	Mean/SD Helpers (Empty-Safe)
+			_m(v)  = isempty(v) ? 0.0 : mean(v)
+			_sd(v) = length(v) > 1 ? std(v) : 0.0
+
+		#	Assemble Common Columns (Weight Distribution + Strength + Weighted Measures)
+			row = DataFrame(
 				network_name                       = [network_name],
 				n_nodes                            = [n_nodes],
 				n_edges                            = [n_edges],
 				directed                           = [directed],
-				mean_indegree                      = [mean(in_vals)],
-				sd_indegree                        = [length(in_vals)  > 1 ? std(in_vals)  : 0.0],
-				mean_outdegree                     = [mean(out_vals)],
-				sd_outdegree                       = [length(out_vals) > 1 ? std(out_vals) : 0.0],
-				mean_symmetric_degree              = [mean(sym_vals)],
-				sd_symmetric_degree                = [length(sym_vals) > 1 ? std(sym_vals) : 0.0],
-				mean_closeness                     = [mean(cc_vals)],
-				sd_closeness                       = [length(cc_vals)  > 1 ? std(cc_vals)  : 0.0],
-				mean_betweenness                   = [mean(bc_vals)],
-				sd_betweenness                     = [length(bc_vals)  > 1 ? std(bc_vals)  : 0.0],
-				mean_bonacich                      = [mean(bn_vals)],
-				sd_bonacich                        = [length(bn_vals)  > 1 ? std(bn_vals)  : 0.0],
-				centralization_indegree            = [_network_centralization(in_vals)],
-				centralization_outdegree           = [_network_centralization(out_vals)],
-				centralization_symmetric_degree    = [_network_centralization(sym_vals)],
-				centralization_closeness           = [_network_centralization(cc_vals)],
-				centralization_betweenness         = [_network_centralization(bc_vals)],
+				w_min                              = [wsum.w_min],
+				w_max                              = [wsum.w_max],
+				w_median                           = [wsum.w_median],
+				w_iqr                              = [wsum.w_iqr],
+				w_gini                             = [wsum.w_gini],
+				mean_total_strength                = [_m(tot_vals)],
+				sd_total_strength                  = [_sd(tot_vals)],
+				mean_weighted_closeness            = [_m(cc_vals)],
+				sd_weighted_closeness              = [_sd(cc_vals)],
+				mean_weighted_betweenness          = [_m(bc_vals)],
+				sd_weighted_betweenness            = [_sd(bc_vals)],
+				mean_bonacich                      = [_m(bn_vals)],
+				sd_bonacich                        = [_sd(bn_vals)],
+				centralization_total_strength      = [_network_centralization(tot_vals)],
+				centralization_weighted_closeness  = [_network_centralization(cc_vals)],
+				centralization_weighted_betweenness = [_network_centralization(bc_vals)],
 				centralization_bonacich            = [_network_centralization(bn_vals)],
-				largest_component_proportion       = [lcp],
-				largest_bicomponent_proportion     = [lbp],
-				mean_inverse_distance              = [mid_val],
-				global_transitivity                = [gcc],
-				tau_rc                             = [tau_val]
+				mean_inverse_distance_weighted     = [mid_val]
 			)
-	end
 
-#	Build Phase 0 Table by Iterating Over All Networks in a Corpus
-	function build_phase_0_table(networks::Dict;
-	                            bonacich_normalize::Symbol = :max,
-	                            tau_n_samples::Int = 500,
-	                            tau_seed::Int = 20260101,
-	                            verbose::Bool = true)
-		"""
-		Args:
-			networks::Dict: dictionary keyed by network name with values
-				having .edges (DataFrame), .nodes (DataFrame), .metadata
-				(NamedTuple with at least :directed)
-			bonacich_normalize::Symbol: passed through to per-network call
-			tau_n_samples::Int: Monte Carlo samples for tau (default = 500)
-			tau_seed::Int: RNG seed for tau (default = 20260101)
-			verbose::Bool: print progress as each network is processed
-		Returns:
-			DataFrame: one row per network, columns matching Phase 0 schema
-		Notes:
-			Iterates over `networks` in sorted-key order so the result row
-			order is deterministic and easy to compare across runs. Each
-			network's `metadata.directed` flag determines the directed
-			argument; if metadata lacks that field, defaults to true.
-
-			Progress reporting (when verbose=true) includes elapsed time per
-			network — useful when computing tau on large networks like
-			Balikatan (typically ~30-60s for n_samples=500).
-		"""
-
-		#	Validation
-			if isempty(networks)
-				return DataFrame()
+		#	Append Directed-Only Columns (In/Out Strength)
+			if directed
+				row.mean_in_strength              = [_m(in_vals)]
+				row.sd_in_strength                = [_sd(in_vals)]
+				row.mean_out_strength             = [_m(out_vals)]
+				row.sd_out_strength               = [_sd(out_vals)]
+				row.centralization_in_strength    = [_network_centralization(in_vals)]
+				row.centralization_out_strength   = [_network_centralization(out_vals)]
 			end
 
-		#	Sort Keys for Deterministic Row Order
-			network_names = sort(collect(keys(networks)))
+			return row
+	end
 
-		#	Accumulate Rows
-			rows = DataFrame[]
-			for (i, name) in enumerate(network_names)
+#	Helper Function for Phase 0 Tables: Iterate a Corpus Subset and Stack Rows
+	function _build_phase_0_subset(networks::Dict,
+	                              want_directed::Bool,
+	                              row_builder::Function;
+	                              verbose::Bool = true,
+	                              builder_kwargs...)
+		"""
+		Args:
+			networks::Dict: corpus keyed by name → (edges, nodes, metadata)
+			want_directed::Bool: select only networks whose metadata.directed
+				matches this flag
+			row_builder::Function: compute_phase_0_binary_row or
+				compute_phase_0_weighted_row
+			verbose::Bool: per-network progress with elapsed time
+			builder_kwargs...: forwarded to the row builder (e.g.
+				bonacich_normalize, tau_n_samples, tau_seed)
+		Returns:
+			DataFrame: stacked rows for the selected directedness, sorted-key
+				order; empty DataFrame if no networks match
+		Notes:
+			Shared orchestration for the four measure-table writers. Selects
+			the corpus subset by directedness (so each table contains only the
+			networks it describes), calls the supplied row builder with
+			directed set to want_directed, and vertically concatenates.
+		"""
+
+		#	Sorted-Key Order for Deterministic Output
+			names = sort(collect(keys(networks)))
+			rows  = DataFrame[]
+
+			for name in names
 				net = networks[name]
+				is_directed = true
+				if hasproperty(net, :metadata) && hasproperty(net.metadata, :directed)
+					is_directed = Bool(net.metadata.directed)
+				end
+
+				#	Skip Networks Not Matching the Requested Directedness
+					if is_directed != want_directed
+						continue
+					end
+
 				if verbose
-					println("[$(i)/$(length(network_names))] Computing Phase 0 stats for: $name")
+					println("  [$(want_directed ? "directed" : "undirected")] $name " *
+					        "(N=$(nrow(net.nodes)), E=$(nrow(net.edges)))...")
 				end
 				t0 = time()
-
-				#	Determine Directedness from Metadata If Available
-					is_directed = true
-					if hasproperty(net, :metadata) && hasproperty(net.metadata, :directed)
-						is_directed = Bool(net.metadata.directed)
-					end
-
-				#	Compute Single-Row Result
-					row = compute_phase_0_statistics(net.edges, net.nodes;
-					                                network_name = name,
-					                                directed = is_directed,
-					                                bonacich_normalize = bonacich_normalize,
-					                                tau_n_samples = tau_n_samples,
-					                                tau_seed = tau_seed)
-					push!(rows, row)
-
-				if verbose
-					elapsed = time() - t0
-					println("    Done in $(round(elapsed, digits=2))s " *
-					        "(N = $(nrow(net.nodes)), E = $(nrow(net.edges)))")
-				end
+				row = row_builder(net.edges, net.nodes;
+				                 network_name = name,
+				                 directed = want_directed,
+				                 builder_kwargs...)
+				push!(rows, row)
+				verbose && println("      done in $(round(time() - t0, digits=2))s")
 			end
 
-		#	Vertical Concatenation
-			return reduce(vcat, rows)
+			return isempty(rows) ? DataFrame() : reduce(vcat, rows)
 	end
-	@doc raw"""
-	**Description**
-	Compute the full Phase 0 descriptive-statistics table for a corpus of
-	networks, matching Smith, Morgan, & Moody (2022) Table 1.
 
-	**Usage**
-	`build_phase_0_table(networks::Dict; bonacich_normalize=:max, tau_n_samples=500, tau_seed=20260101, verbose=true)`
-
-	**Arguments**
-	- `networks::Dict`: Dictionary keyed by network name (String), with
-	  values having `.edges`, `.nodes`, `.metadata` fields. The `.metadata`
-	  NamedTuple should include `:directed` (Bool); defaults to `true` if
-	  missing.
-	- `bonacich_normalize::Symbol`: Normalization applied to Bonacich power
-	  centrality for cross-network comparability. Default `:max` divides
-	  each network's Bonacich vector by its maximum, producing values in
-	  $[0, 1]$. See `bonacich_centrality` for other options.
-	- `tau_n_samples::Int`: Monte Carlo samples for the tau statistic
-	  (default 500; gives roughly 4% relative error on the variance).
-	- `tau_seed::Int`: RNG seed for tau reproducibility.
-	- `verbose::Bool`: Print per-network progress with elapsed time.
-
-	**Details**
-	Runs the full Phase 0 measure battery on every network in the corpus:
-	degree family, closeness, betweenness, Bonacich, their centralizations,
-	largest component proportion, largest bicomponent proportion, mean
-	inverse distance, global transitivity, and the tau statistic with
-	ranked-clusters weighting.
-
-	Tau is undefined for undirected networks (no asymmetric/mutual dyad
-	distinction) and is reported as `0.0` in that case.
-
-	Networks are processed in sorted-name order for reproducible output.
-
-	**Value**
-	A `DataFrame` with one row per network and columns matching the Phase 0
-	schema (see module-level documentation).
-
-	**See Also**
-	`compute_phase_0_statistics`
-	""" build_phase_0_table
-    table = build_phase_0_table(networks)
-
-#   Build & Evaluate Summary Table
-	function run_phase_0_driver_tests()
+#	Build and Write the Four Phase 0 Measure Tables (One CSV per Table)
+	function write_phase_0_measure_tables(networks::Dict,
+	                                     output_dir::String;
+	                                     bonacich_normalize::Symbol = :max,
+	                                     tau_n_samples::Int = 500,
+	                                     tau_seed::Int = 20260101,
+	                                     verbose::Bool = true)
 		"""
 		Args:
-			(none)
+			networks::Dict: corpus keyed by name → (edges, nodes, metadata)
+			output_dir::String: directory for the four CSV files
+			bonacich_normalize::Symbol: Bonacich normalization (default :max)
+			tau_n_samples::Int: Monte Carlo samples for tau (directed binary)
+			tau_seed::Int: RNG seed for tau
+			verbose::Bool: per-network progress
 		Returns:
-			Bool: true if all tests pass, false otherwise
+			NamedTuple: (undirected_binary, directed_binary,
+			             undirected_weighted, directed_weighted) — the four
+			             file paths written
 		Notes:
-			Sanity-tests compute_phase_0_statistics and build_phase_0_table.
-			These tests are not checking specific numeric values (those are
-			covered by each measure's own synthetic tests). Instead they
-			verify that:
+			Writes the four Phase 0 measure tables, one CSV per table:
+				phase_0_undirected_binary.csv    (Table 1)
+				phase_0_directed_binary.csv      (Table 2)
+				phase_0_undirected_weighted.csv  (Table 3)
+				phase_0_directed_weighted.csv    (Table 4)
 
-			1. The driver returns a 1-row DataFrame with the expected schema
-			2. All Phase 0 columns are present
-			3. n_nodes and n_edges fields match the input
-			4. Centralization values equal the SD of the corresponding
-			   centrality column (cross-check our centralization convention)
-			5. build_phase_0_table on a 2-network corpus returns 2 rows
-			6. Empty edge list produces a degenerate but valid row
+			Each table contains only the networks of its directedness, with
+			exactly the columns that table needs (no empty columns). The
+			triad census tables (5 and 6) are produced separately.
 		"""
 
-		println("=" ^ 70)
-		println("Phase 0 driver sanity tests")
-		println("=" ^ 70)
+		#	Ensure Output Directory
+			isdir(output_dir) || mkpath(output_dir)
 
-		all_passed = true
+		#	Table 1: Undirected, Binary
+			verbose && println("Table 1: undirected binary")
+			t1 = _build_phase_0_subset(networks, false, compute_phase_0_binary_row;
+			                          verbose = verbose,
+			                          bonacich_normalize = bonacich_normalize,
+			                          tau_n_samples = tau_n_samples, tau_seed = tau_seed)
+			p1 = joinpath(output_dir, "phase_0_undirected_binary.csv")
+			CSV.write(p1, t1)
 
-		#	Expected Schema Columns
-			expected_cols = [
-				:network_name, :n_nodes, :n_edges, :directed,
-				:mean_indegree, :sd_indegree,
-				:mean_outdegree, :sd_outdegree,
-				:mean_symmetric_degree, :sd_symmetric_degree,
-				:mean_closeness, :sd_closeness,
-				:mean_betweenness, :sd_betweenness,
-				:mean_bonacich, :sd_bonacich,
-				:centralization_indegree,
-				:centralization_outdegree,
-				:centralization_symmetric_degree,
-				:centralization_closeness,
-				:centralization_betweenness,
-				:centralization_bonacich,
-				:largest_component_proportion,
-				:largest_bicomponent_proportion,
-				:mean_inverse_distance,
-				:global_transitivity,
-				:tau_rc
-			]
+		#	Table 2: Directed, Binary
+			verbose && println("Table 2: directed binary")
+			t2 = _build_phase_0_subset(networks, true, compute_phase_0_binary_row;
+			                          verbose = verbose,
+			                          bonacich_normalize = bonacich_normalize,
+			                          tau_n_samples = tau_n_samples, tau_seed = tau_seed)
+			p2 = joinpath(output_dir, "phase_0_directed_binary.csv")
+			CSV.write(p2, t2)
 
-		#	Test 1: Schema and Single-Row Output
-			println("\nTest 1: compute_phase_0_statistics returns 1-row DataFrame with full schema")
-			try
-				net = _build_foundation_test_network()
-				df = compute_phase_0_statistics(net.edges, net.nodes;
-				                                network_name = "foundation_test",
-				                                directed = true,
-				                                tau_n_samples = 50)
-				@assert nrow(df) == 1 "Expected 1 row, got $(nrow(df))"
-				for col in expected_cols
-					@assert col in propertynames(df) "Missing column: $col"
+		#	Table 3: Undirected, Weighted
+			verbose && println("Table 3: undirected weighted")
+			t3 = _build_phase_0_subset(networks, false, compute_phase_0_weighted_row;
+			                          verbose = verbose,
+			                          bonacich_normalize = bonacich_normalize)
+			p3 = joinpath(output_dir, "phase_0_undirected_weighted.csv")
+			CSV.write(p3, t3)
+
+		#	Table 4: Directed, Weighted
+			verbose && println("Table 4: directed weighted")
+			t4 = _build_phase_0_subset(networks, true, compute_phase_0_weighted_row;
+			                          verbose = verbose,
+			                          bonacich_normalize = bonacich_normalize)
+			p4 = joinpath(output_dir, "phase_0_directed_weighted.csv")
+			CSV.write(p4, t4)
+
+			if verbose
+				println("\nWrote four Phase 0 measure tables to $output_dir:")
+				for p in (p1, p2, p3, p4)
+					println("  ", p)
 				end
-				@assert df.network_name[1] == "foundation_test" "Wrong network_name"
-				@assert df.n_nodes[1] == 8 "Expected n_nodes = 8, got $(df.n_nodes[1])"
-				@assert df.n_edges[1] == 7 "Expected n_edges = 7, got $(df.n_edges[1])"
-				@assert df.directed[1] == true "Expected directed = true"
-				println("  PASSED ($(length(expected_cols)) columns present)")
-			catch e
-				println("  FAILED: $e")
-				all_passed = false
 			end
 
-		#	Test 2: Centralization Equals SD of Centrality Column
-			println("\nTest 2: Centralization values equal std of node-level scores")
-			try
-				net = _build_foundation_test_network()
-				df = compute_phase_0_statistics(net.edges, net.nodes;
-				                                network_name = "foundation_test",
-				                                directed = true,
-				                                tau_n_samples = 50)
-				#	Recompute Independently and Verify Match
-				#	Driver binarizes degrees by default (binarize_degrees=true),
-				#	so the reference computation here must also binarize.
-					in_deg = in_degree(net.edges; nodes = net.nodes, weighted = false)
-					expected_centralization = std(Float64.(in_deg.in_degree))
-					@assert isapprox(df.centralization_indegree[1], expected_centralization; atol = 1e-12) "centralization_indegree mismatch: got $(df.centralization_indegree[1]), expected $expected_centralization"
-				println("  PASSED (centralization_indegree = $(round(df.centralization_indegree[1], digits=4)))")
-			catch e
-				println("  FAILED: $e")
-				all_passed = false
-			end
-
-		#	Test 3: Component and Bicomponent Proportions Match Known Values
-			println("\nTest 3: Component / bicomponent proportions on foundation network")
-			try
-				net = _build_foundation_test_network()
-				df = compute_phase_0_statistics(net.edges, net.nodes;
-				                                network_name = "foundation_test",
-				                                directed = true,
-				                                tau_n_samples = 50)
-				#	Largest Component Has 3 Nodes (One of the Triangles), N = 8
-				#	→ Proportion = 3/8 = 0.375
-				#	Same for the Largest Bicomponent
-					@assert isapprox(df.largest_component_proportion[1], 3/8; atol = 1e-12) "Component proportion mismatch"
-					@assert isapprox(df.largest_bicomponent_proportion[1], 3/8; atol = 1e-12) "Bicomponent proportion mismatch"
-				println("  PASSED (both = 3/8 = 0.375)")
-			catch e
-				println("  FAILED: $e")
-				all_passed = false
-			end
-
-		#	Test 4: build_phase_0_table on 2-Network Corpus
-			println("\nTest 4: build_phase_0_table on 2-network corpus returns 2 rows")
-			try
-				net1 = _build_foundation_test_network()
-				net2 = _build_triangle_test_network()
-				corpus = Dict("a_foundation" => net1, "b_triangle" => net2)
-				table = build_phase_0_table(corpus;
-				                           tau_n_samples = 50,
-				                           verbose = false)
-				@assert nrow(table) == 2 "Expected 2 rows, got $(nrow(table))"
-				#	Sorted by Key: "a_foundation" Comes Before "b_triangle"
-					@assert table.network_name[1] == "a_foundation" "Row order is not alphabetical by key"
-					@assert table.network_name[2] == "b_triangle" "Row order is not alphabetical by key"
-				println("  PASSED (2 rows in alphabetical order)")
-			catch e
-				println("  FAILED: $e")
-				all_passed = false
-			end
-
-		#	Test 5: Empty Edge List Produces Valid Row (No Errors)
-			println("\nTest 5: Empty edge list produces a valid degenerate row")
-			try
-				edges_empty = DataFrame(src = String[], dst = String[], weight = Float64[])
-				nodes_empty = DataFrame(id = string.(1:5), label = string.(1:5))
-				df = compute_phase_0_statistics(edges_empty, nodes_empty;
-				                                network_name = "empty_test",
-				                                directed = true,
-				                                tau_n_samples = 50)
-				@assert nrow(df) == 1 "Expected 1 row"
-				@assert df.n_nodes[1] == 5 "Expected n_nodes = 5"
-				@assert df.n_edges[1] == 0 "Expected n_edges = 0"
-				@assert df.mean_indegree[1] == 0.0 "Expected mean_indegree = 0"
-				@assert df.tau_rc[1] == 0.0 "Expected tau_rc = 0"
-				#	Schema Should Still Be Complete
-					for col in expected_cols
-						@assert col in propertynames(df) "Missing column on empty input: $col"
-					end
-				println("  PASSED (empty input produces well-formed row)")
-			catch e
-				println("  FAILED: $e")
-				all_passed = false
-			end
-
-		#	Test 6: Undirected Network Returns Tau = 0
-			println("\nTest 6: Undirected network has tau_rc = 0 (tau undefined for undirected)")
-			try
-				net = _build_foundation_test_network()
-				df = compute_phase_0_statistics(net.edges, net.nodes;
-				                                network_name = "undirected_test",
-				                                directed = false,
-				                                tau_n_samples = 50)
-				@assert df.tau_rc[1] == 0.0 "Expected tau_rc = 0.0 for undirected, got $(df.tau_rc[1])"
-				@assert df.directed[1] == false "Expected directed = false"
-				println("  PASSED (undirected → tau_rc = 0.0)")
-			catch e
-				println("  FAILED: $e")
-				all_passed = false
-			end
-
-		#	Report Overall Result
-			println("\n" * "=" ^ 70)
-			println("Phase 0 driver tests: $(all_passed ? "ALL PASSED" : "SOME FAILED")")
-			println("=" ^ 70)
-
-			return all_passed
-	end
-    run_phase_0_driver_tests()
-
-#   Write-Out CSV. 
-    CSV.write("Data/phase_0_table.csv", table)
-
-#	Iterate Over Networks in Sorted-Key Order (Matches Phase 0 Table Order)
-	gini_rows = DataFrame[]
-	for name in sort(collect(keys(networks)))
-		net = networks[name]
-
-		#	Determine Directedness
-			is_directed = true
-			if hasproperty(net, :metadata) && hasproperty(net.metadata, :directed)
-				is_directed = Bool(net.metadata.directed)
-			end
-
-		#	Compute the Binarized Symmetric Degree Distribution
-		#	weighted=false matches the binarization convention used elsewhere
-		#	in the Phase 0 driver.
-			sym_deg = total_degree(net.edges;
-			                      nodes = net.nodes,
-			                      weighted = false,
-			                      directed = is_directed)
-			sym_vals = Float64.(sym_deg.total_degree)
-
-		#	Compute Gini (Guard Against Trivially-Small Networks)
-			g = length(sym_vals) > 1 ? gini_coefficient(sym_vals) : 0.0
-
-		#	Accumulate Row
-			push!(gini_rows, DataFrame(network_name = [name],
-			                          gini_symmetric_degree = [round(g, digits = 4)]))
+		return (undirected_binary   = p1,
+				directed_binary     = p2,
+				undirected_weighted = p3,
+				directed_weighted   = p4)
 	end
 
-#	Combine and Print
-	gini_table = reduce(vcat, gini_rows)
-	println(gini_table)
+#	Generate Measure Tables
+	write_phase_0_measure_tables(networks, "Data")
+
+#	TRIAD CENSUS
+
+#	Davis-Leinhardt 16-Class Order (Shared Column Order for Both Triad Tables)
+	const _DL16_CLASSES = ["003", "012", "102", "021D", "021U", "021C",
+	                       "111D", "111U", "030T", "030C", "201",
+	                       "120D", "120U", "120C", "210", "300"]
+
+#	Compute Phase 0 Static (Unweighted) Triad Census Row for a Single Network
+	function compute_phase_0_triad_static_row(edges::DataFrame,
+	                                         nodes::DataFrame;
+	                                         network_name::String = "(unnamed)",
+	                                         directed::Bool = true)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst (weights ignored)
+			nodes::DataFrame: node universe with :id, :label
+			network_name::String: identifier for the result row
+			directed::Bool: directed (:directed) vs undirected (:undirected)
+				graph_type for the census
+		Returns:
+			DataFrame: single-row data frame with network_name, n_nodes,
+				n_edges, graph_type, and one count column per DL-16 class
+				(triad_003 ... triad_300).
+		Notes:
+			Classic Holland-Leinhardt / Davis-Leinhardt static triad census
+			(Table 5). Calls the binary path of triad_census on the binarized
+			graph, which always returns the full 16-class DL vector. For
+			undirected networks only {003, 102, 201, 300} are non-zero; the
+			other twelve asymmetric classes carry zeros by construction, so a
+			single uniform 16-column schema serves both directednesses. A
+			graph_type column records which convention produced the row.
+
+			Column names use the triad_<class> prefix (e.g. triad_021D) so the
+			CSV header is self-describing and stable in DL order.
+		"""
+
+		#	Census Graph Type from Directedness
+			gtype = directed ? :directed : :undirected
+
+		#	Run Binary Triad Census (Returns 16-Row DataFrame: :triad, :count)
+			tc = triad_census(edges; nodes = nodes, graph_type = gtype)
+
+		#	Index Counts by Class Label for Deterministic Column Assembly
+			count_by_class = Dict(string(r.triad) => Int(r.count) for r in eachrow(tc))
+
+		#	Assemble Single Row: Metadata + One Column per DL-16 Class
+			row = DataFrame(
+				network_name = [network_name],
+				n_nodes      = [nrow(nodes)],
+				n_edges      = [nrow(edges)],
+				graph_type   = [String(gtype)]
+			)
+			for cls in _DL16_CLASSES
+				row[!, Symbol("triad_$(cls)")] = [get(count_by_class, cls, 0)]
+			end
+
+			return row
+	end
+
+#	Compute Phase 0 Weighted (Layered AUMC) Triad Census Row for a Single Network
+	function compute_phase_0_triad_weighted_row(edges::DataFrame,
+	                                           nodes::DataFrame;
+	                                           network_name::String = "(unnamed)",
+	                                           directed::Bool = true,
+	                                           recommend_method::Symbol = :auto,
+	                                           show_progress::Bool = true)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst, :weight
+			nodes::DataFrame: node universe with :id, :label
+			network_name::String: identifier for the result row
+			directed::Bool: directed (:directed) vs undirected (:undirected)
+				graph_type for the census and the L recommendation
+			recommend_method::Symbol: passed to recommend_L (:auto, :analytic,
+				:empirical). Default :auto uses the calibrated dispatch.
+			show_progress::Bool: per-tau progress bar in the layered census
+				(default true; recommended for Marvel-scale runs)
+		Returns:
+			DataFrame: single-row data frame with network_name, n_nodes,
+				n_edges, graph_type, the recommend_L metadata block (T_max, L,
+				tau_min, tau_max, method), wall-clock seconds, one AUMC_density
+				column per DL-16 class (aumc_003 ... aumc_300), and one peak-tau
+				column per DL-16 class (peaktau_003 ... peaktau_300).
+		Notes:
+			Layered weighted (AUMC) triad census (Table 6). First calls
+			recommend_L to select the tau grid (L, tau_min, tau_max) and the
+			method (analytic vs empirical) via the calibrated auto-dispatch,
+			then runs the weighted path of triad_census across that grid.
+
+			The recommend_L metadata is recorded so the table documents how
+			each network's grid was chosen: T_max (unweighted triangle count),
+			L (grid size), the tau bounds, and the selected method. Wall-clock
+			covers the recommendation plus the layered census (the dominant
+			cost on large networks).
+
+			AUMC_density and peak_tau are reported for all 16 DL classes from
+			the census .summary. For undirected networks the asymmetric classes
+			are zero (AUMC) / degenerate (peak_tau) by construction, mirroring
+			the static table.
+
+			NOTE: the weighted layered census is the expensive Phase 0
+			computation (Marvel ~10 min, analytic dispatch). It is deliberately
+			a one-time Phase 0 characterization and excluded from the Phase 1
+			simulation measure set.
+		"""
+
+		#	Census Graph Type from Directedness
+			gtype = directed ? :directed : :undirected
+
+		#	Time the Full Recommendation + Layered Census
+			t0 = time()
+
+		#	Recommend the Tau Grid (Calibrated Auto-Dispatch by Default)
+			rec = recommend_L(edges;
+			                  nodes = nodes,
+			                  graph_type = gtype,
+			                  method = recommend_method)
+
+		#	Run the Weighted Layered Triad Census Over the Recommended Grid
+			layered = triad_census(edges;
+			                      nodes = nodes,
+			                      weighted = true,
+			                      graph_type = gtype,
+			                      L = rec.L,
+			                      tau_min = rec.tau_min,
+			                      tau_max = rec.tau_max,
+			                      show_progress = show_progress)
+
+			elapsed = time() - t0
+
+		#	Index Summary by Class for Deterministic Column Assembly
+		#	summary columns: :triad, :AUMC_density, :peak_tau, :peak_density
+			aumc_by_class    = Dict(string(r.triad) => Float64(r.AUMC_density) for r in eachrow(layered.summary))
+			peaktau_by_class = Dict(string(r.triad) => Float64(r.peak_tau)     for r in eachrow(layered.summary))
+
+		#	Assemble Single Row: Metadata + Grid Block + AUMC + Peak-Tau
+			row = DataFrame(
+				network_name = [network_name],
+				n_nodes      = [nrow(nodes)],
+				n_edges      = [nrow(edges)],
+				graph_type   = [String(gtype)],
+				T_max        = [rec.T_max],
+				L            = [rec.L],
+				tau_min      = [rec.tau_min],
+				tau_max      = [rec.tau_max],
+				method       = [String(rec.method)],
+				wall_clock_s = [round(elapsed, digits = 2)]
+			)
+			for cls in _DL16_CLASSES
+				row[!, Symbol("aumc_$(cls)")] = [get(aumc_by_class, cls, 0.0)]
+			end
+			for cls in _DL16_CLASSES
+				row[!, Symbol("peaktau_$(cls)")] = [get(peaktau_by_class, cls, 0.0)]
+			end
+
+			return row
+	end
+
+#	Build and Write the Two Phase 0 Triad Census Tables (One CSV per Table)
+	function write_phase_0_triad_tables(networks::Dict,
+	                                   output_dir::String;
+	                                   recommend_method::Symbol = :auto,
+	                                   show_progress::Bool = true,
+	                                   verbose::Bool = true)
+		"""
+		Args:
+			networks::Dict: corpus keyed by name → (edges, nodes, metadata)
+			output_dir::String: directory for the two CSV files
+			recommend_method::Symbol: passed to recommend_L for the weighted
+				table (:auto, :analytic, :empirical)
+			show_progress::Bool: per-tau progress bar in the weighted census
+			verbose::Bool: per-network progress with elapsed time
+		Returns:
+			NamedTuple: (triad_static, triad_weighted) — the two file paths
+		Notes:
+			Writes the two Phase 0 triad census tables, one CSV per table:
+				phase_0_triad_static.csv     (Table 5: Holland-Leinhardt static)
+				phase_0_triad_weighted.csv   (Table 6: layered AUMC census)
+
+			Unlike the four measure tables, the triad tables use a single
+			uniform DL-16 schema across directedness (the census always returns
+			the full 16-vector), so all networks share one CSV per table with a
+			graph_type column distinguishing directed from undirected rows.
+			Networks are processed in sorted-key order for deterministic output.
+		"""
+
+		#	Ensure Output Directory
+			isdir(output_dir) || mkpath(output_dir)
+
+		#	Sorted-Key Order for Deterministic Rows
+			names = sort(collect(keys(networks)))
+
+		#	Per-Network Directedness Resolver
+			_is_dir(net) = (hasproperty(net, :metadata) && hasproperty(net.metadata, :directed)) ?
+			               Bool(net.metadata.directed) : true
+
+		#	--- Table 5: Static (Unweighted) Triad Census ---
+			verbose && println("Table 5: static triad census")
+			static_rows = DataFrame[]
+			for name in names
+				net = networks[name]
+				gt  = _is_dir(net)
+				verbose && println("  [$(gt ? "directed" : "undirected")] $name " *
+				                  "(N=$(nrow(net.nodes)), E=$(nrow(net.edges)))...")
+				t0 = time()
+				push!(static_rows,
+				      compute_phase_0_triad_static_row(net.edges, net.nodes;
+				                                      network_name = name,
+				                                      directed = gt))
+				verbose && println("      done in $(round(time() - t0, digits=2))s")
+			end
+			static_table = reduce(vcat, static_rows)
+			p_static = joinpath(output_dir, "phase_0_triad_static.csv")
+			CSV.write(p_static, static_table)
+
+		#	--- Table 6: Weighted (Layered AUMC) Triad Census ---
+			verbose && println("Table 6: weighted (layered AUMC) triad census")
+			weighted_rows = DataFrame[]
+			for name in names
+				net = networks[name]
+				gt  = _is_dir(net)
+				verbose && println("  [$(gt ? "directed" : "undirected")] $name " *
+				                  "(N=$(nrow(net.nodes)), E=$(nrow(net.edges)))...")
+				t0 = time()
+				push!(weighted_rows,
+				      compute_phase_0_triad_weighted_row(net.edges, net.nodes;
+				                                        network_name = name,
+				                                        directed = gt,
+				                                        recommend_method = recommend_method,
+				                                        show_progress = show_progress))
+				verbose && println("      done in $(round(time() - t0, digits=2))s")
+			end
+			weighted_table = reduce(vcat, weighted_rows)
+			p_weighted = joinpath(output_dir, "phase_0_triad_weighted.csv")
+			CSV.write(p_weighted, weighted_table)
+
+			if verbose
+				println("\nWrote two Phase 0 triad tables to $output_dir:")
+				println("  ", p_static)
+				println("  ", p_weighted)
+			end
+
+		return (triad_static = p_static, triad_weighted = p_weighted)
+	end
+
+#	Execution: Write the Two Triad Census Tables (Takes Some Time Because of Marvel)
+	write_phase_0_triad_tables(networks, "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data")
