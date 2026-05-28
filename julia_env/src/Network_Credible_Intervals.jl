@@ -30,11 +30,13 @@ module Network_Credible_Intervals
     include("graphml_io.jl")
     include("network_community_detection.jl")
     include("network_statistics.jl")
+    include("network_degeneracy_functions.jl")
 
 #   Pull their exports into the parent namespace
     using .graphml_io
     using .network_community_detection
     using .network_statistics
+    using .network_degeneracy
 
 #   Re-export to users of Network_Credible_Intervals
     export write_graphml,
@@ -68,6 +70,9 @@ module Network_Credible_Intervals
            triad_census,
            largest_bicomponent_proportion,
            tau_statistic,
-           structural_equivalence_blockmodel
+           structural_equivalence_blockmodel,
+           generate_missingness_mask,
+           apply_missingness,
+           build_degeneration_corpus
 
 end # module Network_Credible_Intervals
