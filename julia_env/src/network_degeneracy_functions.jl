@@ -1131,7 +1131,6 @@ module network_degeneracy
 		#	Return
 			return (edges = degraded_edges, nodes = degraded_nodes)
 	end
-
 	@doc raw"""
 	**Description**
 	Materializes the degraded $(\text{edges}, \text{nodes})$ pair from an

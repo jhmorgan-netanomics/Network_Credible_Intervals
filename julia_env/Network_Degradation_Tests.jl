@@ -16,8 +16,10 @@
 #   PACKAGES   #
 ################
 
+using Arrow
 using CSV
 using DataFrames
+using Dates
 using Printf
 using SparseArrays
 using Statistics
@@ -1299,3 +1301,128 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 				details = "a=$check_a b=$check_b c=$check_c d=$check_d e=$check_e f=$check_f")
 	end
     smoke_test_orchestrator_dual_mechanism(networks)
+
+############################
+#   Pre-Launch Smoke Run   #
+############################
+
+#	Three networks, full design grid, 10 replicates per cell, both
+#	mechanisms. Exercises the threaded orchestrator, the Arrow writer,
+#	and the per-network diagnostic readout before launching the
+#	production run.
+
+#	Set Parameters (plain variables, not const, so reruns don't error
+#	with "cannot redefine constant" warnings)
+	master_seed       = 42
+	output_dir        = "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data/Degenerate_Networks"
+	smoke_output_file = joinpath(output_dir, "smoke_degeneration_corpus.arrow")
+
+	target_rhos       = [-0.75, -0.25, 0.0, 0.25, 0.75]
+	target_rates      = [0.05, 0.10, 0.15, 0.25, 0.40, 0.50]
+	n_replicates      = 10                                        #	reduced from 100 for smoke
+	mechanisms_cfg    = [:full_removal, :outgoing_only]
+
+	smoke_network_names = [
+		"moreno_highschool_unweighted",
+		"scotland_interlock_unweighted",
+		"marvel_universe_unweighted",
+	]
+
+#	Pre-flight Checks
+	println("─" ^ 70)
+	println("Phase 1 Pre-Launch Smoke Test")
+	println("─" ^ 70)
+	println("Started:           ", now())
+	println("Julia version:     ", VERSION)
+	println("Threads:           ", Threads.nthreads())
+	println("Master seed:       ", master_seed)
+	println("Output file:       ", smoke_output_file)
+	println()
+
+	mkpath(output_dir)
+	Threads.nthreads() >= 4 || @warn "Only $(Threads.nthreads()) threads available"
+
+#	Subset Networks
+	#	Each value in the smoke dict must be the network NamedTuple
+	#	(networks[name]), not the full networks dict.
+	test_networks = Dict{String, NamedTuple}(
+		name => networks[name]
+		for name in smoke_network_names
+		if haskey(networks, name)
+	)
+
+	length(test_networks) == length(smoke_network_names) ||
+		error("Missing networks: ", setdiff(smoke_network_names, keys(test_networks)))
+
+	println("Smoke corpus (", length(test_networks), " networks):")
+	for (name, net) in sort(collect(test_networks), by=first)
+		println("  $(rpad(name, 40)) N=$(rpad(nrow(net.nodes), 8)) E=$(rpad(nrow(net.edges), 10)) directed=$(net.metadata.directed)")
+	end
+	println()
+
+#	Run Smoke Grid
+	println("Launching build_degeneration_corpus (smoke configuration) ...")
+	println()
+
+	@time corpus_df = Network_Credible_Intervals.network_degeneracy.build_degeneration_corpus(
+											test_networks;
+											target_rhos    = target_rhos,
+											target_rates   = target_rates,
+											n_replicates   = n_replicates,
+											mechanisms     = mechanisms_cfg,
+											master_seed    = master_seed,
+											parallel       = true,
+											show_progress  = true)
+
+#	Diagnostic Readout
+	println()
+	println("─" ^ 70)
+	println("Smoke result")
+	println("─" ^ 70)
+	println("Rows:              ", nrow(corpus_df))
+	println("Networks:          ", length(unique(corpus_df.network_name)))
+	println()
+
+	println("Per-network breakdown")
+	println("─" ^ 70)
+	for grp in groupby(corpus_df, :network_name)
+		n_rows  = nrow(grp)
+		n_full  = count(==(:full_removal), grp.mechanism)
+		n_out   = count(==(:outgoing_only), grp.mechanism)
+		n_conv  = count(==(:converged), grp.bisection_status)
+		n_ceil  = count(==(:ceiling_hit), grp.bisection_status)
+		n_fail  = count(==(:failed_other), grp.bisection_status)
+		n_deg   = count(grp.any_topo_degenerate)
+		println("  $(rpad(grp.network_name[1], 40)) rows=$(rpad(n_rows, 5)) full=$(rpad(n_full, 4)) out=$(rpad(n_out, 4)) conv=$(rpad(n_conv, 4)) ceil=$(rpad(n_ceil, 3)) fail=$(rpad(n_fail, 3)) deg=$n_deg")
+	end
+	println()
+
+#	Sanity Checks
+	expected_rows = 0
+	for name in smoke_network_names
+		net = test_networks[name]
+		n_mech = net.metadata.directed ? 2 : 1
+		expected_rows += length(target_rhos) * length(target_rates) * n_replicates * n_mech
+	end
+	nrow(corpus_df) == expected_rows ||
+		@warn "Row count mismatch: got $(nrow(corpus_df)), expected $expected_rows"
+
+#	Write Arrow
+	println("Writing Arrow file ...")
+	Arrow.write(smoke_output_file, corpus_df; compress = :zstd)
+	println("Wrote: ", smoke_output_file, " (", round(filesize(smoke_output_file) / 1024^2, digits=1), " MB)")
+	println()
+
+#	Roundtrip Test
+	#	Confirm the Arrow file reads back correctly with the expected
+	#	column types — particularly the Vector{Vector{Int}} dropped_nodes
+	#	column, which is the column most likely to misbehave.
+	println("Roundtrip test ...")
+	read_df = DataFrame(Arrow.Table(smoke_output_file))
+	nrow(read_df) == nrow(corpus_df) || error("Roundtrip row count mismatch")
+	typeof(read_df.dropped_nodes[1]) <: AbstractVector{<:Integer} ||
+		@warn "dropped_nodes roundtrip type unexpected: $(typeof(read_df.dropped_nodes[1]))"
+	read_df.realized_rho[1] ≈ corpus_df.realized_rho[1] || error("realized_rho roundtrip mismatch")
+	println("Roundtrip OK: read back ", nrow(read_df), " rows, dropped_nodes type intact")
+	println()
+	println("Smoke complete: ", now())
