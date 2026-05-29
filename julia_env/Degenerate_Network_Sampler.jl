@@ -99,7 +99,7 @@
                                                 parallel       = true,
                                                 show_progress  = true)
 
-#	Diagnostic readout ───────────────────────────────────────────
+#	Diagnostic Readout
     println()
     println("─" ^ 70)
     println("Production corpus complete")
@@ -129,3 +129,83 @@
     println()
 
     println("Done: ", now())
+
+#   Checking File
+    production_file = "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data/Degenerate_Networks/degeneration_corpus.arrow"
+
+    read_df = DataFrame(Arrow.Table(production_file))
+    println("Rows:              ", nrow(read_df))
+    println("Columns:           ", names(read_df))
+    println("Networks:          ", length(unique(read_df.network_name)))
+    println("Mechanisms:        ", unique(read_df.mechanism))
+    println("ρ values:          ", sort(unique(read_df.nominal_rho)))
+    println("Rate values:       ", sort(unique(read_df.nominal_rate)))
+    println("dropped_nodes type:", typeof(read_df.dropped_nodes[1]))
+    println("Example row:")
+    println(read_df[1, :])
+
+#	Pick 5 representative rows: small network, large network, both
+#	mechanisms, both ρ signs.
+    sample_indices = [1, 1000, 30000, 50000, 78000]   # arbitrary spread
+    for idx in sample_indices
+        row = read_df[idx, :]
+        net = networks[row.network_name]
+        dropped = collect(row.dropped_nodes)    # convert Arrow vector to Vector{Int}
+        
+        if row.mechanism == :full_removal
+            result = Network_Credible_Intervals.network_degeneracy.apply_missingness(
+                        net.edges, dropped; nodes=net.nodes)
+        else
+            result = Network_Credible_Intervals.network_degeneracy.apply_missingness_outgoing_only(
+                        net.edges, dropped; nodes=net.nodes, directed=true)
+        end
+        
+        #	Validate
+            n_orig         = nrow(net.nodes)
+            n_dropped      = length(dropped)
+            expected_nodes = row.mechanism == :full_removal ? n_orig - n_dropped : n_orig
+            actual_nodes   = nrow(result.nodes)
+            nodes_match    = actual_nodes == expected_nodes
+            rate_match     = abs(row.realized_rate - n_dropped / n_orig) < 1e-10
+        
+        println("Row $idx: $(row.network_name) mech=$(row.mechanism) ρ_nom=$(row.nominal_rho) rate_nom=$(row.nominal_rate)")
+        println("  k = $n_dropped, realized_rate = $(row.realized_rate), rate_match = $rate_match")
+        println("  nodes: $actual_nodes / $expected_nodes ($(nodes_match ? "OK" : "FAIL"))")
+        println("  edges: $(nrow(result.edges)) (n_edges_observed in record: $(row.n_edges_observed))")
+        println("  bisection_status: $(row.bisection_status), realized_ρ: $(row.realized_rho)")
+    end
+
+#	Pick one row, regenerate it from scratch using the recorded seed,
+#	confirm bit-identical dropped_nodes.
+    row = read_df[5000, :]    # arbitrary directed network for variety
+    net = networks[row.network_name]
+
+    c = Network_Credible_Intervals.network_degeneracy._centrality_for_sampler(
+            net.edges; nodes=net.nodes, directed=net.metadata.directed)
+
+    rec = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
+                net.edges; nodes=net.nodes, directed=net.metadata.directed,
+                target_rate=row.nominal_rate, target_rho=row.nominal_rho,
+                seed=row.seed, centrality=c)
+
+    println("Reproducibility check on row 5000:")
+    println("  network:           $(row.network_name)")
+    println("  nominal ρ, rate:   $(row.nominal_rho), $(row.nominal_rate)")
+    println("  seed:              $(row.seed)")
+    println("  dropped match:     $(collect(row.dropped_nodes) == rec.dropped_nodes)")
+    println("  realized_ρ match:  $(isapprox(row.realized_rho, rec.realized_rho))")
+    println("  status match:      $(row.bisection_status == rec.bisection_status)")
+
+#	Group by network, ρ sign, rate, mechanism — report mean realized ρ
+#	at :ceiling_hit cells. We expect: positive ρ ceilings around 0.3-0.5,
+#	negative ρ ceilings often near zero on heavy-tailed networks.
+    ceiling_rows = filter(:bisection_status => ==(:ceiling_hit), read_df)
+    println("Total ceiling-hit rows: ", nrow(ceiling_rows))
+    println()
+
+    for grp in groupby(ceiling_rows, [:network_name, :nominal_rho])
+        mean_realized = round(mean(grp.realized_rho), digits=3)
+        median_realized = round(median(grp.realized_rho), digits=3)
+        n_rows = nrow(grp)
+        println("  $(rpad(grp.network_name[1], 40)) ρ_nom=$(grp.nominal_rho[1])  n=$n_rows  mean=$mean_realized  median=$median_realized")
+    end
