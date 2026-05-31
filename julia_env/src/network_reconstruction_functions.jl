@@ -2331,6 +2331,722 @@ module network_reconstruction
 			)
 	end
 
+###################################################
+#     SECTION 5: REPLICATE GENERATION HELPERS     # 
+###################################################
+
+#	Helper Function for generate_replicate: draw degree and E/I bin assignments for added nodes
+	function _draw_bin_assignments(q::Vector{Float64},
+									ei_conditional::Matrix{Float64},
+									N_add::Int,
+									binning_mode::Symbol,
+									rng::AbstractRNG)
+		"""
+		Args:
+			q::Vector{Float64}: degree-bin distribution from Step 5, length K
+			ei_conditional::Matrix{Float64}: P(EI bin | degree bin) from setup,
+				K x J_effective. Rows uniform where the degree bin is empty in
+				G_obs (Three-Prior contract).
+			N_add::Int: number of added nodes to assign
+			binning_mode::Symbol: :two_dim or :degree_only
+			rng::AbstractRNG: random source
+		Returns:
+			NamedTuple with fields:
+				degree_bins::Vector{Int}, length N_add, values in 1:K
+				ei_bins::Vector{Int}, length N_add. In :two_dim mode, values
+					in 1:J_effective. In :degree_only mode, all entries are 0.
+		Notes:
+			- Returns empty vectors when N_add == 0.
+			- Outputs are pre-allocated at N_add length; no push! during fill.
+		"""
+
+		#	Guards
+			N_add >= 0 ||
+				throw(ArgumentError("N_add must be >= 0, got $N_add"))
+			binning_mode in (:two_dim, :degree_only) ||
+				throw(ArgumentError("binning_mode must be :two_dim or :degree_only, got $binning_mode"))
+			abs(sum(q) - 1.0) < 1e-9 ||
+				throw(ArgumentError("q must sum to 1, got $(sum(q))"))
+
+		#	Handle N_add == 0 Fast-Path
+			if N_add == 0
+				return (degree_bins = Int[], ei_bins = Int[])
+			end
+
+		#	Pre-Allocate Output Vectors
+			degree_bins = Vector{Int}(undef, N_add)
+			ei_bins = Vector{Int}(undef, N_add)
+
+		#	Draw Degree Bins from q
+			degree_dist = Categorical(q)
+			rand!(rng, degree_dist, degree_bins)
+
+		#	Draw E/I Bins Conditional on Degree (or Zero-Fill for 1D)
+			if binning_mode == :degree_only
+				fill!(ei_bins, 0)
+			else
+				for i in 1:N_add
+					row = collect(view(ei_conditional, degree_bins[i], :))
+					ei_bins[i] = rand(rng, Categorical(row))
+				end
+			end
+
+		#	Assemble Output
+			return (degree_bins = degree_bins, ei_bins = ei_bins)
+	end
+
+#	Helper Function for generate_replicate: construct augmented node roster with bin labels
+	function _build_augmented_nodes(setup::SamplerSetup,
+									 added_degree_bins::Vector{Int},
+									 added_ei_bins::Vector{Int})
+		"""
+		Args:
+			setup::SamplerSetup: provides setup.nodes, setup.degree_bins,
+				setup.ei_bins, and partially_observed_nodes
+			added_degree_bins::Vector{Int}: length N_add
+			added_ei_bins::Vector{Int}: length N_add
+		Returns:
+			DataFrame: a copy of setup.nodes extended by N_add rows with
+				ids N+1..N+N_add, plus columns :degree_bin, :ei_bin, :node_type.
+		Notes:
+			- :node_type is :observed for respondent nodes, :nominated for
+			  nodes in partially_observed_nodes, :added for synthetic rows.
+			- All columns are constructed in single allocations; no push!.
+			- Pure: no RNG required.
+		"""
+
+		#	Guards
+			length(added_degree_bins) == length(added_ei_bins) ||
+				throw(ArgumentError("added_degree_bins and added_ei_bins must have equal length"))
+			length(added_degree_bins) == setup.N_add ||
+				throw(ArgumentError("added bin vectors must have length N_add = $(setup.N_add)"))
+
+		#	Construct Observed and Nominated Rows with Bin and Type Labels
+			N = nrow(setup.nodes)
+			out = copy(setup.nodes)
+			out[!, :degree_bin] = setup.degree_bins
+			out[!, :ei_bin] = setup.ei_bins
+			nominated_set = Set(setup.partially_observed_nodes)
+			node_type = Vector{Symbol}(undef, N)
+			for i in 1:N
+				node_type[i] = (out.id[i] in nominated_set) ? :nominated : :observed
+			end
+			out[!, :node_type] = node_type
+
+		#	Construct Added Rows (ids N+1..N+N_add)
+			N_add = setup.N_add
+			if N_add > 0
+				added_rows = DataFrame()
+				for col in names(out)
+					if col == "id"
+						added_rows[!, col] = collect((N + 1):(N + N_add))
+					elseif col == "degree_bin"
+						added_rows[!, col] = added_degree_bins
+					elseif col == "ei_bin"
+						added_rows[!, col] = added_ei_bins
+					elseif col == "node_type"
+						added_rows[!, col] = fill(:added, N_add)
+					else
+						added_rows[!, col] = Vector{Union{Missing, eltype(out[!, col])}}(missing, N_add)
+					end
+				end
+				append!(out, added_rows; promote = true)
+			end
+
+		#	Combine and Return
+			return out
+	end
+
+#	Helper Function for generate_replicate: Stage 0.5 imputation for directed networks
+	function _stage_0_5_directed(setup::SamplerSetup,
+								  augmented_nodes::DataFrame,
+								  rng::AbstractRNG)
+		"""
+		Args:
+			setup::SamplerSetup: must have non-empty partially_observed_nodes,
+				directed == true, and a non-nothing R matrix
+			augmented_nodes::DataFrame: includes nominated rows with bin labels
+			rng::AbstractRNG: random source
+		Returns:
+			DataFrame of new edges added by Stage 0.5 (columns: src, dst, weight).
+		Notes:
+			(a) Reverse edges: for each observed A -> E with E nominated, draw
+			    Bernoulli(R[c_A, c_E]) for E -> A. Weight 1 (unweighted) or
+			    Poisson(w[c_E, c_A]) min 1 (weighted).
+			(b) Outgoing to non-nominators: for each respondent A with no
+			    observed edge in either direction with E, draw Bernoulli(P[c_E, c_A]).
+			(c) Pairs of nominated (E, F): draw E -> F and F -> E independently.
+			- Edge buffers pre-allocated at the combined upper bound; counter
+			  advances on successful draws; resize! truncates at end.
+		"""
+
+		#	Guards
+			setup.directed ||
+				throw(ArgumentError("_stage_0_5_directed called on undirected setup"))
+			!isempty(setup.partially_observed_nodes) ||
+				throw(ArgumentError("_stage_0_5_directed requires partially_observed_nodes"))
+			!isnothing(setup.R) ||
+				throw(ArgumentError("_stage_0_5_directed requires non-nothing R matrix"))
+
+		#	Identify Nominated Non-Respondents and Their Cells
+			nominated_idx = findall(==(:nominated), augmented_nodes.node_type)
+			respondent_idx = findall(==(:observed), augmented_nodes.node_type)
+			nominated_ids = Set(augmented_nodes.id[nominated_idx])
+			id_to_idx = Dict(augmented_nodes.id[i] => i for i in 1:nrow(augmented_nodes))
+
+		#	Build Per-Nominee Connected-Set and Count Forward Edges to Nominees
+			edges_with_nom = Dict{Int, Set{Int}}(E => Set{Int}() for E in nominated_ids)
+			n_forward_to_nom = 0
+			for row in eachrow(setup.edges)
+				if row.src in nominated_ids
+					push!(edges_with_nom[row.src], row.dst)
+				end
+				if row.dst in nominated_ids
+					push!(edges_with_nom[row.dst], row.src)
+					n_forward_to_nom += 1
+				end
+			end
+
+		#	Pre-Allocate Edge Buffers at Upper Bound
+			n_nom = length(nominated_idx)
+			n_resp = length(respondent_idx)
+			upper_bound = n_forward_to_nom + n_nom * n_resp + n_nom * (n_nom - 1)
+			src_buf = Vector{Int}(undef, upper_bound)
+			dst_buf = Vector{Int}(undef, upper_bound)
+			weight_buf = setup.weighted ? Vector{Float64}(undef, upper_bound) : Vector{Int}(undef, upper_bound)
+			n_filled = 0
+
+		#	Stage 0.5a: Reverse Edges via R Matrix
+			for row in eachrow(setup.edges)
+				if !(row.dst in nominated_ids)
+					continue
+				end
+				A_idx = id_to_idx[row.src]
+				E_idx = id_to_idx[row.dst]
+				dA = augmented_nodes.degree_bin[A_idx]
+				eA = augmented_nodes.ei_bin[A_idx]
+				dE = augmented_nodes.degree_bin[E_idx]
+				eE = augmented_nodes.ei_bin[E_idx]
+				p = setup.R[dA, eA, dE, eE]
+				if rand(rng) < p
+					n_filled += 1
+					src_buf[n_filled] = row.dst
+					dst_buf[n_filled] = row.src
+					weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[dE, eE, dA, eA]))) : 1
+				end
+			end
+
+		#	Stage 0.5b: Outgoing Edges to Non-Nominator Respondents via P
+			for E_idx in nominated_idx
+				E_id = augmented_nodes.id[E_idx]
+				dE = augmented_nodes.degree_bin[E_idx]
+				eE = augmented_nodes.ei_bin[E_idx]
+				connected = edges_with_nom[E_id]
+				for A_idx in respondent_idx
+					A_id = augmented_nodes.id[A_idx]
+					if A_id in connected
+						continue
+					end
+					dA = augmented_nodes.degree_bin[A_idx]
+					eA = augmented_nodes.ei_bin[A_idx]
+					p = setup.P[dE, eE, dA, eA]
+					if rand(rng) < p
+						n_filled += 1
+						src_buf[n_filled] = E_id
+						dst_buf[n_filled] = A_id
+						weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[dE, eE, dA, eA]))) : 1
+					end
+				end
+			end
+
+		#	Stage 0.5c: Edges Between Pairs of Nominated Non-Respondents
+			for i in eachindex(nominated_idx)
+				E_idx = nominated_idx[i]
+				E_id = augmented_nodes.id[E_idx]
+				dE = augmented_nodes.degree_bin[E_idx]
+				eE = augmented_nodes.ei_bin[E_idx]
+				for j in eachindex(nominated_idx)
+					if i == j
+						continue
+					end
+					F_idx = nominated_idx[j]
+					F_id = augmented_nodes.id[F_idx]
+					dF = augmented_nodes.degree_bin[F_idx]
+					eF = augmented_nodes.ei_bin[F_idx]
+					p = setup.P[dE, eE, dF, eF]
+					if rand(rng) < p
+						n_filled += 1
+						src_buf[n_filled] = E_id
+						dst_buf[n_filled] = F_id
+						weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[dE, eE, dF, eF]))) : 1
+					end
+				end
+			end
+
+		#	Truncate Buffers to Filled Length and Return
+			resize!(src_buf, n_filled)
+			resize!(dst_buf, n_filled)
+			resize!(weight_buf, n_filled)
+			return DataFrame(src = src_buf, dst = dst_buf, weight = weight_buf)
+	end
+
+#	Helper Function for generate_replicate: Stage 0.5 imputation for undirected networks
+	function _stage_0_5_undirected(setup::SamplerSetup,
+									augmented_nodes::DataFrame,
+									rng::AbstractRNG)
+		"""
+		Args:
+			setup::SamplerSetup: must have non-empty partially_observed_nodes
+				and directed == false. setup.R may be nothing.
+			augmented_nodes::DataFrame: includes nominated rows with bin labels
+			rng::AbstractRNG: random source
+		Returns:
+			DataFrame of new undirected edges (stored with src < dst).
+		Notes:
+			- Observed edges from respondents to nominated nodes are kept as is.
+			- Only new edges are between pairs of nominated non-respondents:
+			  one Bernoulli(P[c_E, c_F]) per unordered pair.
+			- Edge buffers pre-allocated at the n_nom * (n_nom - 1) / 2 upper
+			  bound; counter advances on successful draws; resize! at end.
+		"""
+
+		#	Guards
+			!setup.directed ||
+				throw(ArgumentError("_stage_0_5_undirected called on directed setup"))
+			!isempty(setup.partially_observed_nodes) ||
+				throw(ArgumentError("_stage_0_5_undirected requires partially_observed_nodes"))
+
+		#	Identify Nominated Non-Respondents and Their Cells
+			nominated_idx = findall(==(:nominated), augmented_nodes.node_type)
+			n_nom = length(nominated_idx)
+
+		#	Pre-Allocate Edge Buffers at Upper Bound
+			upper_bound = n_nom * (n_nom - 1) ÷ 2
+			src_buf = Vector{Int}(undef, upper_bound)
+			dst_buf = Vector{Int}(undef, upper_bound)
+			weight_buf = setup.weighted ? Vector{Float64}(undef, upper_bound) : Vector{Int}(undef, upper_bound)
+			n_filled = 0
+
+		#	Sample Edges Between Pairs of Nominated Non-Respondents via P
+			for i in 1:n_nom
+				E_idx = nominated_idx[i]
+				E_id = augmented_nodes.id[E_idx]
+				dE = augmented_nodes.degree_bin[E_idx]
+				eE = augmented_nodes.ei_bin[E_idx]
+				for j in (i + 1):n_nom
+					F_idx = nominated_idx[j]
+					F_id = augmented_nodes.id[F_idx]
+					dF = augmented_nodes.degree_bin[F_idx]
+					eF = augmented_nodes.ei_bin[F_idx]
+					p = setup.P[dE, eE, dF, eF]
+					if rand(rng) < p
+						n_filled += 1
+						a, b = E_id < F_id ? (E_id, F_id) : (F_id, E_id)
+						src_buf[n_filled] = a
+						dst_buf[n_filled] = b
+						weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[dE, eE, dF, eF]))) : 1
+					end
+				end
+			end
+
+		#	Truncate Buffers to Filled Length and Return
+			resize!(src_buf, n_filled)
+			resize!(dst_buf, n_filled)
+			resize!(weight_buf, n_filled)
+			return DataFrame(src = src_buf, dst = dst_buf, weight = weight_buf)
+	end
+
+#	Helper Function for generate_replicate: Stage 1 added-node edge sampling, directed case
+	function _stage_1_directed(setup::SamplerSetup,
+								augmented_nodes::DataFrame,
+								rng::AbstractRNG)
+		"""
+		Args:
+			setup::SamplerSetup: must have directed == true
+			augmented_nodes::DataFrame: full node roster with bin labels
+			rng::AbstractRNG: random source
+		Returns:
+			DataFrame of new edges added by Stage 1.
+		Notes:
+			- For each added node v: draws outgoing to non-added via P; incoming
+			  from non-added via P; added-added edges drawn once per ordered pair.
+			- No self-loops. No edges between original respondents.
+			- Weight: 1 (unweighted) or Poisson(w) min 1 (weighted).
+			- Edge buffers pre-allocated at the combined upper bound; counter
+			  advances on successful draws; resize! at end.
+		"""
+
+		#	Guards
+			setup.directed ||
+				throw(ArgumentError("_stage_1_directed called on undirected setup"))
+
+		#	Identify Added Nodes and Their Cells
+			added_idx = findall(==(:added), augmented_nodes.node_type)
+			non_added_idx = findall(!=(:added), augmented_nodes.node_type)
+			n_added = length(added_idx)
+			n_non_added = length(non_added_idx)
+
+		#	Pre-Allocate Edge Buffers at Upper Bound
+			upper_bound = 2 * n_added * n_non_added + n_added * (n_added - 1)
+			src_buf = Vector{Int}(undef, upper_bound)
+			dst_buf = Vector{Int}(undef, upper_bound)
+			weight_buf = setup.weighted ? Vector{Float64}(undef, upper_bound) : Vector{Int}(undef, upper_bound)
+			n_filled = 0
+
+		#	Stage 1a: Outgoing Edges from Added to Non-Added Nodes via P
+			for v_idx in added_idx
+				v_id = augmented_nodes.id[v_idx]
+				dv = augmented_nodes.degree_bin[v_idx]
+				ev = augmented_nodes.ei_bin[v_idx]
+				for j_idx in non_added_idx
+					j_id = augmented_nodes.id[j_idx]
+					dj = augmented_nodes.degree_bin[j_idx]
+					ej = augmented_nodes.ei_bin[j_idx]
+					p = setup.P[dv, ev, dj, ej]
+					if rand(rng) < p
+						n_filled += 1
+						src_buf[n_filled] = v_id
+						dst_buf[n_filled] = j_id
+						weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[dv, ev, dj, ej]))) : 1
+					end
+				end
+			end
+
+		#	Stage 1b: Incoming Edges from Non-Added Nodes to Added via P
+			for v_idx in added_idx
+				v_id = augmented_nodes.id[v_idx]
+				dv = augmented_nodes.degree_bin[v_idx]
+				ev = augmented_nodes.ei_bin[v_idx]
+				for i_idx in non_added_idx
+					i_id = augmented_nodes.id[i_idx]
+					di = augmented_nodes.degree_bin[i_idx]
+					ei = augmented_nodes.ei_bin[i_idx]
+					p = setup.P[di, ei, dv, ev]
+					if rand(rng) < p
+						n_filled += 1
+						src_buf[n_filled] = i_id
+						dst_buf[n_filled] = v_id
+						weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[di, ei, dv, ev]))) : 1
+					end
+				end
+			end
+
+		#	Stage 1c: Edges Between Pairs of Added Nodes (Both Directions)
+			for i in eachindex(added_idx)
+				v_idx = added_idx[i]
+				v_id = augmented_nodes.id[v_idx]
+				dv = augmented_nodes.degree_bin[v_idx]
+				ev = augmented_nodes.ei_bin[v_idx]
+				for j in eachindex(added_idx)
+					if i == j
+						continue
+					end
+					u_idx = added_idx[j]
+					u_id = augmented_nodes.id[u_idx]
+					du = augmented_nodes.degree_bin[u_idx]
+					eu = augmented_nodes.ei_bin[u_idx]
+					p = setup.P[dv, ev, du, eu]
+					if rand(rng) < p
+						n_filled += 1
+						src_buf[n_filled] = v_id
+						dst_buf[n_filled] = u_id
+						weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[dv, ev, du, eu]))) : 1
+					end
+				end
+			end
+
+		#	Truncate Buffers to Filled Length and Return
+			resize!(src_buf, n_filled)
+			resize!(dst_buf, n_filled)
+			resize!(weight_buf, n_filled)
+			return DataFrame(src = src_buf, dst = dst_buf, weight = weight_buf)
+	end
+
+#	Helper Function for generate_replicate: Stage 1 added-node edge sampling, undirected case
+	function _stage_1_undirected(setup::SamplerSetup,
+								  augmented_nodes::DataFrame,
+								  rng::AbstractRNG)
+		"""
+		Args:
+			setup::SamplerSetup: must have directed == false
+			augmented_nodes::DataFrame: full node roster with bin labels
+			rng::AbstractRNG: random source
+		Returns:
+			DataFrame of new undirected edges (stored with src < dst).
+		Notes:
+			- One Bernoulli(P[cv, cj]) per unordered pair involving an added node.
+			- No self-loops.
+			- Edge buffers pre-allocated at the combined upper bound; counter
+			  advances on successful draws; resize! at end.
+		"""
+
+		#	Guards
+			!setup.directed ||
+				throw(ArgumentError("_stage_1_undirected called on directed setup"))
+
+		#	Identify Added Nodes and Their Cells
+			added_idx = findall(==(:added), augmented_nodes.node_type)
+			non_added_idx = findall(!=(:added), augmented_nodes.node_type)
+			n_added = length(added_idx)
+			n_non_added = length(non_added_idx)
+
+		#	Pre-Allocate Edge Buffers at Upper Bound
+			upper_bound = n_added * n_non_added + n_added * (n_added - 1) ÷ 2
+			src_buf = Vector{Int}(undef, upper_bound)
+			dst_buf = Vector{Int}(undef, upper_bound)
+			weight_buf = setup.weighted ? Vector{Float64}(undef, upper_bound) : Vector{Int}(undef, upper_bound)
+			n_filled = 0
+
+		#	Sample Edges Between Added and Non-Added Nodes via P
+			for v_idx in added_idx
+				v_id = augmented_nodes.id[v_idx]
+				dv = augmented_nodes.degree_bin[v_idx]
+				ev = augmented_nodes.ei_bin[v_idx]
+				for j_idx in non_added_idx
+					j_id = augmented_nodes.id[j_idx]
+					dj = augmented_nodes.degree_bin[j_idx]
+					ej = augmented_nodes.ei_bin[j_idx]
+					p = setup.P[dv, ev, dj, ej]
+					if rand(rng) < p
+						n_filled += 1
+						a, b = v_id < j_id ? (v_id, j_id) : (j_id, v_id)
+						src_buf[n_filled] = a
+						dst_buf[n_filled] = b
+						weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[dv, ev, dj, ej]))) : 1
+					end
+				end
+			end
+
+		#	Sample Edges Between Pairs of Added Nodes via P
+			for i in 1:n_added
+				v_idx = added_idx[i]
+				v_id = augmented_nodes.id[v_idx]
+				dv = augmented_nodes.degree_bin[v_idx]
+				ev = augmented_nodes.ei_bin[v_idx]
+				for j in (i + 1):n_added
+					u_idx = added_idx[j]
+					u_id = augmented_nodes.id[u_idx]
+					du = augmented_nodes.degree_bin[u_idx]
+					eu = augmented_nodes.ei_bin[u_idx]
+					p = setup.P[dv, ev, du, eu]
+					if rand(rng) < p
+						n_filled += 1
+						src_buf[n_filled] = v_id
+						dst_buf[n_filled] = u_id
+						weight_buf[n_filled] = setup.weighted ? max(1, rand(rng, Poisson(setup.w[dv, ev, du, eu]))) : 1
+					end
+				end
+			end
+
+		#	Truncate Buffers to Filled Length and Return
+			resize!(src_buf, n_filled)
+			resize!(dst_buf, n_filled)
+			resize!(weight_buf, n_filled)
+			return DataFrame(src = src_buf, dst = dst_buf, weight = weight_buf)
+	end
+
+#	Helper Function for generate_replicate: Stage 2 weight redistribution (mutating)
+	function _stage_2!(setup::SamplerSetup,
+						augmented_edges::DataFrame,
+						rng::AbstractRNG)
+		"""
+		Args:
+			setup::SamplerSetup: must have pi_edge > 0 and weighted == true
+			augmented_edges::DataFrame: edges after Stages 0.5 and 1; mutated
+				in place
+			rng::AbstractRNG: random source
+		Returns:
+			Int: the number of weight units added (W_add), for diagnostics.
+		Throws:
+			ArgumentError if pi_edge == 0, weighted == false, missing :weight
+				column, or W_aug == 0.
+		Notes:
+			- W_aug = sum(augmented_edges.weight).
+			- W_add = round(pi_edge * W_aug / (1 - pi_edge)).
+			- Multinomial draw of W_add weight units, with edge probabilities
+			  proportional to current weight; each edge's weight is incremented
+			  by its drawn count. Single allocation for the counts vector;
+			  in-place increment of augmented_edges.weight via broadcasted +=.
+		"""
+
+		#	Guards
+			setup.pi_edge > 0 ||
+				throw(ArgumentError("_stage_2! requires pi_edge > 0"))
+			setup.weighted ||
+				throw(ArgumentError("_stage_2! requires weighted == true"))
+			:weight in propertynames(augmented_edges) ||
+				throw(ArgumentError("augmented_edges must have :weight column"))
+
+		#	Compute W_aug and W_add
+			W_aug = sum(augmented_edges.weight)
+			W_aug > 0 ||
+				throw(ArgumentError("W_aug must be > 0, got $W_aug"))
+			W_add = round(Int, setup.pi_edge * W_aug / (1 - setup.pi_edge))
+			if W_add == 0
+				return 0
+			end
+
+		#	Multinomial Draw and Increment Edge Weights
+			probs = Float64.(augmented_edges.weight)
+			probs ./= sum(probs)
+			counts = rand(rng, Multinomial(W_add, probs))
+			augmented_edges.weight .+= counts
+
+		#	Return W_add
+			return W_add
+	end
+
+##########################################################
+#     SECTION 6: REPLICATE GENERATION USER-FACING        #
+##########################################################
+
+#	Replicate: container for one augmented network and its per-replicate diagnostics
+	struct Replicate
+		augmented_edges::DataFrame
+		augmented_nodes::DataFrame
+		diag::Dict{Symbol, Any}
+	end
+	@doc raw"""
+	**Description**
+	Container for one augmented-network replicate produced by `generate_replicate`. Holds the augmented edge table, the augmented node roster (with bin labels and node-type tags), and a per-replicate diagnostics dictionary.
+
+	**Fields**
+	- `augmented_edges::DataFrame`: Columns `:src`, `:dst`, `:weight`. Contains the original observed edges, Stage 0.5 imputed edges (when nominated non-respondents exist), Stage 1 sampled edges incident to synthetic added nodes, and any Stage 2 weight increments on existing edges (when applicable).
+	- `augmented_nodes::DataFrame`: All columns of the original `setup.nodes`, plus `:degree_bin::Int`, `:ei_bin::Int`, and `:node_type::Symbol` where `:node_type` is one of `:observed`, `:nominated`, or `:added`. Synthetic added nodes have ids `N+1..N+N_add`.
+	- `diag::Dict{Symbol, Any}`: Per-replicate diagnostics. Standard keys: `:seed`, `:realized_rho` (Kendall τ_b across observed + added nodes), `:added_degree_bins`, `:added_ei_bins`, `:n_stage_0_5_edges`, `:n_stage_1_edges`, `:stage_2_weight_added`.
+
+	**See Also**
+	`generate_replicate`, `compute_setup`, `SamplerSetup`
+	""" Replicate
+
+#	generate_replicate: compose Stages 0.5, 1, and 2 into one augmented network
+	function generate_replicate(setup::SamplerSetup, seed::Int)
+		"""
+		Args:
+			setup::SamplerSetup: produced by compute_setup
+			seed::Int: deterministic seed for this replicate
+		Returns:
+			Replicate struct with augmented_edges, augmented_nodes, diag.
+		Notes:
+			Steps executed in order match the design doc's Replicate Generation
+			phase: draw bin assignments; build augmented_nodes; copy edges;
+			run Stage 0.5 (if N_nom > 0); run Stage 1; run Stage 2 (if
+			pi_edge > 0 and weighted); record realized Kendall tau_b and
+			per-stage diagnostics.
+		"""
+
+		#	Initialize RNG
+			rng = Xoshiro(seed)
+
+		#	Step 6: Draw Bin Assignments for Added Nodes
+			bin_assignments = _draw_bin_assignments(setup.q,
+													 setup.ei_conditional,
+													 setup.N_add,
+													 setup.binning_mode,
+													 rng)
+
+		#	Build Augmented Nodes Roster
+			augmented_nodes = _build_augmented_nodes(setup,
+													  bin_assignments.degree_bins,
+													  bin_assignments.ei_bins)
+
+		#	Initialize Augmented Edges
+			augmented_edges = copy(setup.edges)
+
+		#	Step 6.5: Stage 0.5 (if N_nom > 0)
+			N_nom = length(setup.partially_observed_nodes)
+			n_stage_0_5_edges = 0
+			if N_nom > 0
+				stage_0_5_edges = setup.directed ?
+					_stage_0_5_directed(setup, augmented_nodes, rng) :
+					_stage_0_5_undirected(setup, augmented_nodes, rng)
+				n_stage_0_5_edges = nrow(stage_0_5_edges)
+				append!(augmented_edges, stage_0_5_edges)
+			end
+
+		#	Step 7: Stage 1
+			stage_1_edges = setup.directed ?
+				_stage_1_directed(setup, augmented_nodes, rng) :
+				_stage_1_undirected(setup, augmented_nodes, rng)
+			n_stage_1_edges = nrow(stage_1_edges)
+			append!(augmented_edges, stage_1_edges)
+
+		#	Step 8: Stage 2 (if pi_edge > 0 and weighted)
+			stage_2_weight_added = 0
+			if setup.pi_edge > 0 && setup.weighted
+				stage_2_weight_added = _stage_2!(setup, augmented_edges, rng)
+			end
+
+		#	Compute Realized Kendall tau_b Across Observed + Added Nodes
+			mask = (augmented_nodes.node_type .== :observed) .| (augmented_nodes.node_type .== :added)
+			is_added = augmented_nodes.node_type[mask] .== :added
+			realized_rho = if sum(is_added) == 0 || sum(is_added) == length(is_added)
+				NaN
+			else
+				corkendall(Float64.(is_added), Float64.(augmented_nodes.degree_bin[mask]))
+			end
+
+		#	Assemble Diagnostics
+			diag = Dict{Symbol, Any}(
+				:seed => seed,
+				:realized_rho => realized_rho,
+				:added_degree_bins => bin_assignments.degree_bins,
+				:added_ei_bins => bin_assignments.ei_bins,
+				:n_stage_0_5_edges => n_stage_0_5_edges,
+				:n_stage_1_edges => n_stage_1_edges,
+				:stage_2_weight_added => stage_2_weight_added,
+			)
+
+		#	Return Replicate
+			return Replicate(augmented_edges, augmented_nodes, diag)
+	end
+	@doc raw"""
+	**Description**
+	Generate one augmented-network replicate from a `SamplerSetup` by composing Stages 0.5, 1, and 2 of the framework's Replicate Generation phase. Returns a `Replicate` containing the augmented edge table, the augmented node roster, and per-replicate diagnostics. This is the per-replicate primitive consumed by `reconstruct_network` (user-facing wrapper) and `build_reconstruction_corpus` (validation orchestrator).
+
+	**Usage**
+	`generate_replicate(setup::SamplerSetup, seed::Int)`
+
+	**Arguments**
+	- `setup::SamplerSetup`: Output of `compute_setup`. Holds the rank-rank matrices `P`, `w`, and (for directed networks) `R`; bin labels; the `q` distribution and `β` solver result; the added-node count `N_add`; the E/I conditional distribution; and other Setup-phase artifacts.
+	- `seed::Int`: Deterministic seed for this replicate. Combined with a master seed in upstream callers, it allows any single replicate to be reproduced exactly without re-running the full grid.
+
+	**Details**
+	Steps executed in order:
+	1. `Xoshiro(seed)` initializes the per-replicate RNG.
+	2. `_draw_bin_assignments` draws degree- and E/I-bin assignments for `N_add` synthetic added nodes from `q` and the E/I conditional distribution.
+	3. `_build_augmented_nodes` constructs the augmented node roster: original observed nodes (tagged `:observed` or `:nominated`) plus `N_add` synthetic rows with ids `N+1..N+N_add` (tagged `:added`).
+	4. `augmented_edges` is initialized as a copy of `setup.edges`.
+	5. If `N_nom > 0`, Stage 0.5 imputes edges involving nominated non-respondents. The directed variant uses `R` for reverse edges and `P` for outgoing edges to non-nominators; the undirected variant samples only edges between pairs of nominated non-respondents.
+	6. Stage 1 samples edges incident to synthetic added nodes via `P` (and `w` when weighted). No self-loops; no edges created between two original respondents.
+	7. If `pi_edge > 0` and the network is weighted, Stage 2 redistributes `W_add = round(pi_edge * W_aug / (1 - pi_edge))` weight units across existing edges via multinomial draw proportional to current weight, mutating `augmented_edges.weight` in place.
+	8. Realized Kendall τ_b is computed between the added-indicator and degree bin across observed and added nodes (excluding nominated), as a per-replicate contract check against the β solver's nominal target.
+
+	Pure-pass case (`N_add == 0`, `N_nom == 0`, `pi_edge == 0`) returns `augmented_edges == setup.edges` and `augmented_nodes == setup.nodes` (with `:node_type` added), with all stage steps skipped.
+
+	**Value**
+	A `Replicate` struct with fields:
+	- `augmented_edges::DataFrame`: Columns `:src`, `:dst`, `:weight`.
+	- `augmented_nodes::DataFrame`: Original node columns plus `:degree_bin::Int`, `:ei_bin::Int`, `:node_type::Symbol`.
+	- `diag::Dict{Symbol, Any}`: Per-replicate diagnostics including `:seed`, `:realized_rho`, `:added_degree_bins`, `:added_ei_bins`, `:n_stage_0_5_edges`, `:n_stage_1_edges`, `:stage_2_weight_added`.
+
+	**Examples**
+	```julia
+		#	Setup phase: run once per (network, prior) configuration
+			setup = compute_setup(edges, nodes, community_labels;
+								directed = true, weighted = true,
+								pi_node = 0.10, rho = 0.10)
+
+		#	Replicate generation: one augmented network from a deterministic seed
+			rep = generate_replicate(setup, 42)
+			println("Realized rho: $(rep.diag[:realized_rho])")
+			println("Augmented edge count: $(nrow(rep.augmented_edges))")
+	```
+
+	**See Also**
+	`compute_setup`, `Replicate`, `SamplerSetup`, `feasible_rho_range`, `find_optimal_K`
+	""" generate_replicate
+
 #	Exports (public API)
 	export SamplerSetup,
 		   build_community_corpus,
