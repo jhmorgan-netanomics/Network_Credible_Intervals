@@ -12,11 +12,65 @@
     get(ENV, "JULIA_NUM_THREADS", "not set")
     Threads.nthreads() 
 
+#	Tests' Description
+"""
+Setup Tests (Tests 1–18). The setup test tier verifies each component of compute_setup in isolation. 
+Each test exercises one helper — _compute_observed_centrality, _compute_p_matrix, _compute_r_matrix, _solve_bin_distribution, _compute_ei_conditional, 
+_determine_n_add, feasible_rho_range, find_optimal_K, and so on — on a small fixture with known structure, asserting that the helper's output matches a 
+hand-derivable expectation. The fixtures are deliberately tractable: a small ring, a directed star, a small SBM with known communities. Where a helper has 
+multiple branches (directed vs. undirected; weighted vs. unweighted; 1D vs. 2D binning fallback; converged vs. ceiling_hit vs. failed_other for the β-solver), 
+each branch gets its own test. These tests are fast and fully deterministic; the whole tier runs in well under a second. They are the first line of defense — 
+any change to the math of the setup phase surfaces here before it propagates downstream, and a failure points directly to the helper at fault with no ambiguity 
+about which component broke. Test 18, the final test in the tier, is the end-to-end smoke test on compute_setup itself: it assembles a small fixture, 
+runs the full setup, and checks that the returned SamplerSetup has consistent fields (q sums to 1, N_add matches the pi_node arithmetic, 
+beta_status is :converged for a feasible target, ei_conditional rows sum to 1 where the degree bin is populated). This catches assembly bugs that per-helper tests cannot.
+
+Behavior Calibration Tests (Tests 19–21). The calibration tier is where the setup phase is held accountable to the three-prior algorithmic contract on real networks. 
+Each test runs compute_setup on a corpus network at three cells — (rho=0, rate=0.10), (rho=+0.5, rate=0.10), (rho=-0.5, rate=0.10) — and verifies that 
+Prior 1 (proportion missing) holds arithmetically, Prior 2 (centrality–missingness Kendall τ_b) holds empirically across R=20 bin-distribution samples from q, 
+and Prior 3 (E/I conditional on degree bin) holds against the empirical conditional from G_obs. Realized values are aggregated and reported alongside the nominal 
+targets, with :ceiling_hit counts surfaced as informational diagnostics so ceiling-pulled cells are visible rather than hidden.
+The four networks chosen for this tier — Moreno (directed N=70), Scotland at K=4, Scotland at K=10 (the same network at a higher bin count to exercise the 
+K-dependent ceiling), and Marvel (undirected N=6,486, heavy-tailed) — span the corpus's structural variety: small and large, directed and undirected, 
+light-tailed and heavy-tailed. The calibration tier catches system-level failure modes that no individual helper test can: a q distribution that 
+produces the right analytic τ_b but the wrong empirical τ_b under sampling (a math error one level up from the β-solver), an ei_conditional that has the right 
+marginals but fails to capture the joint structure of G_obs, or a K-selection that picks the wrong bin count for the network at hand. Test 21 (Marvel) is the 
+stress case: heavy-tailed centrality, large N, expensive CHAMP runs at ~30 minutes wall-clock, and ceiling-pulled negative-ρ cells. If the calibration passes on 
+Marvel, the framework's setup phase is honest under the most adversarial conditions in the corpus.
+
+Replication Unit Tests (Tests 22–28). This tier mirrors the Setup test tier in structure but operates on the new Replicate Generation helpers: _draw_bin_assignments, 
+_build_augmented_nodes, _stage_0_5_directed, _stage_0_5_undirected, _stage_1_directed, _stage_1_undirected, and _stage_2!. Each test runs the helper on a 
+small fixture with known structure and asserts the helper's contract: that _draw_bin_assignments produces a histogram matching q within tolerance from 
+10,000 draws; that _build_augmented_nodes assigns node ids N+1..N+N_add and tags each row with the correct :node_type; that the stage helpers respect structural 
+invariants (no self-loops, no edges between two :observed nodes, src < dst for undirected outputs); and that _stage_2! satisfies the weight-conservation identity 
+sum(weight) == W_aug + W_add after the call. Like the Setup unit tests, these are fast and deterministic — each helper gets exercised on a small fixture with 
+seeded RNG, so failures point directly to the responsible code. The tier is especially valuable as a diagnostic floor for the integration tier: if a calibration 
+test on Moreno fails, running the helper unit tests first localizes the bug to a specific stage before any expensive debugging into composition. Test 28 (_stage_2!) 
+carries a tighter set of arithmetic assertions than the other helpers because Stage 2 has a closed-form expected output — W_add is deterministic given pi_edge and 
+W_aug — making the test essentially a contract identity rather than a stochastic property.
+
+Replication Integration Tests (Tests 29–34). The integration tier exercises generate_replicate end-to-end and verifies the three-prior contract on actual realized 
+augmented networks — not on the analytic outputs of compute_setup, but on the graphs that the framework would hand a downstream measure function. Tests 29–30 run on 
+small synthetic fixtures (N=30, one directed and one undirected) and focus on composition correctness across R=20 seeds: every replicate has 
+nrow(augmented_nodes) == N + N_add, exactly N_add rows tagged :added, no self-loops, no respondent–respondent edges introduced by Stage 1, seed reproducibility 
+(two calls with seed=42 produce bit-identical replicates), and mean realized τ_b across the 20 seeds matches setup.rho within tolerance. These tests catch any 
+composition bug that the helper unit tests in isolation would not — most importantly, mis-ordering of the stage dispatch and mis-tagging of nodes that feeds into 
+the realized-rho mask. Tests 31–34 are the Replicate Generation analogs of Tests 19–21: the same four networks (Moreno, Scotland K=4, Scotland K=10, Marvel), the same 
+three cells, the same R=20. The structural difference from the Setup calibration is that Prior 2 is now measured on each replicate's actual realized 
+Kendall τ_b — computed across the augmented_nodes' added-indicator vs. degree_bin — rather than on bin-distribution samples in isolation. 
+If a bug in _draw_bin_assignments mis-samples q, or if _build_augmented_nodes puts the wrong nodes into the realized-rho mask, or if any stage helper accidentally 
+drops or duplicates added rows, the calibration here will catch it where the setup calibration would not. The wall-clock budget mirrors the 
+Setup calibration (Marvel stays the long pole at roughly 30 minutes), with the new R=20 generate_replicate calls adding a few minutes per network — under 5 minutes 
+total additional cost across the four networks. The integration tier is where the framework is held accountable to the same algorithmic contract on the realized cake 
+that the calibration tier already held accountable on the recipe.
+"""
+
 ################
 #   PACKAGES   #
 ################
 
 using DataFrames
+using Distributions
 using Printf
 using Random
 using Statistics
@@ -31,7 +85,14 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
                                                          _determine_n_add,
                                                          _realized_rho_for_beta,
                                                          _solve_bin_distribution,
-                                                         _compute_ei_conditional
+                                                         _compute_ei_conditional,
+														 _draw_bin_assignments,
+														 _build_augmented_nodes,
+														 _stage_0_5_directed,
+														 _stage_0_5_undirected,
+														 _stage_1_directed,
+														 _stage_1_undirected,
+														 _stage_2!
 
 #################
 #   FUNCTIONS   #
@@ -1233,9 +1294,9 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 		return nothing
 	end
 
-######################
-#   FUNCTION TESTS   #
-######################
+###################
+#   SETUP TESTS   #
+###################
 
 #	Test 1: _compute_observed_centrality on directed star fixture
 	function test_compute_centrality_star()
@@ -3755,9 +3816,9 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 	end
 	run_tests_through_18()
 
-######################
-#   BEHAVIOR TESTS   #
-######################
+##################################
+#   BEHAVIOR CALIBRATION TESTS   #
+##################################
 
 #	Test 19: Moreno algorithmic-contract calibration
 	function test_calibration_moreno()
@@ -4160,4 +4221,820 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 	end
 	test_calibration_marvel()
 
+############################
+#   REPLICATE UNIT TESTS   #
+############################
 
+#	Test 22: _draw_bin_assignments unit checks
+	function test_draw_bin_assignments()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Verifies four contracts of _draw_bin_assignments:
+			(a) N_add == 0 returns empty vectors.
+			(b) Empirical degree-bin histogram matches q (max abs deviation
+			    < 0.01 at N_draw = 10,000).
+			(c) :degree_only binning_mode returns all-ones ei_bins (matches
+			    the framework's singleton-J convention: setup.ei_bins == 1
+			    for all observed nodes when J = 1).
+			(d) Empirical E/I-bin marginal conditional on degree matches the
+			    corresponding row of ei_conditional (max abs deviation < 0.02
+			    at N_draw = 10,000).
+		"""
+		println("─" ^ 70)
+		println("Test 22: _draw_bin_assignments unit checks")
+		println("─" ^ 70)
+
+		#	Construct Reference Inputs
+			q_ref = [0.10, 0.20, 0.30, 0.40]
+			K = 4
+			J = 3
+			ei_conditional_ref = [
+				0.50  0.30  0.20;
+				0.20  0.50  0.30;
+				0.10  0.40  0.50;
+				0.05  0.25  0.70;
+			]
+
+		#	Sub-check (a): N_add == 0 Returns Empty Vectors
+			result_empty = _draw_bin_assignments(q_ref, ei_conditional_ref,
+												  0, :two_dim, Xoshiro(42))
+			check_a = length(result_empty.degree_bins) == 0 &&
+					  length(result_empty.ei_bins) == 0
+			println("  (a) N_add == 0 returns empty vectors: $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): Empirical Degree-Bin Histogram Matches q
+			N_draw = 10_000
+			result_b = _draw_bin_assignments(q_ref, ei_conditional_ref,
+											  N_draw, :two_dim, Xoshiro(43))
+			counts_b = [count(==(k), result_b.degree_bins) for k in 1:K]
+			empirical_b = counts_b ./ N_draw
+			max_dev_b = maximum(abs.(empirical_b .- q_ref))
+			check_b = max_dev_b < 0.01
+			println("  (b) Empirical degree-bin histogram matches q (max dev = $(round(max_dev_b, digits=4))): $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): :degree_only Returns All-Ones ei_bins
+			result_c = _draw_bin_assignments(q_ref, ei_conditional_ref,
+											  100, :degree_only, Xoshiro(44))
+			check_c = all(==(1), result_c.ei_bins)
+			println("  (c) :degree_only returns all-ones ei_bins: $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): Conditional E/I Marginal Matches ei_conditional Row
+			result_d = _draw_bin_assignments(q_ref, ei_conditional_ref,
+											  N_draw, :two_dim, Xoshiro(45))
+			target_row = 2
+			mask = result_d.degree_bins .== target_row
+			n_mask = sum(mask)
+			ei_given_degree = [count(==(e), result_d.ei_bins[mask]) for e in 1:J]
+			empirical_d = ei_given_degree ./ n_mask
+			expected_d = ei_conditional_ref[target_row, :]
+			max_dev_d = maximum(abs.(empirical_d .- expected_d))
+			check_d = max_dev_d < 0.02
+			println("  (d) E/I marginal | degree=$target_row matches row $target_row (max dev = $(round(max_dev_d, digits=4))): $(check_d ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d
+			println()
+			println("  Test 22 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+
+#	Test 23: _build_augmented_nodes unit checks
+	function test_build_augmented_nodes()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Verifies four contracts of _build_augmented_nodes:
+			(a) nrow(augmented_nodes) == N + N_add.
+			(b) Added rows have ids exactly N+1..N+N_add (string-typed to
+			    match setup.nodes.id).
+			(c) :node_type partitions correctly into :observed, :nominated,
+			    and :added with the expected counts.
+			(d) N_add == 0 still produces a valid output with :node_type
+			    column added but no added rows.
+		"""
+		println("─" ^ 70)
+		println("Test 23: _build_augmented_nodes unit checks")
+		println("─" ^ 70)
+
+		#	Construct Small Fixture and Setup with Nominated
+			nodes = DataFrame(id = string.(1:12))
+			edges = DataFrame(
+				src = string.([1,1,1,2,2,3,3,4,5,6,7,8,9,10,11,12]),
+				dst = string.([2,3,4,3,5,4,6,7,6,8,9,10,11,12,1,2]),
+				weight = ones(Int, 16),
+			)
+			community_labels = ones(Int, 12)
+			setup = compute_setup(edges, nodes, community_labels;
+								   directed = true, weighted = true,
+								   pi_node = 0.20, rho = 0.10,
+								   partially_observed_nodes = ["5", "6"],
+								   K = 4)
+
+		#	Construct Added Bin Assignments
+			added_degree_bins = ones(Int, setup.N_add) .* 2
+			added_ei_bins = ones(Int, setup.N_add)
+
+		#	Build Augmented Nodes
+			out = _build_augmented_nodes(setup, added_degree_bins, added_ei_bins)
+
+		#	Sub-check (a): Row Count Matches N + N_add
+			N = nrow(setup.nodes)
+			check_a = nrow(out) == N + setup.N_add
+			println("  (a) nrow(out) == N + N_add ($(nrow(out)) == $(N) + $(setup.N_add)): $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): Added IDs Are Exactly N+1..N+N_add
+			added_mask = out.node_type .== :added
+			added_ids = sort(out.id[added_mask])
+			expected_ids = sort(string.((N + 1):(N + setup.N_add)))
+			check_b = added_ids == expected_ids
+			println("  (b) Added ids == string.(N+1..N+N_add): $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): node_type Partition Counts Match Expectation
+			n_observed = count(==(:observed), out.node_type)
+			n_nominated = count(==(:nominated), out.node_type)
+			n_added = count(==(:added), out.node_type)
+			check_c = n_observed == (N - length(setup.partially_observed)) &&
+					  n_nominated == length(setup.partially_observed) &&
+					  n_added == setup.N_add
+			println("  (c) node_type partition (obs=$n_observed, nom=$n_nominated, add=$n_added): $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): N_add == 0 Case
+			setup_zero = compute_setup(edges, nodes, community_labels;
+										directed = true, weighted = true,
+										pi_node = 0.0, rho = 0.0,
+										K = 4)
+			out_zero = _build_augmented_nodes(setup_zero, Int[], Int[])
+			check_d = nrow(out_zero) == N &&
+					  hasproperty(out_zero, :node_type) &&
+					  count(==(:added), out_zero.node_type) == 0
+			println("  (d) N_add == 0 case (nrow = $(nrow(out_zero)), :added count = 0): $(check_d ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d
+			println()
+			println("  Test 23 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+
+#	Test 24: _stage_0_5_directed unit checks
+	function test_stage_0_5_directed()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Verifies four contracts of _stage_0_5_directed:
+			(a) Throws ArgumentError when called on an undirected setup.
+			(b) Throws ArgumentError when setup.partially_observed is empty.
+			(c) Every output edge has at least one endpoint in the nominated set.
+			(d) No self-loops in the returned DataFrame.
+		"""
+		println("─" ^ 70)
+		println("Test 24: _stage_0_5_directed unit checks")
+		println("─" ^ 70)
+
+		#	Construct Directed Fixture with Nominated Nodes
+			nodes = DataFrame(id = string.(1:12))
+			edges = DataFrame(
+				src = string.([1,1,1,2,2,3,3,4,5,6,7,8,9,10,11,12]),
+				dst = string.([2,3,4,3,5,4,6,7,6,8,9,10,11,12,1,2]),
+				weight = ones(Int, 16),
+			)
+			community_labels = ones(Int, 12)
+			setup_dir = compute_setup(edges, nodes, community_labels;
+									   directed = true, weighted = true,
+									   pi_node = 0.10, rho = 0.10,
+									   partially_observed_nodes = ["5", "6"],
+									   K = 4)
+			added_degree_bins = ones(Int, setup_dir.N_add) .* 2
+			added_ei_bins = ones(Int, setup_dir.N_add)
+			augmented_nodes = _build_augmented_nodes(setup_dir,
+													  added_degree_bins,
+													  added_ei_bins)
+
+		#	Sub-check (a): Throws on Undirected Setup
+			setup_undir = compute_setup(edges, nodes, community_labels;
+										 directed = false, weighted = true,
+										 pi_node = 0.10, rho = 0.10,
+										 partially_observed_nodes = ["5", "6"],
+										 K = 4)
+			aug_nodes_undir = _build_augmented_nodes(setup_undir,
+													  ones(Int, setup_undir.N_add) .* 2,
+													  ones(Int, setup_undir.N_add))
+			check_a = false
+			try
+				_stage_0_5_directed(setup_undir, aug_nodes_undir, Xoshiro(42))
+			catch e
+				check_a = isa(e, ArgumentError)
+			end
+			println("  (a) Throws ArgumentError on undirected setup: $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): Throws on Empty partially_observed
+			setup_empty_nom = compute_setup(edges, nodes, community_labels;
+											 directed = true, weighted = true,
+											 pi_node = 0.10, rho = 0.10,
+											 K = 4)
+			aug_nodes_empty = _build_augmented_nodes(setup_empty_nom,
+													  ones(Int, setup_empty_nom.N_add) .* 2,
+													  ones(Int, setup_empty_nom.N_add))
+			check_b = false
+			try
+				_stage_0_5_directed(setup_empty_nom, aug_nodes_empty, Xoshiro(42))
+			catch e
+				check_b = isa(e, ArgumentError)
+			end
+			println("  (b) Throws ArgumentError on empty partially_observed: $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): Output Respects No-Respondent-Respondent Contract
+			result = _stage_0_5_directed(setup_dir, augmented_nodes, Xoshiro(42))
+			nominated_ids = Set(setup_dir.partially_observed)
+			check_c = all(row.src in nominated_ids || row.dst in nominated_ids
+						   for row in eachrow(result))
+			println("  (c) Every edge involves a nominated node (n_edges = $(nrow(result))): $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): No Self-Loops
+			check_d = all(row.src != row.dst for row in eachrow(result))
+			println("  (d) No self-loops: $(check_d ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d
+			println()
+			println("  Test 24 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+
+#	Test 25: _stage_0_5_undirected unit checks
+	function test_stage_0_5_undirected()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Verifies four contracts of _stage_0_5_undirected:
+			(a) Throws ArgumentError when called on a directed setup.
+			(b) Throws ArgumentError when setup.partially_observed is empty.
+			(c) Every output edge has both endpoints in the nominated set.
+			(d) Every output edge has src < dst (canonical undirected form).
+		"""
+		println("─" ^ 70)
+		println("Test 25: _stage_0_5_undirected unit checks")
+		println("─" ^ 70)
+
+		#	Construct Undirected Fixture with Nominated Nodes
+			nodes = DataFrame(id = string.(1:12))
+			edges = DataFrame(
+				src = string.([1,1,2,3,4,5,6,7,8,9,10,11, 1,3,5]),
+				dst = string.([2,3,3,4,5,6,7,8,9,10,11,12, 4,5,8]),
+				weight = ones(Int, 15),
+			)
+			community_labels = ones(Int, 12)
+			setup_undir = compute_setup(edges, nodes, community_labels;
+										 directed = false, weighted = true,
+										 pi_node = 0.10, rho = 0.10,
+										 partially_observed_nodes = ["5", "6", "7"],
+										 K = 4)
+			added_degree_bins = ones(Int, setup_undir.N_add) .* 2
+			added_ei_bins = ones(Int, setup_undir.N_add)
+			augmented_nodes = _build_augmented_nodes(setup_undir,
+													  added_degree_bins,
+													  added_ei_bins)
+
+		#	Sub-check (a): Throws on Directed Setup
+			setup_dir = compute_setup(edges, nodes, community_labels;
+									   directed = true, weighted = true,
+									   pi_node = 0.10, rho = 0.10,
+									   partially_observed_nodes = ["5", "6", "7"],
+									   K = 4)
+			aug_nodes_dir = _build_augmented_nodes(setup_dir,
+													ones(Int, setup_dir.N_add) .* 2,
+													ones(Int, setup_dir.N_add))
+			check_a = false
+			try
+				_stage_0_5_undirected(setup_dir, aug_nodes_dir, Xoshiro(42))
+			catch e
+				check_a = isa(e, ArgumentError)
+			end
+			println("  (a) Throws ArgumentError on directed setup: $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): Throws on Empty partially_observed
+			setup_empty_nom = compute_setup(edges, nodes, community_labels;
+											 directed = false, weighted = true,
+											 pi_node = 0.10, rho = 0.10,
+											 K = 4)
+			aug_nodes_empty = _build_augmented_nodes(setup_empty_nom,
+													  ones(Int, setup_empty_nom.N_add) .* 2,
+													  ones(Int, setup_empty_nom.N_add))
+			check_b = false
+			try
+				_stage_0_5_undirected(setup_empty_nom, aug_nodes_empty, Xoshiro(42))
+			catch e
+				check_b = isa(e, ArgumentError)
+			end
+			println("  (b) Throws ArgumentError on empty partially_observed: $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): All Output Edges Have Both Endpoints Nominated
+			result = _stage_0_5_undirected(setup_undir, augmented_nodes, Xoshiro(42))
+			nominated_ids = Set(setup_undir.partially_observed)
+			check_c = all(row.src in nominated_ids && row.dst in nominated_ids
+						   for row in eachrow(result))
+			println("  (c) Every edge has both endpoints nominated (n_edges = $(nrow(result))): $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): Output Edges Stored with src < dst
+			check_d = all(row.src < row.dst for row in eachrow(result))
+			println("  (d) Every edge has src < dst: $(check_d ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d
+			println()
+			println("  Test 25 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+
+#	Test 26: _stage_1_directed unit checks
+	function test_stage_1_directed()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Verifies five contracts of _stage_1_directed:
+			(a) Throws ArgumentError when called on an undirected setup.
+			(b) No self-loops in the returned DataFrame.
+			(c) No edges between two :observed nodes.
+			(d) All-zeros P returns an empty DataFrame.
+			(e) All-ones P returns exactly the upper-bound edge count.
+		"""
+		println("─" ^ 70)
+		println("Test 26: _stage_1_directed unit checks")
+		println("─" ^ 70)
+
+		#	Construct Directed Fixture
+			nodes = DataFrame(id = string.(1:12))
+			edges = DataFrame(
+				src = string.([1,1,1,2,2,3,3,4,5,6,7,8,9,10,11,12]),
+				dst = string.([2,3,4,3,5,4,6,7,6,8,9,10,11,12,1,2]),
+				weight = ones(Int, 16),
+			)
+			community_labels = ones(Int, 12)
+			setup = compute_setup(edges, nodes, community_labels;
+								   directed = true, weighted = true,
+								   pi_node = 0.20, rho = 0.10,
+								   K = 4)
+			added_degree_bins = ones(Int, setup.N_add) .* 2
+			added_ei_bins = ones(Int, setup.N_add)
+			augmented_nodes = _build_augmented_nodes(setup,
+													  added_degree_bins,
+													  added_ei_bins)
+
+		#	Sub-check (a): Throws on Undirected Setup
+			setup_undir = compute_setup(edges, nodes, community_labels;
+										 directed = false, weighted = true,
+										 pi_node = 0.20, rho = 0.10, K = 4)
+			aug_nodes_undir = _build_augmented_nodes(setup_undir,
+													  ones(Int, setup_undir.N_add) .* 2,
+													  ones(Int, setup_undir.N_add))
+			check_a = false
+			try
+				_stage_1_directed(setup_undir, aug_nodes_undir, Xoshiro(42))
+			catch e
+				check_a = isa(e, ArgumentError)
+			end
+			println("  (a) Throws ArgumentError on undirected setup: $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): No Self-Loops
+			result = _stage_1_directed(setup, augmented_nodes, Xoshiro(42))
+			check_b = all(row.src != row.dst for row in eachrow(result))
+			println("  (b) No self-loops (n_edges = $(nrow(result))): $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): No Respondent-Respondent Edges
+			observed_ids = Set(augmented_nodes.id[augmented_nodes.node_type .== :observed])
+			check_c = all(!(row.src in observed_ids && row.dst in observed_ids)
+						   for row in eachrow(result))
+			println("  (c) No edges between two :observed nodes: $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): All-Zeros P Returns Empty
+			P_save = copy(setup.P)
+			setup.P .= 0.0
+			result_zero = _stage_1_directed(setup, augmented_nodes, Xoshiro(42))
+			check_d = nrow(result_zero) == 0
+			setup.P .= P_save
+			println("  (d) All-zeros P returns empty DataFrame (n = $(nrow(result_zero))): $(check_d ? "PASS" : "FAIL")")
+
+		#	Sub-check (e): All-Ones P Returns Upper-Bound Edge Count
+			setup.P .= 1.0
+			result_full = _stage_1_directed(setup, augmented_nodes, Xoshiro(42))
+			n_added = setup.N_add
+			n_non_added = nrow(augmented_nodes) - n_added
+			expected_upper = 2 * n_added * n_non_added + n_added * (n_added - 1)
+			check_e = nrow(result_full) == expected_upper
+			setup.P .= P_save
+			println("  (e) All-ones P fills upper bound (n = $(nrow(result_full)), expected = $expected_upper): $(check_e ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d && check_e
+			println()
+			println("  Test 26 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+
+#	Test 27: _stage_1_undirected unit checks
+	function test_stage_1_undirected()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Verifies five contracts of _stage_1_undirected:
+			(a) Throws ArgumentError when called on a directed setup.
+			(b) No self-loops in the returned DataFrame.
+			(c) Every output edge has src < dst.
+			(d) All-zeros P returns an empty DataFrame.
+			(e) All-ones P returns exactly the upper-bound edge count
+			    (= n_added * n_non_added + n_added * (n_added - 1) / 2).
+		"""
+		println("─" ^ 70)
+		println("Test 27: _stage_1_undirected unit checks")
+		println("─" ^ 70)
+
+		#	Construct Undirected Fixture
+			nodes = DataFrame(id = string.(1:12))
+			edges = DataFrame(
+				src = string.([1,1,2,3,4,5,6,7,8,9,10,11, 1,3,5]),
+				dst = string.([2,3,3,4,5,6,7,8,9,10,11,12, 4,5,8]),
+				weight = ones(Int, 15),
+			)
+			community_labels = ones(Int, 12)
+			setup = compute_setup(edges, nodes, community_labels;
+								   directed = false, weighted = true,
+								   pi_node = 0.20, rho = 0.10,
+								   K = 4)
+			added_degree_bins = ones(Int, setup.N_add) .* 2
+			added_ei_bins = ones(Int, setup.N_add)
+			augmented_nodes = _build_augmented_nodes(setup,
+													  added_degree_bins,
+													  added_ei_bins)
+
+		#	Sub-check (a): Throws on Directed Setup
+			setup_dir = compute_setup(edges, nodes, community_labels;
+									   directed = true, weighted = true,
+									   pi_node = 0.20, rho = 0.10, K = 4)
+			aug_nodes_dir = _build_augmented_nodes(setup_dir,
+													ones(Int, setup_dir.N_add) .* 2,
+													ones(Int, setup_dir.N_add))
+			check_a = false
+			try
+				_stage_1_undirected(setup_dir, aug_nodes_dir, Xoshiro(42))
+			catch e
+				check_a = isa(e, ArgumentError)
+			end
+			println("  (a) Throws ArgumentError on directed setup: $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): No Self-Loops
+			result = _stage_1_undirected(setup, augmented_nodes, Xoshiro(42))
+			check_b = all(row.src != row.dst for row in eachrow(result))
+			println("  (b) No self-loops (n_edges = $(nrow(result))): $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): src < dst Enforced
+			check_c = all(row.src < row.dst for row in eachrow(result))
+			println("  (c) Every edge has src < dst: $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): All-Zeros P Returns Empty
+			P_save = copy(setup.P)
+			setup.P .= 0.0
+			result_zero = _stage_1_undirected(setup, augmented_nodes, Xoshiro(42))
+			check_d = nrow(result_zero) == 0
+			setup.P .= P_save
+			println("  (d) All-zeros P returns empty DataFrame (n = $(nrow(result_zero))): $(check_d ? "PASS" : "FAIL")")
+
+		#	Sub-check (e): All-Ones P Fills Upper Bound
+			setup.P .= 1.0
+			result_full = _stage_1_undirected(setup, augmented_nodes, Xoshiro(42))
+			n_added = setup.N_add
+			n_non_added = nrow(augmented_nodes) - n_added
+			expected_upper = n_added * n_non_added + n_added * (n_added - 1) ÷ 2
+			check_e = nrow(result_full) == expected_upper
+			setup.P .= P_save
+			println("  (e) All-ones P fills upper bound (n = $(nrow(result_full)), expected = $expected_upper): $(check_e ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d && check_e
+			println()
+			println("  Test 27 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+
+#	Test 28: _stage_2! unit checks
+	function test_stage_2_bang()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Verifies four contracts of _stage_2!:
+			(a) Throws ArgumentError when pi_edge == 0.
+			(b) Throws ArgumentError when weighted == false.
+			(c) For known W_aug and pi_edge, returned W_add equals
+			    round(pi_edge * W_aug / (1 - pi_edge)).
+			(d) After the call, sum(augmented_edges.weight) equals
+			    W_aug + W_add exactly (weight conservation).
+		"""
+		println("─" ^ 70)
+		println("Test 28: _stage_2! unit checks")
+		println("─" ^ 70)
+
+		#	Construct Weighted Fixture and Setup with pi_edge > 0
+			nodes = DataFrame(id = string.(1:12))
+			edges = DataFrame(
+				src = string.([1,1,1,2,2,3,3,4,5,6,7,8,9,10,11,12]),
+				dst = string.([2,3,4,3,5,4,6,7,6,8,9,10,11,12,1,2]),
+				weight = [3,2,1,2,4,1,3,2,1,1,2,3,1,2,1,1],
+			)
+			community_labels = ones(Int, 12)
+			setup = compute_setup(edges, nodes, community_labels;
+								   directed = true, weighted = true,
+								   pi_node = 0.10, pi_edge = 0.20,
+								   rho = 0.10, K = 4)
+
+		#	Sub-check (a): Throws on pi_edge == 0
+			setup_no_pi_edge = compute_setup(edges, nodes, community_labels;
+											  directed = true, weighted = true,
+											  pi_node = 0.10, pi_edge = 0.0,
+											  rho = 0.10, K = 4)
+			augmented_edges_a = copy(edges)
+			check_a = false
+			try
+				_stage_2!(setup_no_pi_edge, augmented_edges_a, Xoshiro(42))
+			catch e
+				check_a = isa(e, ArgumentError)
+			end
+			println("  (a) Throws ArgumentError on pi_edge == 0: $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): Throws on Unweighted Setup
+			edges_unw = DataFrame(src = edges.src, dst = edges.dst,
+								   weight = ones(Int, nrow(edges)))
+			setup_unw = compute_setup(edges_unw, nodes, community_labels;
+									   directed = true, weighted = false,
+									   pi_node = 0.10, pi_edge = 0.20,
+									   rho = 0.10, K = 4)
+			augmented_edges_b = copy(edges_unw)
+			check_b = false
+			try
+				_stage_2!(setup_unw, augmented_edges_b, Xoshiro(42))
+			catch e
+				check_b = isa(e, ArgumentError)
+			end
+			println("  (b) Throws ArgumentError on weighted == false: $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): W_add Matches Arithmetic
+			augmented_edges = copy(edges)
+			W_aug = sum(augmented_edges.weight)
+			expected_W_add = round(Int, setup.pi_edge * W_aug / (1 - setup.pi_edge))
+			W_add = _stage_2!(setup, augmented_edges, Xoshiro(42))
+			check_c = W_add == expected_W_add
+			println("  (c) W_add == round(pi_edge * W_aug / (1 - pi_edge)) ($W_add == $expected_W_add): $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): Weight Conservation
+			W_final = sum(augmented_edges.weight)
+			check_d = W_final == W_aug + W_add
+			println("  (d) sum(weight) after call == W_aug + W_add ($W_final == $(W_aug + W_add)): $(check_d ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d
+			println()
+			println("  Test 28 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+	test_stage_2_bang()
+
+###################################
+#   REPLICATE CALIBRATION TESTS   #
+###################################
+
+#	Test 29: generate_replicate integration on directed fixture
+	function test_generate_replicate_directed()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Integration test for generate_replicate on a deterministic
+			directed fixture (N=50, single community, varied out-degree).
+			Verifies that the full pipeline composes correctly across R=100
+			seeds. Sub-checks:
+			(a) Every replicate: nrow(augmented_nodes) == N + N_add.
+			(b) Every replicate: exactly N_add rows have node_type == :added.
+			(c) Seed reproducibility: two calls with seed=42 produce bit-
+			    identical augmented_edges and augmented_nodes.
+			(d) Mean realized_rho across 100 seeds matches setup.rho within
+			    tolerance 0.04. R=100 is used (rather than the R=20 Phase-2
+			    Setup convention) because the small fixture has higher
+			    per-replicate variance than the corpus networks.
+			(e) Pure-pass case (pi_node=0, pi_edge=0, no nominated): the
+			    augmented_edges matches setup.edges and augmented_nodes
+			    has N :observed rows with no :added.
+		"""
+		println("─" ^ 70)
+		println("Test 29: generate_replicate integration on directed fixture")
+		println("─" ^ 70)
+
+		#	Construct Deterministic Directed Fixture (N=50)
+			N = 50
+			nodes = DataFrame(id = string.(1:N))
+			src_int = Int[]
+			dst_int = Int[]
+			for v in 1:N
+				n_out = 2 + (v % 5)
+				for offset in 1:n_out
+					u = 1 + (v - 1 + offset) % N
+					push!(src_int, v)
+					push!(dst_int, u)
+				end
+			end
+			edges = DataFrame(
+				src = string.(src_int),
+				dst = string.(dst_int),
+				weight = ones(Int, length(src_int)),
+			)
+			community_labels = ones(Int, N)
+			println("  Fixture: N = $N, n_edges = $(nrow(edges)), directed, single community")
+
+		#	Construct Setup and Generate R=100 Replicates
+			setup = compute_setup(edges, nodes, community_labels;
+								   directed = true, weighted = true,
+								   pi_node = 0.20, pi_edge = 0.0,
+								   rho = 0.10, K = 4)
+			R = 100
+			reps = [generate_replicate(setup, seed) for seed in 1:R]
+			println("  Setup: N_add = $(setup.N_add), beta_status = $(setup.beta_status)")
+			println("  Generated R = $R replicates")
+			println()
+
+		#	Sub-check (a): Row Count Matches N + N_add
+			expected_nrow = N + setup.N_add
+			check_a = all(nrow(r.augmented_nodes) == expected_nrow for r in reps)
+			println("  (a) All $R replicates have nrow(augmented_nodes) == $expected_nrow: $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): :added Row Count Matches N_add
+			check_b = all(count(==(:added), r.augmented_nodes.node_type) == setup.N_add for r in reps)
+			println("  (b) All $R replicates have exactly $(setup.N_add) :added rows: $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): Seed Reproducibility
+			rep_42a = generate_replicate(setup, 42)
+			rep_42b = generate_replicate(setup, 42)
+			check_c = isequal(rep_42a.augmented_edges, rep_42b.augmented_edges) &&
+					  isequal(rep_42a.augmented_nodes, rep_42b.augmented_nodes)
+			println("  (c) Seed=42 produces bit-identical output on two calls: $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): Mean Realized rho Matches setup.rho
+			rhos = [r.diag[:realized_rho] for r in reps]
+			mean_rho = mean(rhos)
+			dev_d = abs(mean_rho - setup.rho)
+			tolerance_d = 0.04
+			check_d = dev_d < tolerance_d
+			println("  (d) Mean realized_rho matches setup.rho (mean = $(round(mean_rho, digits=4)), target = $(round(setup.rho, digits=4)), dev = $(round(dev_d, digits=4)), tol = $tolerance_d): $(check_d ? "PASS" : "FAIL")")
+
+		#	Sub-check (e): Pure-Pass Case (no added, no nominated, no edge inflation)
+			setup_pure = compute_setup(edges, nodes, community_labels;
+										directed = true, weighted = true,
+										pi_node = 0.0, pi_edge = 0.0,
+										rho = 0.0, K = 4)
+			rep_pure = generate_replicate(setup_pure, 99)
+			check_e = nrow(rep_pure.augmented_edges) == nrow(edges) &&
+					  nrow(rep_pure.augmented_nodes) == N &&
+					  all(rep_pure.augmented_nodes.node_type .== :observed) &&
+					  count(==(:added), rep_pure.augmented_nodes.node_type) == 0
+			println("  (e) Pure-pass case (pi_node = 0, pi_edge = 0): $(check_e ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d && check_e
+			println()
+			println("  Test 29 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+	test_generate_replicate_directed()
+
+#	Test 30: generate_replicate integration on undirected fixture
+	function test_generate_replicate_undirected()
+		"""
+		Args: none
+		Returns:
+			Bool: true if all sub-checks pass
+		Notes:
+			Integration test for generate_replicate on a deterministic
+			undirected fixture (N=50, single community, varied degree).
+			Sub-checks (a) through (e) mirror Test 29; sub-check (f) adds
+			verification of the undirected canonical-form contract
+			(src < dst, by lexicographic string comparison) across all
+			augmented_edges in all R=100 replicates.
+
+			The fixture uses n_out = 2 + (v % 5), matching the directed
+			cycle pattern from Test 29. This produces 4-5 distinct
+			centrality values, populating all K=4 bins. With narrower
+			variation (e.g., n_out = 2 + (v % 4) → centrality range 6-8
+			only) the framework's bins end up degenerate (bins 1 and 3
+			empty), and the realized_rho diagnostic — which uses bin
+			INDEX rather than centrality directly — becomes uninformative
+			because added nodes sampled into the empty middle bins
+			generate spurious discordant pairs.
+		"""
+		println("─" ^ 70)
+		println("Test 30: generate_replicate integration on undirected fixture")
+		println("─" ^ 70)
+
+		#	Construct Deterministic Undirected Fixture (N=50)
+			N = 50
+			nodes = DataFrame(id = string.(1:N))
+			edge_pairs = Set{Tuple{String, String}}()
+			for v in 1:N
+				v_str = string(v)
+				n_out = 2 + (v % 5)
+				for offset in 1:n_out
+					u = 1 + (v - 1 + offset) % N
+					if u != v
+						u_str = string(u)
+						a, b = v_str < u_str ? (v_str, u_str) : (u_str, v_str)
+						push!(edge_pairs, (a, b))
+					end
+				end
+			end
+			edge_list = sort(collect(edge_pairs))
+			edges = DataFrame(
+				src = [p[1] for p in edge_list],
+				dst = [p[2] for p in edge_list],
+				weight = ones(Int, length(edge_list)),
+			)
+			community_labels = ones(Int, N)
+			println("  Fixture: N = $N, n_edges = $(nrow(edges)), undirected, single community")
+
+		#	Construct Setup and Generate R=100 Replicates
+			setup = compute_setup(edges, nodes, community_labels;
+								   directed = false, weighted = true,
+								   pi_node = 0.20, pi_edge = 0.0,
+								   rho = 0.10, K = 4)
+			R = 100
+			reps = [generate_replicate(setup, seed) for seed in 1:R]
+			println("  Setup: N_add = $(setup.N_add), beta_status = $(setup.beta_status)")
+			println("  Generated R = $R replicates")
+			println()
+
+		#	Sub-check (a): Row Count Matches N + N_add
+			expected_nrow = N + setup.N_add
+			check_a = all(nrow(r.augmented_nodes) == expected_nrow for r in reps)
+			println("  (a) All $R replicates have nrow(augmented_nodes) == $expected_nrow: $(check_a ? "PASS" : "FAIL")")
+
+		#	Sub-check (b): :added Row Count Matches N_add
+			check_b = all(count(==(:added), r.augmented_nodes.node_type) == setup.N_add for r in reps)
+			println("  (b) All $R replicates have exactly $(setup.N_add) :added rows: $(check_b ? "PASS" : "FAIL")")
+
+		#	Sub-check (c): Seed Reproducibility
+			rep_42a = generate_replicate(setup, 42)
+			rep_42b = generate_replicate(setup, 42)
+			check_c = isequal(rep_42a.augmented_edges, rep_42b.augmented_edges) &&
+					  isequal(rep_42a.augmented_nodes, rep_42b.augmented_nodes)
+			println("  (c) Seed=42 produces bit-identical output on two calls: $(check_c ? "PASS" : "FAIL")")
+
+		#	Sub-check (d): Mean Realized rho Matches setup.rho
+			rhos = [r.diag[:realized_rho] for r in reps]
+			mean_rho = mean(rhos)
+			dev_d = abs(mean_rho - setup.rho)
+			tolerance_d = 0.04
+			check_d = dev_d < tolerance_d
+			println("  (d) Mean realized_rho matches setup.rho (mean = $(round(mean_rho, digits=4)), target = $(round(setup.rho, digits=4)), dev = $(round(dev_d, digits=4)), tol = $tolerance_d): $(check_d ? "PASS" : "FAIL")")
+
+		#	Sub-check (e): Pure-Pass Case
+			setup_pure = compute_setup(edges, nodes, community_labels;
+										directed = false, weighted = true,
+										pi_node = 0.0, pi_edge = 0.0,
+										rho = 0.0, K = 4)
+			rep_pure = generate_replicate(setup_pure, 99)
+			check_e = nrow(rep_pure.augmented_edges) == nrow(edges) &&
+					  nrow(rep_pure.augmented_nodes) == N &&
+					  all(rep_pure.augmented_nodes.node_type .== :observed) &&
+					  count(==(:added), rep_pure.augmented_nodes.node_type) == 0
+			println("  (e) Pure-pass case (pi_node = 0, pi_edge = 0): $(check_e ? "PASS" : "FAIL")")
+
+		#	Sub-check (f): All Edges in augmented_edges Have src < dst
+			check_f = all(all(row.src < row.dst for row in eachrow(r.augmented_edges)) for r in reps)
+			println("  (f) All edges across all $R replicates have src < dst (lexicographic): $(check_f ? "PASS" : "FAIL")")
+
+		#	Aggregate
+			all_pass = check_a && check_b && check_c && check_d && check_e && check_f
+			println()
+			println("  Test 30 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+			return all_pass
+	end
+	test_generate_replicate_undirected()

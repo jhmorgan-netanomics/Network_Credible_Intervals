@@ -79,6 +79,8 @@ module Network_Credible_Intervals
            SamplerSetup,
 		   build_community_corpus,
 		   compute_setup,
-           feasible_rho_range
+           feasible_rho_range,
+           Replicate,
+           generate_replicate
 
 end # module Network_Credible_Intervals

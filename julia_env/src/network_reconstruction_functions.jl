@@ -2,6 +2,7 @@ module network_reconstruction
 
 #	Module Packages
 	using DataFrames
+    using Distributions
 	using SparseArrays
 	using LinearAlgebra
 	using Random
@@ -2335,7 +2336,7 @@ module network_reconstruction
 #     SECTION 5: REPLICATE GENERATION HELPERS     # 
 ###################################################
 
-#	Helper Function for generate_replicate: draw degree and E/I bin assignments for added nodes
+#	Helper Function for generate_replicate: draw degree- and E/I-bin assignments for added nodes
 	function _draw_bin_assignments(q::Vector{Float64},
 									ei_conditional::Matrix{Float64},
 									N_add::Int,
@@ -2343,55 +2344,48 @@ module network_reconstruction
 									rng::AbstractRNG)
 		"""
 		Args:
-			q::Vector{Float64}: degree-bin distribution from Step 5, length K
-			ei_conditional::Matrix{Float64}: P(EI bin | degree bin) from setup,
-				K x J_effective. Rows uniform where the degree bin is empty in
-				G_obs (Three-Prior contract).
-			N_add::Int: number of added nodes to assign
-			binning_mode::Symbol: :two_dim or :degree_only
+			q::Vector{Float64}: K-element distribution over degree bins
+			ei_conditional::Matrix{Float64}: K x J conditional E/I-given-degree distribution
+			N_add::Int: number of added-node bin assignments to draw
+			binning_mode::Symbol: :degree_only (singleton J) or :two_dim
 			rng::AbstractRNG: random source
 		Returns:
-			NamedTuple with fields:
-				degree_bins::Vector{Int}, length N_add, values in 1:K
-				ei_bins::Vector{Int}, length N_add. In :two_dim mode, values
-					in 1:J_effective. In :degree_only mode, all entries are 0.
+			NamedTuple (degree_bins::Vector{Int}, ei_bins::Vector{Int}), each
+			of length N_add.
 		Notes:
-			- Returns empty vectors when N_add == 0.
-			- Outputs are pre-allocated at N_add length; no push! during fill.
+			- N_add == 0 returns empty vectors via fast-path.
+			- :degree_only returns ei_bins = ones(Int, N_add) to match the
+			  framework's singleton-J convention: when J = 1, setup.ei_bins
+			  takes value 1 (the only valid index into the J dimension of
+			  P, R, and w), not 0. Returning zeros would produce
+			  BoundsError downstream when stage helpers index into P.
+			- :two_dim draws ei_bin[i] ~ Categorical(ei_conditional[degree_bins[i], :])
+			  for each i, conditional on the freshly-drawn degree bin.
 		"""
 
-		#	Guards
-			N_add >= 0 ||
-				throw(ArgumentError("N_add must be >= 0, got $N_add"))
-			binning_mode in (:two_dim, :degree_only) ||
-				throw(ArgumentError("binning_mode must be :two_dim or :degree_only, got $binning_mode"))
-			abs(sum(q) - 1.0) < 1e-9 ||
-				throw(ArgumentError("q must sum to 1, got $(sum(q))"))
-
-		#	Handle N_add == 0 Fast-Path
+		#	N_add == 0 Fast-Path
 			if N_add == 0
 				return (degree_bins = Int[], ei_bins = Int[])
 			end
 
-		#	Pre-Allocate Output Vectors
-			degree_bins = Vector{Int}(undef, N_add)
-			ei_bins = Vector{Int}(undef, N_add)
-
-		#	Draw Degree Bins from q
+		#	Draw Degree Bins from Categorical(q)
 			degree_dist = Categorical(q)
+			degree_bins = Vector{Int}(undef, N_add)
 			rand!(rng, degree_dist, degree_bins)
 
-		#	Draw E/I Bins Conditional on Degree (or Zero-Fill for 1D)
-			if binning_mode == :degree_only
-				fill!(ei_bins, 0)
+		#	Draw E/I Bins Conditional on Degree Bins
+			ei_bins = if binning_mode == :degree_only
+				ones(Int, N_add)
 			else
+				out = Vector{Int}(undef, N_add)
 				for i in 1:N_add
-					row = collect(view(ei_conditional, degree_bins[i], :))
-					ei_bins[i] = rand(rng, Categorical(row))
+					row = ei_conditional[degree_bins[i], :]
+					out[i] = rand(rng, Categorical(row))
 				end
+				out
 			end
 
-		#	Assemble Output
+		#	Return as NamedTuple
 			return (degree_bins = degree_bins, ei_bins = ei_bins)
 	end
 
@@ -2402,16 +2396,24 @@ module network_reconstruction
 		"""
 		Args:
 			setup::SamplerSetup: provides setup.nodes, setup.degree_bins,
-				setup.ei_bins, and partially_observed_nodes
+				setup.ei_bins, and setup.partially_observed
 			added_degree_bins::Vector{Int}: length N_add
 			added_ei_bins::Vector{Int}: length N_add
 		Returns:
 			DataFrame: a copy of setup.nodes extended by N_add rows with
-				ids N+1..N+N_add, plus columns :degree_bin, :ei_bin, :node_type.
+				ids N+1..N+N_add (typed to match eltype(setup.nodes.id)),
+				plus columns :degree_bin, :ei_bin, :node_type.
 		Notes:
 			- :node_type is :observed for respondent nodes, :nominated for
-			  nodes in partially_observed_nodes, :added for synthetic rows.
-			- All columns are constructed in single allocations; no push!.
+			  nodes in setup.partially_observed, :added for synthetic rows.
+			- Added-row id type matches the id column type of setup.nodes:
+			  String ids are stringified ("13", "14", ...), integer ids are
+			  appended as integers.
+			- All vector assignments use explicit copy() to break reference
+			  sharing with the input setup. DataFrames' `df[!, col] = vec`
+			  stores vec by reference, so subsequent append!(out, ...) would
+			  mutate setup.degree_bins / setup.ei_bins in place and break
+			  later calls. Hence the copy().
 			- Pure: no RNG required.
 		"""
 
@@ -2424,26 +2426,30 @@ module network_reconstruction
 		#	Construct Observed and Nominated Rows with Bin and Type Labels
 			N = nrow(setup.nodes)
 			out = copy(setup.nodes)
-			out[!, :degree_bin] = setup.degree_bins
-			out[!, :ei_bin] = setup.ei_bins
-			nominated_set = Set(setup.partially_observed_nodes)
+			out[!, :degree_bin] = copy(setup.degree_bins)
+			out[!, :ei_bin] = copy(setup.ei_bins)
+			nominated_set = Set(setup.partially_observed)
 			node_type = Vector{Symbol}(undef, N)
 			for i in 1:N
 				node_type[i] = (out.id[i] in nominated_set) ? :nominated : :observed
 			end
 			out[!, :node_type] = node_type
 
-		#	Construct Added Rows (ids N+1..N+N_add)
+		#	Construct Added Rows (ids N+1..N+N_add, typed to match setup.nodes.id)
 			N_add = setup.N_add
 			if N_add > 0
+				id_type = eltype(out[!, :id])
+				added_ids = id_type == String ?
+					string.((N + 1):(N + N_add)) :
+					collect((N + 1):(N + N_add))
 				added_rows = DataFrame()
 				for col in names(out)
 					if col == "id"
-						added_rows[!, col] = collect((N + 1):(N + N_add))
+						added_rows[!, col] = added_ids
 					elseif col == "degree_bin"
-						added_rows[!, col] = added_degree_bins
+						added_rows[!, col] = copy(added_degree_bins)
 					elseif col == "ei_bin"
-						added_rows[!, col] = added_ei_bins
+						added_rows[!, col] = copy(added_ei_bins)
 					elseif col == "node_type"
 						added_rows[!, col] = fill(:added, N_add)
 					else
@@ -2463,7 +2469,7 @@ module network_reconstruction
 								  rng::AbstractRNG)
 		"""
 		Args:
-			setup::SamplerSetup: must have non-empty partially_observed_nodes,
+			setup::SamplerSetup: must have non-empty setup.partially_observed,
 				directed == true, and a non-nothing R matrix
 			augmented_nodes::DataFrame: includes nominated rows with bin labels
 			rng::AbstractRNG: random source
@@ -2474,17 +2480,19 @@ module network_reconstruction
 			    Bernoulli(R[c_A, c_E]) for E -> A. Weight 1 (unweighted) or
 			    Poisson(w[c_E, c_A]) min 1 (weighted).
 			(b) Outgoing to non-nominators: for each respondent A with no
-			    observed edge in either direction with E, draw Bernoulli(P[c_E, c_A]).
+			    observed edge in either direction with E, draw
+			    Bernoulli(P[c_E, c_A]) for E -> A.
 			(c) Pairs of nominated (E, F): draw E -> F and F -> E independently.
-			- Edge buffers pre-allocated at the combined upper bound; counter
-			  advances on successful draws; resize! truncates at end.
+			- Edge buffers pre-allocated at the combined upper bound; id type
+			  inferred from eltype(augmented_nodes.id); counter advances on
+			  successful draws; resize! truncates at end.
 		"""
 
 		#	Guards
 			setup.directed ||
 				throw(ArgumentError("_stage_0_5_directed called on undirected setup"))
-			!isempty(setup.partially_observed_nodes) ||
-				throw(ArgumentError("_stage_0_5_directed requires partially_observed_nodes"))
+			!isempty(setup.partially_observed) ||
+				throw(ArgumentError("_stage_0_5_directed requires non-empty setup.partially_observed"))
 			!isnothing(setup.R) ||
 				throw(ArgumentError("_stage_0_5_directed requires non-nothing R matrix"))
 
@@ -2495,7 +2503,8 @@ module network_reconstruction
 			id_to_idx = Dict(augmented_nodes.id[i] => i for i in 1:nrow(augmented_nodes))
 
 		#	Build Per-Nominee Connected-Set and Count Forward Edges to Nominees
-			edges_with_nom = Dict{Int, Set{Int}}(E => Set{Int}() for E in nominated_ids)
+			edges_with_nom = Dict{eltype(augmented_nodes.id), Set{eltype(augmented_nodes.id)}}(
+				E => Set{eltype(augmented_nodes.id)}() for E in nominated_ids)
 			n_forward_to_nom = 0
 			for row in eachrow(setup.edges)
 				if row.src in nominated_ids
@@ -2508,11 +2517,12 @@ module network_reconstruction
 			end
 
 		#	Pre-Allocate Edge Buffers at Upper Bound
+			id_type = eltype(augmented_nodes.id)
 			n_nom = length(nominated_idx)
 			n_resp = length(respondent_idx)
 			upper_bound = n_forward_to_nom + n_nom * n_resp + n_nom * (n_nom - 1)
-			src_buf = Vector{Int}(undef, upper_bound)
-			dst_buf = Vector{Int}(undef, upper_bound)
+			src_buf = Vector{id_type}(undef, upper_bound)
+			dst_buf = Vector{id_type}(undef, upper_bound)
 			weight_buf = setup.weighted ? Vector{Float64}(undef, upper_bound) : Vector{Int}(undef, upper_bound)
 			n_filled = 0
 
@@ -2596,7 +2606,7 @@ module network_reconstruction
 									rng::AbstractRNG)
 		"""
 		Args:
-			setup::SamplerSetup: must have non-empty partially_observed_nodes
+			setup::SamplerSetup: must have non-empty setup.partially_observed
 				and directed == false. setup.R may be nothing.
 			augmented_nodes::DataFrame: includes nominated rows with bin labels
 			rng::AbstractRNG: random source
@@ -2606,24 +2616,25 @@ module network_reconstruction
 			- Observed edges from respondents to nominated nodes are kept as is.
 			- Only new edges are between pairs of nominated non-respondents:
 			  one Bernoulli(P[c_E, c_F]) per unordered pair.
-			- Edge buffers pre-allocated at the n_nom * (n_nom - 1) / 2 upper
-			  bound; counter advances on successful draws; resize! at end.
+			- Edge buffers pre-allocated at upper bound; id type inferred from
+			  eltype(augmented_nodes.id); resize! at end.
 		"""
 
 		#	Guards
 			!setup.directed ||
 				throw(ArgumentError("_stage_0_5_undirected called on directed setup"))
-			!isempty(setup.partially_observed_nodes) ||
-				throw(ArgumentError("_stage_0_5_undirected requires partially_observed_nodes"))
+			!isempty(setup.partially_observed) ||
+				throw(ArgumentError("_stage_0_5_undirected requires non-empty setup.partially_observed"))
 
 		#	Identify Nominated Non-Respondents and Their Cells
 			nominated_idx = findall(==(:nominated), augmented_nodes.node_type)
 			n_nom = length(nominated_idx)
 
 		#	Pre-Allocate Edge Buffers at Upper Bound
+			id_type = eltype(augmented_nodes.id)
 			upper_bound = n_nom * (n_nom - 1) ÷ 2
-			src_buf = Vector{Int}(undef, upper_bound)
-			dst_buf = Vector{Int}(undef, upper_bound)
+			src_buf = Vector{id_type}(undef, upper_bound)
+			dst_buf = Vector{id_type}(undef, upper_bound)
 			weight_buf = setup.weighted ? Vector{Float64}(undef, upper_bound) : Vector{Int}(undef, upper_bound)
 			n_filled = 0
 
@@ -2671,9 +2682,8 @@ module network_reconstruction
 			- For each added node v: draws outgoing to non-added via P; incoming
 			  from non-added via P; added-added edges drawn once per ordered pair.
 			- No self-loops. No edges between original respondents.
-			- Weight: 1 (unweighted) or Poisson(w) min 1 (weighted).
-			- Edge buffers pre-allocated at the combined upper bound; counter
-			  advances on successful draws; resize! at end.
+			- Edge buffers pre-allocated at upper bound; id type inferred from
+			  eltype(augmented_nodes.id); resize! at end.
 		"""
 
 		#	Guards
@@ -2687,9 +2697,10 @@ module network_reconstruction
 			n_non_added = length(non_added_idx)
 
 		#	Pre-Allocate Edge Buffers at Upper Bound
+			id_type = eltype(augmented_nodes.id)
 			upper_bound = 2 * n_added * n_non_added + n_added * (n_added - 1)
-			src_buf = Vector{Int}(undef, upper_bound)
-			dst_buf = Vector{Int}(undef, upper_bound)
+			src_buf = Vector{id_type}(undef, upper_bound)
+			dst_buf = Vector{id_type}(undef, upper_bound)
 			weight_buf = setup.weighted ? Vector{Float64}(undef, upper_bound) : Vector{Int}(undef, upper_bound)
 			n_filled = 0
 
@@ -2776,8 +2787,8 @@ module network_reconstruction
 		Notes:
 			- One Bernoulli(P[cv, cj]) per unordered pair involving an added node.
 			- No self-loops.
-			- Edge buffers pre-allocated at the combined upper bound; counter
-			  advances on successful draws; resize! at end.
+			- Edge buffers pre-allocated at upper bound; id type inferred from
+			  eltype(augmented_nodes.id); resize! at end.
 		"""
 
 		#	Guards
@@ -2791,9 +2802,10 @@ module network_reconstruction
 			n_non_added = length(non_added_idx)
 
 		#	Pre-Allocate Edge Buffers at Upper Bound
+			id_type = eltype(augmented_nodes.id)
 			upper_bound = n_added * n_non_added + n_added * (n_added - 1) ÷ 2
-			src_buf = Vector{Int}(undef, upper_bound)
-			dst_buf = Vector{Int}(undef, upper_bound)
+			src_buf = Vector{id_type}(undef, upper_bound)
+			dst_buf = Vector{id_type}(undef, upper_bound)
 			weight_buf = setup.weighted ? Vector{Float64}(undef, upper_bound) : Vector{Int}(undef, upper_bound)
 			n_filled = 0
 
@@ -2954,7 +2966,7 @@ module network_reconstruction
 			augmented_edges = copy(setup.edges)
 
 		#	Step 6.5: Stage 0.5 (if N_nom > 0)
-			N_nom = length(setup.partially_observed_nodes)
+			N_nom = length(setup.partially_observed)
 			n_stage_0_5_edges = 0
 			if N_nom > 0
 				stage_0_5_edges = setup.directed ?
@@ -3008,7 +3020,7 @@ module network_reconstruction
 	`generate_replicate(setup::SamplerSetup, seed::Int)`
 
 	**Arguments**
-	- `setup::SamplerSetup`: Output of `compute_setup`. Holds the rank-rank matrices `P`, `w`, and (for directed networks) `R`; bin labels; the `q` distribution and `β` solver result; the added-node count `N_add`; the E/I conditional distribution; and other Setup-phase artifacts.
+	- `setup::SamplerSetup`: Output of `compute_setup`. Holds the rank-rank matrices `P`, `w`, and (for directed networks) `R`; bin labels; the `q` distribution and `β` solver result; the added-node count `N_add`; the E/I conditional distribution; the set of partially-observed (nominated) node ids; and other Setup-phase artifacts.
 	- `seed::Int`: Deterministic seed for this replicate. Combined with a master seed in upstream callers, it allows any single replicate to be reproduced exactly without re-running the full grid.
 
 	**Details**
@@ -3017,12 +3029,12 @@ module network_reconstruction
 	2. `_draw_bin_assignments` draws degree- and E/I-bin assignments for `N_add` synthetic added nodes from `q` and the E/I conditional distribution.
 	3. `_build_augmented_nodes` constructs the augmented node roster: original observed nodes (tagged `:observed` or `:nominated`) plus `N_add` synthetic rows with ids `N+1..N+N_add` (tagged `:added`).
 	4. `augmented_edges` is initialized as a copy of `setup.edges`.
-	5. If `N_nom > 0`, Stage 0.5 imputes edges involving nominated non-respondents. The directed variant uses `R` for reverse edges and `P` for outgoing edges to non-nominators; the undirected variant samples only edges between pairs of nominated non-respondents.
+	5. If `length(setup.partially_observed) > 0`, Stage 0.5 imputes edges involving nominated non-respondents. The directed variant uses `R` for reverse edges and `P` for outgoing edges to non-nominators; the undirected variant samples only edges between pairs of nominated non-respondents.
 	6. Stage 1 samples edges incident to synthetic added nodes via `P` (and `w` when weighted). No self-loops; no edges created between two original respondents.
 	7. If `pi_edge > 0` and the network is weighted, Stage 2 redistributes `W_add = round(pi_edge * W_aug / (1 - pi_edge))` weight units across existing edges via multinomial draw proportional to current weight, mutating `augmented_edges.weight` in place.
 	8. Realized Kendall τ_b is computed between the added-indicator and degree bin across observed and added nodes (excluding nominated), as a per-replicate contract check against the β solver's nominal target.
 
-	Pure-pass case (`N_add == 0`, `N_nom == 0`, `pi_edge == 0`) returns `augmented_edges == setup.edges` and `augmented_nodes == setup.nodes` (with `:node_type` added), with all stage steps skipped.
+	Pure-pass case (`N_add == 0`, `partially_observed` empty, `pi_edge == 0`) returns `augmented_edges == setup.edges` and `augmented_nodes == setup.nodes` (with `:node_type` added), with all stage steps skipped.
 
 	**Value**
 	A `Replicate` struct with fields:
@@ -3051,6 +3063,8 @@ module network_reconstruction
 	export SamplerSetup,
 		   build_community_corpus,
 		   compute_setup,
-           feasible_rho_range
+           feasible_rho_range,
+           Replicate,
+           generate_replicate
 
 end # module network_reconstruction
