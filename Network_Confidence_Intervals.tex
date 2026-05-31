@@ -138,7 +138,9 @@ The framework introduced in this document addresses each limitation:
 
 \paragraph{Explicit node-level missingness.} The framework treats missing nodes as a first-class mechanism, separate from edge-weight loss. The parameter $\pinode$ governs the fraction of nodes believed missing, and a synthetic-node augmentation step adds plausible missing nodes to each replicate. The retained edge-weight mechanism ($\piedge$) becomes optional residual error on observed nodes.
 
-\paragraph{Centrality-correlated missingness via a user-supplied prior.} The parameter~$\rho$ encodes the user's domain-knowledge belief about the correlation between node centrality and probability of being missing from observation. Positive~$\rho$ corresponds to settings where central actors are more likely to be hidden (covert networks, non-response among prominent people); negative~$\rho$ corresponds to settings where central actors are more visible (social media, surveillance prioritizing known figures); zero~$\rho$ recovers MCAR behavior. The framework converts~$\rho$ into a bin-assignment distribution that biases the centrality of added nodes accordingly.
+\paragraph{Centrality-correlated missingness via a user-supplied prior.} The parameter~$\rho \in (-1, 1)$ encodes the user's domain-knowledge belief about the association between node centrality and probability of being missing from observation. Positive~$\rho$ corresponds to settings where central actors are more likely to be hidden (covert networks, non-response among prominent people); negative~$\rho$ corresponds to settings where central actors are more visible (social media, surveillance prioritizing known figures); zero~$\rho$ recovers MCAR behavior. The framework converts~$\rho$ into a bin-assignment distribution that biases the centrality of added nodes accordingly.
+
+Internally, $\rho$ is interpreted as Kendall's $\tau_b$, the rank-based correlation between the missingness indicator (binary) and node centrality (continuous). This choice matches the user's rank-order intuition about missingness (``low-ranked nodes are likely to be missing'' is a statement about ranks, not raw centrality values), and it avoids an asymmetric-ceiling problem that arose under Pearson correlation in early framework development. On heavy-tailed networks (e.g., Marvel co-appearance, citation networks), Pearson correlation between missingness and centrality saturates at a much lower magnitude on the negative side than the positive side, because the many low-centrality nodes have near-identical values that fail to discriminate missing from observed. Kendall $\tau_b$ on ranks produces symmetric ceilings across networks and across the sign of~$\rho$, making the framework's behavior consistent regardless of network structure. The user-facing parameter $\rho \in (-1, 1)$ is unchanged from a standard correlation interface; the metric switch is internal.
 
 \paragraph{Native support for unweighted networks.} Because node-level missingness is independent of edge-weight semantics, the framework operates on unweighted networks by skipping the edge-weight reversal step entirely. This is a substantive extension: the Chapter~4 framework cannot handle unweighted networks at all, but unweighted networks are central to several lines of prior work on missing-data bias in survey-based networks \citep[e.g.,][of which the present author was a co-author]{SmithMorganMoody2022}, and supporting them is one of the primary motivations for treating node missingness explicitly.
 
@@ -180,6 +182,8 @@ At least one of $\pinode$ or $\piedge$ must be positive. For unweighted networks
 \end{itemize}
 A negative~$\rho$ does not denote a negative probability; it denotes a negative correlation between centrality and the indicator of being missing.
 
+The framework interprets $\rho$ internally as Kendall's $\tau_b$, the rank-based correlation between centrality and the missingness indicator. The user-facing parameter is a standard correlation in $(-1, 1)$; the rank-based interpretation is internal and not exposed to the user except in diagnostic output. See Section~\ref{sec:feasibility} for the feasibility constraints that determine whether a given~$\rho$ is structurally achievable on a given network at a given missingness rate.
+
 \paragraph{Guidance table for $\rho$.} Table~\ref{tab:rho-guidance} provides illustrative values of~$\rho$ for common observation processes. Users should set~$\rho$ based on domain knowledge, not by estimating it from~$\Gobs$.
 
 \begin{table}[h]
@@ -198,7 +202,7 @@ Covert network from police surveillance & Central more visible & 0.5 -- 0.7 & $-
 Mixed police data & Variable & Variable & User judgment \\
 \bottomrule
 \end{tabular}
-\caption{Guidance for setting~$\rho$ based on observation process. Values are illustrative starting points, not prescriptions.}
+\caption{Guidance for setting~$\rho$ based on observation process. Values are illustrative starting points, not prescriptions. Whether a chosen $\rho$ is structurally achievable on a given network at a given missingness rate is a separate question; the framework surfaces this via \texttt{feasible\_rho\_range} (Section~\ref{sec:feasibility}). On heavy-tailed networks at low missingness rates, the rate-bounded ceiling $\sqrt{2 p (1-p)}$ may limit the achievable $|\rho|$ below the values in this table; the framework will then operate at the practical ceiling and report both nominal and realized values.}
 \label{tab:rho-guidance}
 \end{table}
 
@@ -212,9 +216,30 @@ Mixed police data & Variable & Variable & User judgment \\
 \paragraph{Algorithm hyperparameters with defaults.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
   \item $B$: number of posterior samples (default 1000)
-  \item $K$: number of degree-rank bins (default 5 for $N < 100$, else 10)
+  \item $K$: number of degree-rank bins. Default is automatic selection (\texttt{K = :auto}) via the function \texttt{find\_optimal\_K}, which iterates $K$ from a maximum tractable value down to a floor and returns the largest $K$ that satisfies the framework's three algorithmic priors (see Section~\ref{sec:three-priors}). Larger $K$ produces a Kendall $\tau_b$ ceiling closer to the rate-bounded absolute (fewer bin-level ties on the centrality side), at the cost of fewer observed nodes per bin. The default $K_{\max}$ is $\min(20, \lfloor N_{\text{obs}} / 5 \rfloor)$, the default $K_{\min}$ is~4. Users may override with an explicit integer when manual control is desired.
   \item $J$: number of E/I bins (default 3, with semantic categories internal-leaning [$\EI < -0.33$], balanced [$-0.33 \leq \EI \leq 0.33$], broker-leaning [$\EI > 0.33$])
 \end{itemize}
+
+\subsection{Feasibility of $\rho$}
+\label{sec:feasibility}
+
+Not every $\rho \in (-1, 1)$ is structurally achievable on a given network at a given missingness rate. Two distinct ceilings constrain the realized correlation:
+
+\paragraph{Rate-bounded absolute ceiling.} Under Kendall's $\tau_b$ between a binary indicator (missingness, with proportion $p$) and a continuous variable (centrality), the realized correlation is structurally bounded by
+\[
+|\tau_b|_{\max} = \sqrt{\frac{2 \cdot k \cdot (n - k)}{n \cdot (n - 1)}} \approx \sqrt{2 \cdot p \cdot (1 - p)}
+\]
+where $k$ is the number of missing nodes and $p = k/n$. This bound depends only on the missingness rate, not on the network structure. At $p = 0.10$, $|\tau_b|_{\max} \approx 0.42$; at $p = 0.25$, $|\tau_b|_{\max} \approx 0.61$; at $p = 0.50$, $|\tau_b|_{\max} \approx 0.71$. The framework cannot produce realized $\rho$ exceeding this absolute ceiling no matter how the sampling is configured.
+
+\paragraph{Practical tie-bounded ceiling.} On networks where centrality has many ties (most unweighted networks, where multiple nodes share the same degree), the achievable $|\tau_b|$ is further reduced below the absolute ceiling. Centrality ties contribute to the denominator of Kendall $\tau_b$, lowering the maximum that any sampling configuration can reach. The practical ceiling is network-specific and depends on the centrality distribution's tie structure.
+
+\paragraph{Feasibility check.} The framework provides a public function \texttt{feasible\_rho\_range} that probes the sampling mechanism at extreme configurations to estimate the practical $[\rho_{\min}, \rho_{\max}]$ achievable on a given network at a given rate. The wrapper \texttt{reconstruct\_network} calls this function at startup and emits a warning if the user's $\rho$ falls outside the practical range, with three tiers of warning intensity (silent, note, prompt) depending on the degree of infeasibility.
+
+\paragraph{What happens when $\rho$ exceeds the practical ceiling.} The framework does not silently clip or rescale. Instead, the Phase~1 sampler's bisection on the mixing scalar~$b$ saturates at the extreme value, and the resulting \emph{realized} $\rho$ is whatever the network can structurally produce. Phase~2's bin-distribution solver then honors the realized $\rho$ rather than the user's nominal request. Diagnostic output reports both nominal and realized values, allowing the user to interpret credible intervals appropriately.
+
+\paragraph{Asymmetry between $+\rho$ and $-\rho$.} Under Kendall $\tau_b$ with rank-based sampling weights (see Step~5), feasibility ceilings are typically symmetric: $|\rho_{\min}| \approx |\rho_{\max}|$. This is a substantive improvement over Pearson correlation, where heavy-tailed networks produced dramatically asymmetric ceilings (e.g., $\rho_{\max} \approx +0.4$ but $\rho_{\min} \approx -0.03$ on Marvel under Pearson). The \texttt{is\_asymmetric} flag in \texttt{feasible\_rho\_range} output retains a diagnostic for unusual cases but rarely fires under Kendall.
+
+
 
 \subsection{Weight Semantics and Transformation}
 \label{sec:weight-semantics}
@@ -332,16 +357,35 @@ Let $N_{\text{nom}}$ be the number of partially observed (nominated non-responde
 If $N_{\text{nom}} = 0$, this reduces to $\Nadd = \mathrm{round}(\pinode \cdot N / (1 - \pinode))$ as in the original formulation. If $\pinode = 0$, skip both Stage~0.5 and Stage~1; the framework reduces to Stage~2 only. The total number of nodes in each replicate's true-network estimate is $N + N_{\text{nom}} + \Nadd$.
 
 \paragraph{Step 5: Determine the bin-assignment distribution for added nodes.}
-Find a distribution~$q$ over degree bins $\{1, \ldots, K\}$ such that drawing $\Nadd$ bins from~$q$ yields correlation~$\rho$ between centrality (proxied by bin index) and missingness (binary: 1 for added, 0 for observed) across all $N + \Nadd$ nodes. Use the logistic form
+Find a distribution~$q$ over degree bins $\{1, \ldots, K\}$ such that drawing $\Nadd$ bins from~$q$ yields realized Kendall $\tau_b$ correlation~$\rho$ between the bin index and the missingness indicator across all $N + \Nadd$ nodes. Use the logistic form
 \[
 q_b \propto \exp(\beta \cdot \tilde{b}),
 \]
-where $\tilde{b}$ is the standardized bin index. Solve numerically for~$\beta$ such that the induced correlation matches~$\rho$:
+where $\tilde{b}$ is the standardized bin index. Solve numerically for~$\beta$ such that the induced Kendall $\tau_b$ matches~$\rho$:
 \begin{itemize}[leftmargin=*, itemsep=2pt]
   \item $\rho > 0$: $\beta > 0$, $q$ skews toward high bins
   \item $\rho < 0$: $\beta < 0$, $q$ skews toward low bins
   \item $\rho = 0$: $\beta = 0$, $q$ uniform across bins
 \end{itemize}
+
+\paragraph{Analytic Kendall $\tau_b$ formula.} Because bins are ordinal and missingness is binary, Kendall $\tau_b$ has a closed-form expression as a function of $\beta$, $K$, $N$, and $\Nadd$. Only cross-pairs (one observed node, one added node) contribute to concordant/discordant counts; same-status pairs are tied on the indicator. With observed nodes uniformly distributed across bins ($N/K$ per bin) and added nodes distributed by $q$:
+\[
+C = \frac{N}{K} \cdot \Nadd \cdot \sum_{k=1}^{K} q_k \cdot (k - 1), \qquad
+D = \frac{N}{K} \cdot \Nadd \cdot \sum_{k=1}^{K} q_k \cdot (K - k),
+\]
+\[
+T_x = \frac{N \cdot \Nadd}{K}, \qquad
+T_y = \frac{N^2 (K - 1)}{2K} + \frac{\Nadd^2}{2}\left(1 - \sum_k q_k^2\right),
+\]
+\[
+\tau_b = \frac{C - D}{\sqrt{(C + D + T_x)(C + D + T_y)}}.
+\]
+This is the function being numerically inverted to solve for~$\beta$. The formula is monotone increasing in~$\beta$, so a straightforward bisection on $\beta \in [-50, 50]$ converges in a small number of iterations to tight tolerance.
+
+\paragraph{$K$-dependent ceiling.} The maximum achievable $|\tau_b|$ from Step~5's mechanism depends on~$K$: larger~$K$ reduces the bin-side ties $T_x$ and lifts the ceiling closer to the rate-bounded absolute $\sqrt{2 p (1 - p)}$. Smaller~$K$ increases bin ties and lowers the ceiling. This is one reason the framework's default $K$ is chosen by \texttt{find\_optimal\_K} (Section~\ref{sec:three-priors}): for a user-specified $\rho$ near the rate-bounded ceiling, only sufficiently large $K$ can avoid \texttt{:ceiling\_hit} in the bisection.
+
+\paragraph{$\beta$-solver status.} The solver returns one of three statuses: \texttt{:converged} (bisection found $\beta$ within tolerance of the target), \texttt{:ceiling\_hit} (target exceeds the $K$-dependent achievable maximum; $\beta$ saturates at the bracket endpoint), or \texttt{:failed\_other} (degenerate case, e.g., $\Nadd = 0$ with nonzero target). The status is recorded in diagnostics.
+
 In 2D binning mode, also compute the empirical conditional distribution of E/I bin given degree bin in~$\Gobs$, for use in Step~6.
 
 \subsection{Replicate Generation Phase}
@@ -394,6 +438,23 @@ Sample $\Wadd$ weight units, each assigned to an existing edge with probability 
 \paragraph{Step 9: Compute measure(s) on the replicate.}
 For network-level measures, compute $m(\Gb)$. For node-level measures, compute $m_i(\Gb)$ for each respondent node~$i$ in~$\Gobs$ and (optionally) for each nominated non-respondent. Synthetic added nodes are nuisance variables introduced for structural realism; their measure values are not reported. Nominated non-respondents have partial observed data plus imputed edges, so node-level credible intervals for these nodes reflect both observational and imputation uncertainty.
 
+\subsection{The Three-Prior Algorithmic Contract}
+\label{sec:three-priors}
+
+The framework operates as an algorithmic contract that honors three priors on each replicate:
+
+\begin{enumerate}[leftmargin=*, itemsep=4pt]
+  \item \textbf{Prior~1 (proportion missing).} The user supplies $\pinode$. The framework honors this via the arithmetic identity $\Nadd / (N + \Nadd) = \pinode$ (modulo integer rounding). Verified by the inputs to \texttt{\_determine\_n\_add}.
+
+  \item \textbf{Prior~2 (centrality-missingness correlation).} The user supplies $\rho$. The framework honors this via the $\beta$ solver in Step~5, which finds $\beta$ such that the analytic Kendall $\tau_b$ between bin index and missingness equals $\rho$ within tolerance. When $\rho$ exceeds the $K$-dependent ceiling, the solver returns \texttt{:ceiling\_hit}, and the realized $\rho$ is the maximum achievable at the given $K$, $N$, and $\Nadd$. Both \texttt{:converged} and \texttt{:ceiling\_hit} are contract-compliant responses; the framework's job is to tell the user honestly what it could and could not achieve.
+
+  \item \textbf{Prior~3 (E/I distribution conditional on degree).} This prior is \emph{inferred} from $\Gobs$ rather than user-supplied. The framework computes the empirical conditional distribution $P(\text{E/I bin} \mid \text{degree bin})$ from observed nodes and uses it to assign E/I bins to added nodes (with uniform fallback for empty degree bins). The contract is that added nodes' E/I distribution matches $\Gobs$'s empirical conditional row-by-row.
+\end{enumerate}
+
+\paragraph{What the contract guarantees and what it does not.} The contract guarantees the framework will honor each prior \emph{algorithmically}: the realized values across replicates will match the priors within tolerance, or the framework will report exactly where it could not (via \texttt{:ceiling\_hit} status flags). The contract does \emph{not} guarantee that the user's priors are \emph{correct}: a user who specifies $\rho = 0$ when the truth is $\rho = 0.5$ will receive miscalibrated credible intervals, but the framework will honor $\rho = 0$ as requested.
+
+\paragraph{Automatic $K$ selection.} The function \texttt{find\_optimal\_K} searches for the largest $K$ that satisfies all three priors. Because the Phase~2 analytic Kendall ceiling depends on $K$ (larger $K$ permits larger realized $\rho$), users specifying $\rho$ near the rate-bounded ceiling benefit from larger $K$ to avoid \texttt{:ceiling\_hit}. The search is preceded by a feasibility check via \texttt{feasible\_rho\_range}: if $\rho$ is structurally infeasible, the function returns immediately with \texttt{:rho\_infeasible} rather than searching $K$ values that cannot succeed.
+
 \subsection{Aggregation Phase}
 
 \paragraph{Step 10: Summarize the posterior sample.}
@@ -406,7 +467,18 @@ The framework returns:
   \item \textbf{Primary output:} the full posterior sample ($B$ values per network-level measure, or $B$ values per observed node per node-level measure)
   \item \textbf{Default summaries:} posterior median and 95\% credible interval; alternative credible levels and other summaries can be computed from the sample
   \item \textbf{Reference values:} $m(\Gobs)$ on the observed (post-transformation if applicable) network
-  \item \textbf{Diagnostics:} realized correlation between bin assignment and missingness across replicates (verification of~$\beta$), distribution of measure values, transformation parameters used (if applicable), community structure used and E/I distributions, binning mode (2D or fallback to 1D)
+  \item \textbf{Diagnostics:} 
+  \begin{itemize}[leftmargin=*, itemsep=1pt]
+    \item Nominal vs. realized $\rho$ (Kendall $\tau_b$) per replicate, with summary across replicates
+    \item Nominal vs. realized missingness rate per replicate
+    \item $\beta$ solver status distribution (\texttt{:converged}, \texttt{:ceiling\_hit}, \texttt{:failed\_other}) across replicates
+    \item Feasibility output from \texttt{feasible\_rho\_range}: practical $[\rho_{\min}, \rho_{\max}]$ at the user's missingness rate, MC standard errors, asymmetry flag
+    \item $K$ selected by \texttt{find\_optimal\_K} (if \texttt{K = :auto}) and per-$K$ test trace
+    \item Transformation parameters used (if weight semantics required transformation)
+    \item Community structure used and E/I distributions
+    \item Binning mode (2D or fallback to 1D) and any fallback reason
+    \item Per-replicate degeneracy flags (giant-component fraction, empty bins, etc.) for downstream filtering
+  \end{itemize}
 \end{itemize}
 
 \section{Key Assumptions}
@@ -420,7 +492,7 @@ The framework makes the following assumptions, which users should consider when 
 
   \item \textbf{Rank-conditional reciprocity behavior is representative.} For directed networks, the empirical reciprocity rate $\Rmat_{c, c'}$ observed among respondent-respondent dyads is representative of reciprocity behavior involving nominated non-respondents at the same rank-rank cell pair. This generalizes the assumption in \citet{SmithMorganMoody2022} that a single global reciprocity rate could be used for imputation; the framework's assumption is that reciprocity varies by rank-rank cell but is otherwise constant.
 
-  \item \textbf{$\rho$ is a genuine prior, not estimated from~$\Gobs$.} Users supply~$\rho$ based on domain knowledge about the observation process, not by looking at the data.
+  \item \textbf{$\rho$ is a genuine prior, not estimated from~$\Gobs$.} Users supply~$\rho$ based on domain knowledge about the observation process, not by looking at the data. The framework interprets~$\rho$ internally as Kendall's $\tau_b$ between the missingness indicator and node centrality. When the user's $\rho$ exceeds the practical feasibility ceiling (Section~\ref{sec:feasibility}), the framework operates at the ceiling and reports both nominal and realized values via diagnostics; the contract is algorithmic compliance with what is structurally achievable, not silent overrides of the user's request.
 
   \item \textbf{Bin membership, not node identity, governs sampling.} All observed nodes in the same cell are treated as exchangeable. This is the framework's central simplifying assumption (see Section on bin exchangeability).
 
@@ -455,6 +527,7 @@ The following are explicitly outside the scope of this framework:
   \item Separate prior on brokerage-missingness correlation ($\rho$ governs degree-missingness; E/I assignment is conditional on degree)
   \item Uncertainty in the detected community structure (Louvain output is treated as fixed)
   \item Reciprocity-based imputation for undirected networks (the reciprocity matrix~$\Rmat$ is undefined; nominated non-respondents in undirected networks are handled with the unconditional rank-rank matrix~$\Pmat$ only)
+  \item Silent enforcement of structurally infeasible $\rho$ priors. When the user's $\rho$ exceeds the rate-bounded or tie-bounded ceiling, the framework operates at the achievable ceiling, reports the realized $\rho$ alongside the nominal, and emits a diagnostic. It does not silently rescale or clip the user's input.
 \end{itemize}
 
 \section{Next Steps}

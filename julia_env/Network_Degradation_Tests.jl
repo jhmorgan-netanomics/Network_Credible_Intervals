@@ -244,34 +244,48 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 #	Test Bisection Convergence
 	function test_bisection_convergence_scotland(networks::Dict;
                                               n_reps::Int = 100,
-                                              target_rho::Real = 0.25,
+                                              target_rho::Real = 0.10,
                                               target_rate::Real = 0.10,
-                                              tol_mean_rho::Real = 0.04)
+                                              tol_mean_rho::Real = 0.03)
 		"""
 		Args:
 			networks::Dict: corpus dict; must contain "scotland_interlock_unweighted"
 			n_reps::Int: number of replicates (default 100)
-			target_rho::Real: target rho (default 0.25 — interior, achievable)
+			target_rho::Real: target Kendall tau-b (default 0.10 — interior
+				to the rate-bounded ceiling at rate=0.10)
 			target_rate::Real: target rate (default 0.10)
 			tol_mean_rho::Real: tolerance on |mean(realized_rho) - target_rho|
-				across n_reps replicates (default 0.02)
+				across n_reps replicates (default 0.03)
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies that the bisection actually solves cor(prob, c) =
+			Verifies that the bisection actually solves cor_kendall(is_dropped, c) =
 			target_rho in expectation across replicates. Single-replicate
 			realized_rho is noisy; the assertion is on the mean across
 			n_reps draws.
 
-			Scotland (undirected, N=108, degree Gini ~0.48) is the natural
-			fixture: moderate skew, large enough that 100 replicates give
-			a tight estimate of mean realized rho, small enough that the
-			whole test runs in milliseconds.
+			RATE-BOUNDED CEILING. Under Kendall tau-b, the realized
+			correlation between a binary indicator (is_dropped) and a
+			continuous variable (centrality) is structurally bounded by
+			|tau| <= 2*p*(1-p) where p is the missingness rate. At
+			rate=0.10, the ceiling is ~0.18. The default target_rho of
+			0.10 is comfortably inside this ceiling, leaving room for
+			the bisection to converge without saturating.
 
-			The bisection status must be :converged for every replicate
-			(no ceiling hits expected on Scotland at rho=0.25 — the
-			achievable-rho ceiling on a moderately-skewed undirected
-			network is well above 0.5).
+			This is the Kendall-era replacement for the previous Pearson
+			default of target_rho=0.25, which under Kendall would
+			structurally exceed the rate-bounded ceiling and produce
+			:ceiling_hit rather than :converged. The test now exercises
+			the bisection's normal convergence path; the explicit
+			rate-bounded ceiling check lives in
+			test_rate_bounded_ceiling_scotland (Test 1b).
+
+			Scotland (undirected, N=108, degree Gini ~0.48) is the
+			natural fixture: moderate skew, large enough that 100
+			replicates give a tight estimate of mean realized tau, small
+			enough that the whole test runs in seconds.
+
+			The bisection status must be :converged for every replicate.
 		"""
 		println("─" ^ 70)
 		println("Test 1: Bisection convergence on Scotland (rho=$target_rho, rate=$target_rate)")
@@ -307,6 +321,105 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 
 		return (passed  = passed,
 				details = "mean_rho=$(round(mean_rho, digits=4)) Δ=$(round(rho_delta, digits=4))")
+	end
+
+#	Test Rate-Bounded Ceiling: Kendall tau-b structural ceiling under rate
+	function test_rate_bounded_ceiling_scotland(networks::Dict;
+                                                n_reps::Int = 20,
+                                                target_rho::Real = 0.25,
+                                                target_rate::Real = 0.10)
+		"""
+		Args:
+			networks::Dict: corpus dict; must contain "scotland_interlock_unweighted"
+			n_reps::Int: number of replicates (default 20)
+			target_rho::Real: target tau (default 0.25 — above Scotland's
+				practical ceiling at rate=0.10, though well below the
+				theoretical absolute ceiling of ~0.42)
+			target_rate::Real: target rate (default 0.10)
+		Returns:
+			NamedTuple (passed::Bool, details::String)
+		Notes:
+			Verifies the Kendall tau-b rate-bounded ceiling property.
+			Under Kendall, the realized correlation between a binary
+			indicator (proportion p) and a continuous variable is
+			structurally bounded by
+
+			    |tau|_max = sqrt(2 * k * (n-k) / (n * (n-1)))
+			              ≈ sqrt(2 * p * (1 - p))
+
+			where p = k/n is the missingness rate. At p = 0.10 the
+			theoretical absolute ceiling is sqrt(0.18) ≈ 0.42.
+
+			The TIES-BOUNDED CEILING. On unweighted networks the
+			centrality vector contains many ties (multiple nodes at
+			the same degree). Ties on the continuous variable reduce
+			the achievable tau-b below the theoretical absolute ceiling
+			(the +Ty term in tau-b's denominator). The practical
+			ceiling on a given network is therefore below sqrt(2*p*(1-p))
+			and depends on the network's centrality tie structure.
+			Scotland (N=108, many ties at low degree) has a practical
+			ceiling around 0.20-0.25 at rate=0.10 — well below the
+			theoretical absolute of 0.42.
+
+			Test design: request target_rho = 0.25 at rate = 0.10.
+			Scotland's practical ceiling is at or below this, so the
+			bisection should return :ceiling_hit consistently. Expected
+			behavior:
+			(a) Every replicate returns bisection_status = :ceiling_hit.
+			(b) Max realized rho across replicates does not exceed the
+			    theoretical absolute ceiling sqrt(2*p*(1-p)) (with
+			    small tolerance for floating-point and single-replicate
+			    saturation noise).
+
+			This is a NEW test introduced with the Pearson-to-Kendall
+			refactor. The rate-bounded ceiling is a structural property
+			of Kendall tau-b on binary indicators that didn't exist
+			under Pearson. Combined with the practical tie-bounded
+			ceiling, this gives the framework two distinct "you can't
+			reach this target" constraints to surface to users.
+		"""
+		println("─" ^ 70)
+		println("Test 1b: Rate-bounded ceiling on Scotland (rho=$target_rho at rate=$target_rate)")
+		println("─" ^ 70)
+
+		haskey(networks, "scotland_interlock_unweighted") ||
+			return (passed = false, details = "Scotland missing from corpus")
+
+		net     = networks["scotland_interlock_unweighted"]
+		records = _draw_replicates(net; target_rho = target_rho,
+									  target_rate = target_rate,
+									  n_reps      = n_reps)
+
+		#	Compute theoretical absolute ceiling for diagnostic
+			theoretical_ceiling = sqrt(2.0 * target_rate * (1.0 - target_rate))
+
+		#	Check 1: every replicate ceiling-hit
+			ceiling_hit_count = count(r -> r.bisection_status == :ceiling_hit, records)
+			all_ceiling_hit   = ceiling_hit_count == n_reps
+
+		#	Check 2: realized rhos do not exceed the theoretical absolute ceiling
+		#	Allow modest tolerance for single-replicate saturation noise.
+			realized_rhos = [r.realized_rho for r in records]
+			max_realized  = maximum(realized_rhos)
+			mean_realized = mean(realized_rhos)
+			tolerance     = 0.05
+			respects_ceiling = max_realized <= theoretical_ceiling + tolerance
+
+		#	Report
+			println("  Replicates:                $n_reps")
+			println("  Target rho:                $target_rho")
+			println("  Theoretical abs ceiling:   $(round(theoretical_ceiling, digits=4))  (sqrt(2*p*(1-p)))")
+			println("  :ceiling_hit count:        $ceiling_hit_count / $n_reps")
+			println("  All ceiling_hit:           $(all_ceiling_hit ? "YES" : "NO")")
+			println("  Mean realized rho:         $(round(mean_realized, digits=4))  (practical ceiling on Scotland)")
+			println("  Max realized rho:          $(round(max_realized, digits=4))")
+			println("  Respects abs ceiling:      $(respects_ceiling ? "YES" : "NO")  (max ≤ $(round(theoretical_ceiling + tolerance, digits=4)))")
+
+			passed = all_ceiling_hit && respects_ceiling
+			println("  Result:                    $(passed ? "PASS ✓" : "FAIL ✗")")
+
+		return (passed  = passed,
+				details = "ceiling_hits=$ceiling_hit_count/$n_reps max_realized=$(round(max_realized, digits=4)) abs_ceiling=$(round(theoretical_ceiling, digits=4))")
 	end
 
 #   Extraction Rate Validation
@@ -909,6 +1022,7 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 
 		results = NamedTuple[]
 		push!(results, test_bisection_convergence_scotland(networks))
+		push!(results, test_rate_bounded_ceiling_scotland(networks))
 		push!(results, test_exact_rate_scotland_moreno(networks))
 		push!(results, test_achievable_rho_ceiling_star())
 		push!(results, test_seed_reproducibility(networks))

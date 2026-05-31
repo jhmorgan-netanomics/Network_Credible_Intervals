@@ -31,12 +31,14 @@ module Network_Credible_Intervals
     include("network_community_detection.jl")
     include("network_statistics.jl")
     include("network_degeneracy_functions.jl")
+    include("network_reconstruction_functions.jl")
 
 #   Pull their exports into the parent namespace
     using .graphml_io
     using .network_community_detection
     using .network_statistics
     using .network_degeneracy
+    using .network_reconstruction
 
 #   Re-export to users of Network_Credible_Intervals
     export write_graphml,
@@ -73,6 +75,10 @@ module Network_Credible_Intervals
            structural_equivalence_blockmodel,
            generate_missingness_mask,
            apply_missingness,
-           build_degeneration_corpus
+           build_degeneration_corpus,
+           SamplerSetup,
+		   build_community_corpus,
+		   compute_setup,
+           feasible_rho_range
 
 end # module Network_Credible_Intervals

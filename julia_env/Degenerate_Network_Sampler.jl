@@ -5,9 +5,6 @@
 #	Generates the degeneration corpus across all sixteen networks,
 #	five centrality–missingness correlation levels, six missingness
 #	rates, 100 replicates per cell, and both materialization mechanisms.
-#
-#	Expected runtime: ~4 hours on a single workstation with
-#	JULIA_NUM_THREADS=8.
 
 #   Pulling-In Network_Credible_Inteverals & Activating Local Environment
     cd("/mnt/d/GitHub_Repositories/Network_Credible_Intervals")

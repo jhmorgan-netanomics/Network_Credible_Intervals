@@ -148,7 +148,7 @@ module network_degeneracy
 	  network and missing data conditions. *Social Networks*, 68, 148–178.
 	""" _centrality_for_sampler
 
-#	Helper Centrality Correlation: Monte Carlo estimate of E[cor(is_dropped, c)] at candidate b
+#	Helper Centrality Correlation: Monte Carlo estimate of E[corkendall(is_dropped, c)] at candidate b
 	function _centrality_correlation_for_b(centrality::AbstractVector{<:Real},
 											b::Real,
 											sgn::Integer,
@@ -161,8 +161,9 @@ module network_degeneracy
 			centrality::AbstractVector{<:Real}: centrality driver from
 				_centrality_for_sampler
 			b::Real: candidate mixing scalar, in [0, 1]
-			sgn::Integer: +1 to target positive realized rho (drop central
-				nodes preferentially), -1 to target negative; must be +1 or -1
+			sgn::Integer: +1 to target positive realized Kendall tau (drop
+				central nodes preferentially), -1 to target negative; must
+				be +1 or -1
 			target_rate::Real: target fraction of nodes to drop; in (0, 1).
 				Needed because the inner samples must draw the same k that
 				the actual sampler will draw at production time.
@@ -174,56 +175,75 @@ module network_degeneracy
 				draws
 			M::Int: number of inner Monte Carlo samples per call (default 50)
 		Returns:
-			Float64: empirical mean of cor(is_dropped, centrality) across M
-				inner weighted-without-replacement draws. Returns NaN when
-				the centrality vector is constant (max == min); the bisection
-				short-circuits on that case via the :failed_other status.
+			Float64: empirical mean of corkendall(is_dropped, centrality)
+				across M inner weighted-without-replacement draws. Returns
+				NaN when the centrality vector is constant (max == min);
+				the bisection short-circuits on that case via the
+				:failed_other status.
 		Notes:
-			This function is the substantive change from the prob-vector
-			bisection. Instead of returning cor(prob, c) — the deterministic
-			sampler-recipe quantity — it returns an estimate of cor(is_dropped, c),
-			the realized indicator quantity that the analysis cares about.
-			The estimate is the average of M independent weighted-without-
-			replacement draws at this candidate b.
+			This function targets the realized RANK correlation (Kendall's
+			tau-b) between is_dropped and centrality, not the value-based
+			Pearson correlation. The rank-based formulation matches the
+			user's intuition: "low-ranked nodes are likely missing" is a
+			rank-order statement, not a linear-correlation statement.
 
-			The probability vector is constructed once per call:
-				prob_i = b * c_normalized_i + (1 - b) * u_i  (with u_i drawn
-				once from a single RNG seeded deterministically; see below)
-			For negative-rho targets (sgn == -1), the prob vector is inverted
-			via prob_i <- 1 - prob_i before sampling. The inner draws share
-			one prob vector and differ only in which k nodes get sampled
-			from it.
+			On heavy-tailed networks (e.g., Marvel) the Pearson formulation
+			produces an asymmetric ceiling — the negative-rho side can
+			only reach ~-0.03 because the many low-centrality nodes look
+			alike under min-max normalization, making the rank-style
+			"peripheral nodes missing" theory unrepresentable. Kendall
+			tau-b treats both ends of the centrality distribution
+			symmetrically via ranks, eliminating the asymmetric ceiling.
+
+			Two coupled changes from the Pearson version:
+			(1) Probability vector uses RANK-based normalization:
+			    prob_i = b * r_normalized_i + (1 - b) * u_i
+			    where r_normalized_i = (tiedrank(centrality)[i] - 1) / (N - 1)
+			    is the rank position scaled to [0, 1]. Min-max value-based
+			    normalization is replaced because, on heavy-tailed networks,
+			    it puts almost all weight mass on a few hubs and leaves
+			    the low end indistinguishable.
+			(2) Realized correlation is Kendall's tau-b (StatsBase.corkendall)
+			    rather than Pearson cor. Kendall tau-b handles the ties on
+			    the binary is_dropped vector correctly.
+
+			A consequence of using Kendall tau-b on a binary indicator:
+			|tau| is structurally bounded by 2*p*(1-p) where p is the
+			missingness rate. At rate=0.10, max |tau| ~= 0.18 regardless
+			of network. This rate-bounded ceiling is reported as
+			:ceiling_hit by the bisection caller.
+
+			For negative-rho targets (sgn == -1), the prob vector is
+			inverted via prob_i <- 1 - prob_i before sampling. The inner
+			draws share one prob vector and differ only in which k nodes
+			get sampled from it.
 
 			Determinism scheme: each inner sample m in 1:M uses a seed
 			derived as Int(hash((bisection_seed, iter_idx, m)) % UInt32).
-			This makes the function reproducible in bisection_seed regardless
-			of thread scheduling (when threaded), and ensures that successive
-			bisection iterations consume different inner draws (no false
-			convergence from re-using the same M samples at every b).
+			This makes the function reproducible in bisection_seed
+			regardless of thread scheduling, and ensures that successive
+			bisection iterations consume different inner draws.
 
-			Cost: M weighted-without-replacement draws plus M correlation
-			computations. On N <= 1000 networks each iteration is sub-
-			millisecond. At the default M=50 with ~30 bisection iterations
-			per cell, the bisection adds ~1500 sampling operations per
-			generate_missingness_mask call.
+			Cost: M weighted-without-replacement draws plus M Kendall
+			tau-b computations. corkendall is O(N log N) via the Knight's
+			algorithm; on N <= 10000 networks each inner sample is sub-
+			10ms. At M=50 with ~30 bisection iterations per cell, the
+			bisection adds ~1500 sampling+corkendall operations per
+			generate_missingness_mask call. On Marvel (N=6486), expect
+			~15 seconds per generate_missingness_mask call.
 
 			Edge cases:
-			- Constant centrality returns NaN: cor(is_dropped, constant) is
-			  undefined regardless of the draw. The bisection caller checks
-			  for NaN and returns status = :failed_other.
-			- Inner draws use a separate u-draw per call; this is necessary
-			  because changing b changes the prob vector. The 'inner' part
-			  is purely the sampling-given-prob; the u_i noise is regenerated
-			  fresh at every bisection iteration.
+			- Constant centrality returns NaN: corkendall(is_dropped,
+			  constant) is undefined. The bisection caller checks for NaN
+			  and returns status = :failed_other.
 			- Saturation: when fewer than k entries of prob are strictly
-			  positive (e.g., extreme-skew centrality at b=1 on a star
-			  fixture), weighted-without-replacement sampling cannot draw k
-			  distinct nodes. The function falls back to selecting all
+			  positive, weighted-without-replacement sampling cannot draw
+			  k distinct nodes. The function falls back to selecting all
 			  positive-weight nodes deterministically and uniform-randomly
 			  filling the remaining k - n_positive slots from zero-weight
-			  nodes. This is the regime where the centrality signal is
-			  exhausted; the bisection should detect the resulting realized
-			  cor as below target and return :ceiling_hit.
+			  nodes. This regime exhausts the centrality signal; the
+			  bisection should detect the resulting realized tau as below
+			  target and return :ceiling_hit.
 		"""
 		#	Guards
 			n = length(centrality)
@@ -233,13 +253,27 @@ module network_degeneracy
 			(0.0 < target_rate < 1.0) || throw(ArgumentError("target_rate must be in (0, 1), got $target_rate"))
 			M >= 1 || throw(ArgumentError("M must be >= 1, got $M"))
 
-		#	Min-Max Normalize Centrality, Short-Circuit on Constant
-			c_min = minimum(centrality)
-			c_max = maximum(centrality)
-			if c_max == c_min
-				return NaN
-			end
-			c_norm = (centrality .- c_min) ./ (c_max - c_min)
+		#	Constant-Centrality Short-Circuit
+			#	Kendall tau-b on a constant vector is undefined (no concordant
+			#	or discordant pairs can be formed). Mirror the previous
+			#	min-max short-circuit so the bisection caller's :failed_other
+			#	branch fires correctly.
+				c_min = minimum(centrality)
+				c_max = maximum(centrality)
+				if c_max == c_min
+					return NaN
+				end
+
+		#	Rank-Based Normalization of Centrality
+			#	tiedrank assigns Float64 ranks with ties handled by averaging.
+			#	Subtracting 1 and dividing by n - 1 gives a [0, 1] range
+			#	where rank-1 nodes (lowest centrality) map to 0 and rank-N
+			#	nodes (highest centrality) map to 1. Unlike min-max value-
+			#	based normalization, rank-based normalization is symmetric
+			#	across the centrality distribution and doesn't concentrate
+			#	weight on a few hubs on heavy-tailed networks.
+				ranks = StatsBase.tiedrank(centrality)
+				c_norm = (ranks .- 1.0) ./ (n - 1)
 
 		#	Probability Vector
 			#	The u-noise is regenerated each call; this is deterministic
@@ -262,64 +296,53 @@ module network_degeneracy
 			k <= n - 1 || throw(ArgumentError("target_rate too large: k = $k > N - 1"))
 
 			#	Saturation check: count strictly positive prob entries.
-			#	When fewer than k entries are positive (extreme-skew centrality
-			#	at b=1 produces a (1, 0, ..., 0)-like prob vector), StatsBase.sample
-			#	cannot draw k distinct nodes from the positive support. We handle
-			#	this deterministic edge case by selecting all positive-weight
-			#	nodes and filling the remaining slots uniformly at random from
-			#	zero-weight nodes. This is the saturation regime where the
-			#	centrality signal is exhausted; the achievable realized cor
-			#	is whatever this construction produces, and the bisection will
-			#	correctly classify it as :ceiling_hit since the saturation cor
-			#	is below any target_rho close to 1.
+			#	When fewer than k entries are positive, StatsBase.sample
+			#	cannot draw k distinct nodes from the positive support.
+			#	The saturation path mirrors the standard-path math:
+			#	positive nodes are deterministically dropped, remaining
+			#	slots are filled uniformly from zero-weight nodes.
 				n_positive = count(p -> p > 0.0, prob)
 
-			cor_sum = 0.0
-			centrality_vec = Vector{Float64}(centrality)   #	avoid repeated conversion
-			is_dropped_buf = zeros(Float64, n)              #	reused across inner draws
+			tau_sum = 0.0
+			centrality_vec = Vector{Float64}(centrality)
+			is_dropped_buf = zeros(Float64, n)
 
 			if n_positive >= k
-				#	Standard path: enough positive-weight nodes for weighted-
-				#	without-replacement sampling
+				#	Standard path: weighted-without-replacement sampling
 					weights = StatsBase.Weights(prob)
 					@inbounds for m in 1:M
 						sample_seed = Int(hash((bisection_seed, iter_idx, m)) % UInt32)
 						rng = Xoshiro(sample_seed)
 						dropped = StatsBase.sample(rng, 1:n, weights, k; replace=false)
-						#	Reset and fill the indicator buffer for this draw
-							fill!(is_dropped_buf, 0.0)
-							for idx in dropped
-								is_dropped_buf[idx] = 1.0
-							end
-						cor_sum += cor(is_dropped_buf, centrality_vec)
+						fill!(is_dropped_buf, 0.0)
+						for idx in dropped
+							is_dropped_buf[idx] = 1.0
+						end
+						tau_sum += StatsBase.corkendall(is_dropped_buf, centrality_vec)
 					end
 			else
-				#	Saturation path: take all positive-weight nodes deterministically,
-				#	then uniform-randomly fill the remaining k - n_positive slots
-				#	from the zero-weight nodes. The positive nodes are always
-				#	dropped; the zero nodes are chosen at random.
+				#	Saturation path: positives always dropped, plus uniform
+				#	draws from zeros to fill remaining slots
 					positive_idxs = findall(p -> p > 0.0, prob)
 					zero_idxs     = findall(p -> p == 0.0, prob)
 					k_remaining   = k - n_positive
 					@inbounds for m in 1:M
 						sample_seed = Int(hash((bisection_seed, iter_idx, m)) % UInt32)
 						rng = Xoshiro(sample_seed)
-						#	Reset and fill: positives always dropped, plus
-						#	k_remaining uniform draws from zeros
-							fill!(is_dropped_buf, 0.0)
-							for idx in positive_idxs
-								is_dropped_buf[idx] = 1.0
-							end
-							zero_dropped = StatsBase.sample(rng, zero_idxs, k_remaining; replace=false)
-							for idx in zero_dropped
-								is_dropped_buf[idx] = 1.0
-							end
-						cor_sum += cor(is_dropped_buf, centrality_vec)
+						fill!(is_dropped_buf, 0.0)
+						for idx in positive_idxs
+							is_dropped_buf[idx] = 1.0
+						end
+						zero_dropped = StatsBase.sample(rng, zero_idxs, k_remaining; replace=false)
+						for idx in zero_dropped
+							is_dropped_buf[idx] = 1.0
+						end
+						tau_sum += StatsBase.corkendall(is_dropped_buf, centrality_vec)
 					end
 			end
 
-		#	Return Mean Realized Indicator Correlation
-			return cor_sum / M
+		#	Return Mean Realized Kendall tau-b
+			return tau_sum / M
 	end
 
 #	Helper Bisection: solve for b such that the realized cor(is_dropped, c) hits target_rho
@@ -465,8 +488,8 @@ module network_degeneracy
 			target_rate::Real: target fraction of nodes to drop; in (0, 1)
 			b::Real: mixing scalar from _bisect_b_for_target_rho; in [0, 1]
 			sgn::Integer: +1 to drop high-centrality nodes preferentially
-				(positive target rho), -1 to drop low-centrality preferentially
-				(negative target rho). MUST be +1 or -1.
+				(positive target Kendall tau), -1 to drop low-centrality
+				preferentially (negative target). MUST be +1 or -1.
 			sample_seed::Integer: RNG seed for the u_i Uniform(0,1) draws and
 				for the StatsBase.sample(...) call
 		Returns:
@@ -474,65 +497,77 @@ module network_degeneracy
 				- dropped_nodes::Vector{Int}: indices of the dropped nodes in
 					the canonical node order, sorted ascending
 				- realized_rate::Float64: |dropped_nodes| / N
-				- realized_rho::Float64: cor(is_dropped, centrality) across
-					the node set, signed against the original centrality
-					direction (NOT inverted by sgn — this is the realized
-					correlation the analysis cares about)
+				- realized_rho::Float64: corkendall(is_dropped, centrality)
+					across the node set, signed against the original
+					centrality direction (NOT inverted by sgn). The field
+					name is preserved for backward compatibility with
+					downstream code; the metric is now Kendall's tau-b.
 		Notes:
-			Implements the weighted-without-replacement sampler from SMM 2022.
-			The probability vector is constructed as
-			    prob_i = b * c_normalized_i + (1 - b) * u_i,
-			where c_normalized_i is the [0,1] min-max-normalized centrality
-			and u_i ~ Uniform(0,1). When sgn = -1 (negative target rho), the
-			prob vector is inverted via prob_i ← 1 - prob_i before sampling,
-			producing draws where low-centrality nodes are preferentially
-			selected.
+			Implements the weighted-without-replacement sampler with rank-
+			based weighting and Kendall tau-b as the realized correlation
+			metric. This is the production sampler called by
+			generate_missingness_mask.
+
+			Two coupled choices that distinguish this from a Pearson sampler:
+			(1) Rank-based normalization. The probability vector is
+			    constructed from ranks rather than raw centrality values:
+			        prob_i = b * r_normalized_i + (1 - b) * u_i
+			    where r_normalized_i = (tiedrank(centrality)[i] - 1) / (N - 1)
+			    is the rank position scaled to [0, 1]. This gives all parts
+			    of the centrality distribution equal weight-density, in
+			    contrast to value-based min-max normalization which puts
+			    almost all weight on a few hubs in heavy-tailed networks.
+			(2) Realized correlation is Kendall's tau-b. This matches the
+			    rank-based weighting and the user's rank-order intuition
+			    about missingness.
+
+			When sgn = -1 (negative target tau), the prob vector is
+			inverted via prob_i <- 1 - prob_i before sampling, producing
+			draws where low-rank nodes are preferentially selected.
 
 			Rate-targeting is exact: k = round(target_rate * N) nodes are
-			drawn via StatsBase.sample(..., weights=prob, replace=false),
-			which produces a draw of exactly k nodes from the node set with
-			selection probabilities proportional to prob. The realized rate
-			is therefore round(target_rate * N) / N for every replicate
-			(modulo Julia's round-half-to-even convention).
+			drawn via StatsBase.sample(..., weights=prob, replace=false).
+			The realized rate is therefore round(target_rate * N) / N for
+			every replicate.
 
 			realized_rho is computed from the SAMPLED dropped-node set
 			(is_dropped indicator vector) against the original centrality
-			vector — not from the prob vector. This is what the analysis
-			cares about: the realized correlation between dropped status
-			and centrality, which is what coverage and calibration are
-			conditioned on. The mean of realized_rho across many seeds
-			converges to the target_rho the bisection was solving for (per
-			Test 1 in the harness); single-replicate realized_rho is noisy.
+			vector using corkendall — not from the prob vector and not
+			from ranks. The mean of realized_rho across many seeds
+			converges to the target_rho the bisection was solving for.
+			Single-replicate realized_rho is noisy.
 
-			The realized_rho is signed against the ORIGINAL centrality
-			direction, so for negative-target-rho draws it will be negative
-			as expected. This matches what the caller expects to record in
-			the per-replicate record alongside the nominal target_rho.
+			The realized_rho is signed against the original centrality
+			direction, so for negative-target draws it will be negative
+			as expected. Kendall tau-b is invariant under monotone
+			transformations of centrality, so it doesn't matter whether
+			we pass raw centrality or ranks to corkendall here.
+
+			RATE-BOUNDED CEILING. Kendall tau-b on a binary indicator is
+			bounded by |tau| <= 2*p*(1-p) where p = mean(is_dropped). At
+			target_rate = 0.10, max |tau| ~= 0.18 regardless of network
+			structure. This is a structural property of Kendall tau-b on
+			binary indicators, not a network artifact. Users specifying
+			|target_rho| above this rate-bounded ceiling will have the
+			bisection return :ceiling_hit; the framework will honor
+			whatever realized correlation the saturated sampler produces.
 
 			sample_seed should be distinct from any seed used in the
-			bisection (Function 3), otherwise the deterministic bisection
-			result becomes entangled with the sampling stochasticity in
-			confusing ways. The public wrapper generate_missingness_mask
-			handles this seed-splitting; direct callers must do so manually.
+			bisection, otherwise the deterministic bisection result
+			becomes entangled with the sampling stochasticity. The public
+			wrapper generate_missingness_mask handles this seed-splitting.
 
 			Edge cases:
-			- If centrality is constant (max == min), c_normalized is the zero
-			  vector and prob_i = (1-b) * u_i, giving uniform-noise sampling
-			  regardless of b. This is the correct behavior for a regular
-			  graph where no value of b can produce target rho; the caller
-			  (Function 3) should have returned status = :failed_other on this
-			  network, but the sampler still returns a valid uniform draw if
-			  called directly.
-			- If b = 1.0 exactly and centrality is non-constant, prob_i =
-			  c_normalized_i with no noise component. When the centrality
-			  distribution is extreme-skew (e.g., a star fixture where one
-			  node has all the mass), the prob vector saturates with fewer
-			  than k positive entries. The function detects this and falls
-			  back to a deterministic-positive-plus-uniform-zero-fill draw
-			  rather than failing. This path is exercised when the bisection
-			  returns :ceiling_hit and the caller proceeds with the saturated
-			  b; the realized indicator correlation matches what the
-			  bisection's saturation probe estimated.
+			- If centrality is constant (max == min), the rank vector is
+			  also constant (all ties tiedrank to (n+1)/2), and corkendall
+			  with a constant variable is undefined. The caller should
+			  have returned :failed_other on this network via the
+			  bisection's constant-centrality short-circuit.
+			- If b = 1.0 exactly and centrality is non-constant, prob_i
+			  = r_normalized_i with no noise component. Saturation can
+			  still occur if many nodes share the lowest rank (extreme
+			  tie patterns), in which case the fallback handles the
+			  draw deterministically.
 		"""
 
 		#	Guards
@@ -542,61 +577,58 @@ module network_degeneracy
 			(0.0 <= b <= 1.0) || throw(ArgumentError("b must be in [0, 1], got $b"))
 			(sgn == 1 || sgn == -1) || throw(ArgumentError("sgn must be +1 or -1, got $sgn"))
 
-		#	Min-Max Normalize Centrality to [0, 1]
-			c_min  = minimum(centrality)
-			c_max  = maximum(centrality)
-			c_norm = c_max == c_min ? zeros(Float64, n) : (centrality .- c_min) ./ (c_max - c_min)
+		#	Rank-Based Normalization of Centrality to [0, 1]
+			#	Constant centrality produces an all-equal rank vector
+			#	(all entries tiedrank to (n+1)/2). Resulting r_normalized
+			#	is the zero vector, giving prob = (1-b)*u. The caller's
+			#	bisection should have caught this and returned
+			#	:failed_other before reaching here.
+				c_min = minimum(centrality)
+				c_max = maximum(centrality)
+				if c_max == c_min
+					c_norm = zeros(Float64, n)
+				else
+					ranks = StatsBase.tiedrank(centrality)
+					c_norm = (ranks .- 1.0) ./ (n - 1)
+				end
 
 		#	Draw u_i and Form the Probability Vector
 			rng  = Xoshiro(sample_seed)
 			u    = rand(rng, n)
 			prob = b .* c_norm .+ (1 - b) .* u
 
-		#	Sign Flip for Negative Target rho
+		#	Sign Flip for Negative Target tau
 			#	Inverting via 1 - prob keeps the prob vector in [0, 1] and
 			#	flips which nodes are preferred for dropping.
 				if sgn == -1
 					prob = 1.0 .- prob
 				end
 
-		#	Numerical Safety: ensure no negative weights
-			#	prob should already be in [0, 1] but floating-point error can
-			#	produce tiny negatives near the boundaries. Clamp.
-				@inbounds for i in 1:n
-					if prob[i] < 0.0
-						prob[i] = 0.0
-					end
+		#	Numerical Safety
+			@inbounds for i in 1:n
+				if prob[i] < 0.0
+					prob[i] = 0.0
 				end
+			end
 
 		#	Weighted-Without-Replacement Sample of k = round(target_rate * N)
 			k = Int(round(target_rate * n))
 			k >= 1                || throw(ArgumentError("target_rate too small: k = $k < 1"))
 			k <= n - 1            || throw(ArgumentError("target_rate too large: k = $k > N - 1 = $(n - 1)"))
 
-			#	Saturation check: count strictly positive prob entries.
-			#	Mirror of the saturation handling in _centrality_correlation_for_b:
-			#	when the bisection returns :ceiling_hit on extreme-skew centrality,
-			#	the call here arrives with a saturated prob vector (e.g., b=1
-			#	on a star fixture gives prob = (1, 0, ..., 0)). StatsBase.sample
-			#	cannot draw k distinct nodes from fewer than k positive weights.
-			#	The fallback selects all positive-weight nodes deterministically
-			#	and uniform-randomly fills the remaining slots from zero-weight
-			#	nodes — the realized indicator correlation matches what the
-			#	bisection's saturation probe predicted.
-				n_positive = count(p -> p > 0.0, prob)
-				if n_positive >= k
-					#	Standard path
-						dropped = StatsBase.sample(rng, 1:n, StatsBase.Weights(prob), k; replace=false)
-				else
-					#	Saturation path: positives always dropped, plus uniform
-					#	draws from zeros to fill remaining slots
-						positive_idxs = findall(p -> p > 0.0, prob)
-						zero_idxs     = findall(p -> p == 0.0, prob)
-						k_remaining   = k - n_positive
-						zero_dropped  = StatsBase.sample(rng, zero_idxs, k_remaining; replace=false)
-						dropped       = vcat(positive_idxs, zero_dropped)
-				end
-				sort!(dropped)
+			n_positive = count(p -> p > 0.0, prob)
+			if n_positive >= k
+				#	Standard path
+					dropped = StatsBase.sample(rng, 1:n, StatsBase.Weights(prob), k; replace=false)
+			else
+				#	Saturation path
+					positive_idxs = findall(p -> p > 0.0, prob)
+					zero_idxs     = findall(p -> p == 0.0, prob)
+					k_remaining   = k - n_positive
+					zero_dropped  = StatsBase.sample(rng, zero_idxs, k_remaining; replace=false)
+					dropped       = vcat(positive_idxs, zero_dropped)
+			end
+			sort!(dropped)
 
 		#	Compute Realized Quantities from the Actual Draw
 			is_dropped = falses(n)
@@ -604,7 +636,7 @@ module network_degeneracy
 				is_dropped[idx] = true
 			end
 			realized_rate = k / n
-			realized_rho  = cor(Float64.(is_dropped), centrality)
+			realized_rho  = StatsBase.corkendall(Float64.(is_dropped), Vector{Float64}(centrality))
 
 		#	Return
 			return (dropped_nodes  = dropped,
