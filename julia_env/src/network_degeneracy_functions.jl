@@ -11,142 +11,18 @@ module network_degeneracy
     using ProgressMeter
 
 #   Sibling-Module Helpers
-    #   Sibling-relative import — submodules cannot `using` their parent
+    #   Sibling-relative imports — submodules cannot `using` their parent
     #   (the parent is still loading when this line runs). Pull in only the
-    #   specific helpers this module needs from network_community_detection.
+    #   specific helpers this module needs.
+    #
+    #   network_reconstruction is included BEFORE network_degeneracy in the
+    #   parent umbrella, so calling into it here is safe. The degeneracy module
+    #   is the testing special case; reconstruction is the primary, user-facing
+    #   module and owns the shared logistic-beta tilt machinery and the
+    #   feasibility envelope.
         using ..network_community_detection: _graph_to_sparse_matrix
-
-#	Helper Centrality Driver: Binarized in-degree (directed) / binarized degree (undirected)
-	function _centrality_for_sampler(edges::DataFrame;
-									nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing,
-									directed::Bool)
-		"""
-		Args:
-			edges::DataFrame: edge list with :src, :dst (weights ignored — binarized)
-			nodes::Union{Nothing,DataFrame,Vector}: optional node universe (includes isolates)
-			directed::Bool: true for directed networks (use binarized in-degree),
-				false for undirected (use binarized degree)
-		Returns:
-			Vector{Float64}: per-node centrality score in the same order as the
-				node universe (the order returned by _graph_to_sparse_matrix)
-		Notes:
-			This is the centrality driver for the Phase 1 sampler — the c_i in
-			prob_i = b*c_i + (1-b)*u_i. It is binarized regardless of any
-			:weight column on the edges DataFrame, following SMM 2022 for the
-			directed case and extending naturally to the undirected case. Edge
-			weights are stripped (weighted=false in _graph_to_sparse_matrix) so
-			the centrality reflects tie presence, not tie intensity — the
-			degradation grid varies tie presence (dropped nodes lose all their
-			edges) and the centrality driver must align with that.
-
-			For directed networks the centrality is the in-degree of the
-			binarized graph: sum of incoming edges per node. For undirected
-			networks the centrality is the degree of the binarized graph: sum
-			of edges per node (each undirected edge counted once per endpoint).
-			On a symmetric adjacency the row sums and column sums are equal, so
-			either axis would work; we use the row sums for consistency with
-			the directed case (where row sums = out-degree, column sums = in-
-			degree, and we want in-degree).
-
-			Returned as Float64 rather than Int because downstream the values
-			are used as weights in StatsBase.sample(..., weights=...) and in
-			the floating-point convex combination prob_i = b*c_i + (1-b)*u_i.
-			The Float64 conversion is done here rather than at every call site.
-
-			Output is in the canonical node order from _graph_to_sparse_matrix
-			— the same order used elsewhere in the package. Callers indexing
-			dropped-node sets back to network names must use the same node
-			ordering convention.
-		"""
-
-		#	Build Binarized Adjacency
-			#	weighted=false strips edge weights; isolates are included when
-			#	the nodes argument is supplied.
-				adj, _, _ = isnothing(nodes) ?
-					_graph_to_sparse_matrix(edges; weighted=false) :
-					_graph_to_sparse_matrix(edges; nodes=nodes, weighted=false)
-				n = size(adj, 1)
-
-		#	Compute Centrality
-			#	Directed: in-degree = column sums of A (number of incoming
-			#	edges to each node). Undirected: degree = sum of incoming AND
-			#	outgoing tie-stubs at each node, because _graph_to_sparse_matrix
-			#	stores each undirected edge as a single directed entry (one
-			#	direction, determined by the edges DataFrame's src/dst layout)
-			#	rather than symmetrizing. We therefore add column sums (incoming)
-			#	to row sums (outgoing) for the undirected case to recover the
-			#	true degree. For directed networks the in-degree is what we
-			#	want and only the column sum is added.
-				centrality = Vector{Float64}(undef, n)
-				nzv  = nonzeros(adj)
-				rows = rowvals(adj)
-				@inbounds for j in 1:n
-					s = 0.0
-					#	Column j: edges with dst == node j (in-degree contribution)
-						for k in nzrange(adj, j)
-							s += nzv[k]
-						end
-					centrality[j] = s
-				end
-				if !directed
-					#	Add row sums (out-degree contribution) so the undirected
-					#	centrality is the full degree, not just the half captured
-					#	by the column sum.
-						@inbounds for j in 1:n
-							for k in nzrange(adj, j)
-								i = rows[k]
-								centrality[i] += nzv[k]
-							end
-						end
-				end
-
-		#	Return
-			return centrality
-	end
-	@doc raw"""
-	**Description**
-	Computes the binarized centrality driver used by the Phase 1 missingness
-	sampler. For directed networks the centrality is in-degree; for undirected
-	networks the centrality is degree. Edge weights are ignored — the
-	centrality reflects tie presence, consistent with the SMM 2022 convention.
-
-	This is the $c_i$ in the sampler's selection-probability formula:
-	$$\text{prob}_i = b \cdot c_i + (1 - b) \cdot u_i,\quad u_i \sim \text{Uniform}(0,1).$$
-
-	**Usage**
-	`_centrality_for_sampler(edges; nodes=nothing, directed=true)`
-
-	**Arguments**
-	- `edges::DataFrame`: edge list with `:src`, `:dst` columns. Any `:weight`
-	  column is ignored.
-	- `nodes::Union{Nothing,DataFrame,Vector}`: optional explicit node universe
-	  including isolates. When `nothing`, only nodes appearing in `edges` are
-	  in the node set.
-	- `directed::Bool`: `true` to use binarized in-degree, `false` to use
-	  binarized degree. Caller typically passes the network's directedness
-	  metadata.
-
-	**Value**
-	`Vector{Float64}` of per-node centrality scores in the canonical node
-	order returned by `_graph_to_sparse_matrix`. Length equals the number of
-	nodes (including any isolates supplied via `nodes`).
-
-	**Notes**
-	Per-network value — does not change across $(\rho, \text{rate})$ targets
-	in the validation grid. The caller (typically `generate_missingness_mask`
-	or the orchestrator `build_degeneration_corpus`) caches the result for
-	each network and reuses it across all 30 cells of the $(\rho, \text{rate})$
-	grid for that network.
-
-	**See Also**
-	`generate_missingness_mask`, `_centrality_correlation_for_b`,
-	`_graph_to_sparse_matrix`
-
-	**References**
-	- Smith, J. A., Morgan, J. H., & Moody, J. (2022). Network sampling
-	  coverage III: Imputation of missing network data under different
-	  network and missing data conditions. *Social Networks*, 68, 148–178.
-	""" _centrality_for_sampler
+        using ..network_reconstruction: _solve_propensity_field, _topup_missing_nodes, _solve_bin_distribution, _centrality_for_sampler, 
+                                        feasible_rho_range
 
 #	Helper Centrality Correlation: Monte Carlo estimate of E[corkendall(is_dropped, c)] at candidate b
 	function _centrality_correlation_for_b(centrality::AbstractVector{<:Real},
@@ -644,6 +520,677 @@ module network_degeneracy
 					realized_rho   = realized_rho)
 	end
 
+#	Helper Function for _sample_weight_removal: multinomial counts over edges
+	function _multinomial_counts(rng::AbstractRNG, probs::AbstractVector{<:Real}, n_draws::Integer)
+		"""
+		Args:
+			rng::AbstractRNG: random stream.
+			probs::AbstractVector{<:Real}: probability vector over edges, sums to ~1.
+			n_draws::Integer: number of units to allocate.
+		Returns:
+			Vector{Int}: per-edge counts summing to n_draws.
+		Notes:
+			Thin wrapper over Distributions.Multinomial; isolated so the removal
+			loop reads cleanly and so the draw is swappable. Falls back to a
+			sequential categorical draw when n_draws is small relative to the
+			edge count (cheaper than allocating the full Multinomial sampler for
+			single-unit redistribution passes).
+		"""
+
+		#	Degenerate cases
+			m = length(probs)
+			counts = zeros(Int, m)
+			(n_draws <= 0 || m == 0) && return counts
+
+		#	Small-draw sequential path
+			if n_draws <= 8
+				w = StatsBase.Weights(collect(float.(probs)))
+				@inbounds for _ in 1:n_draws
+					counts[StatsBase.sample(rng, 1:m, w)] += 1
+				end
+				return counts
+			end
+
+		#	Bulk multinomial path
+			d = Distributions.Multinomial(Int(n_draws), collect(float.(probs)))
+			return rand(rng, d)
+	end
+
+#	Helper Function for _sample_weight_removal: rebuild a sparse matrix on a fixed pattern
+	function _rebuild_sparse(template::SparseMatrixCSC,
+								values::AbstractVector{<:Real},
+								edge_i::AbstractVector{<:Integer},
+								edge_j::AbstractVector{<:Integer})
+		"""
+		Args:
+			template::SparseMatrixCSC: matrix whose size defines the output.
+			values::AbstractVector{<:Real}: per-edge values in the (edge_i, edge_j)
+				enumeration order produced by walking the template's CSC.
+			edge_i, edge_j::AbstractVector{<:Integer}: row/col of each edge, same
+				order as values.
+		Returns:
+			SparseMatrixCSC{Int,Int}: matrix with values placed at (edge_i, edge_j).
+		Notes:
+			Helper for _sample_weight_removal. Reconstructs the removal/weight
+			matrix on the SAME sparsity pattern as the template so edges are
+			preserved even at zero value (zeros retained). Built via sparse()
+			with explicit I, J, V triples.
+		"""
+		n = size(template, 1)
+		I = collect(Int, edge_i)
+		J = collect(Int, edge_j)
+		V = collect(Int, round.(Int, values))
+		return sparse(I, J, V, n, n)
+	end
+
+#	Helper Weighted Adjacency: integer-count weighted matrix for the edge-degradation stage
+	function _weighted_adjacency(edges::DataFrame;
+									nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst and a :weight column.
+			nodes::Union{Nothing,DataFrame,Vector}: optional node universe
+				(includes isolates), same convention as _graph_to_sparse_matrix.
+		Returns:
+			Tuple{SparseMatrixCSC{Float64,Int}, Vector{String}}: (adj, node_names)
+				adj[i, j] = weight of edge from node i to node j (or the symmetric
+				entry for undirected input, exactly as _graph_to_sparse_matrix lays
+				it out). node_names is the canonical node order.
+		Notes:
+			The centrality driver deliberately binarizes (weighted=false). The
+			edge-degradation stage needs the actual integer weights, so this
+			builds a weighted adjacency via _graph_to_sparse_matrix with
+			weighted=true. Edge weights are treated as integer counts (the
+			Bellutta Chapter-3 weight-unit model); non-integer weights are
+			accepted as-is but the weight-removal stage rounds the per-edge
+			budget, so fractional weights degrade gracefully to their rounded
+			counterparts.
+		"""
+
+		#	Build Weighted Adjacency
+			adj, node_names, _ = isnothing(nodes) ?
+				_graph_to_sparse_matrix(edges; weighted=true) :
+				_graph_to_sparse_matrix(edges; nodes=nodes, weighted=true)
+
+		#	Return
+			return (adj, node_names)
+	end
+
+#	Helper Propensity Field: logistic-beta tilt over centrality-rank bins (shared with reconstruction)
+	function _solve_propensity_field(centrality::AbstractVector{<:Real},
+										target_rho::Real,
+										pi_node::Real,
+										K::Int)
+		"""
+		Args:
+			centrality::AbstractVector{<:Real}: per-node centrality from
+				_centrality_for_sampler, in canonical node order.
+			target_rho::Real: target Kendall tau-b between the binary missingness
+				indicator and centrality; in (-1, 1).
+			pi_node::Real: target missing-node fraction; in (0, 1). Sets the
+				reference split (retained, missing) = (N - k, k), k = round(pi_node*N),
+				that the tilt is solved against.
+			K::Int: number of centrality-rank bins; 2 <= K <= N.
+		Returns:
+			NamedTuple: (d, q, beta, bin_index, status)
+				- d::Vector{Float64}: per-node RELATIVE propensity (the rho-tilted
+					shape), normalized to node-mean 1. Each stage applies its own
+					level (pi_edge for weight removal, pi_node for node accounting).
+				- q::Vector{Float64}: per-bin softmax distribution, length K.
+				- beta::Float64: solved logistic-skew parameter.
+				- bin_index::Vector{Int}: per-node centrality-rank bin (1..K).
+				- status::Symbol: :converged, :ceiling_hit, or :failed_other.
+		Notes:
+			The single rho-governed field that both the weight-removal stage and
+			the node-accounting stage draw from, replacing the old b-mixing prob
+			vector. Reuses the reconstruction module's logistic-beta machinery
+			directly via _solve_bin_distribution, which bisects
+			_realized_rho_for_beta to find q = softmax(beta * b_tilde) over K bins.
+			Degradation's (retained, missing) counts map onto reconstruction's
+			(N, N_add), so the identical analytic tau-b applies and both modules
+			share one tilt.
+
+			At target_rho = 0 the solve returns beta = 0, q uniform, d constant 1,
+			so weight removal is proportional-to-current-weight (Bellutta MCAR)
+			and node selection is uniform.
+
+			The retained-uniform assumption inside _realized_rho_for_beta is only
+			approximate for degradation (carving out missing nodes makes the
+			retained per-bin counts non-uniform under a strong tilt), so the
+			realized tau-b is verified by the end-of-pipeline 3-prior gate, not
+			trusted from this solve. :ceiling_hit is propagated so the caller can
+			honor the up-front feasibility decision rather than chase an
+			unreachable rho.
+
+			Bins are rank-equal (~N/K per bin); bin 1 is most peripheral, bin K
+			most central, matching reconstruction's higher-bin = higher-centrality
+			convention.
+		"""
+
+		#	Guards
+			n = length(centrality)
+			n >= 2 || throw(ArgumentError("centrality must have at least 2 nodes, got $n"))
+			(-1.0 < target_rho < 1.0) ||
+				throw(ArgumentError("target_rho must be in (-1, 1), got $target_rho"))
+			(0.0 < pi_node < 1.0) ||
+				throw(ArgumentError("pi_node must be in (0, 1), got $pi_node"))
+			K >= 2 || throw(ArgumentError("K must be >= 2, got $K"))
+			K <= n || throw(ArgumentError("K must be <= N = $n, got $K"))
+
+		#	Assign Centrality-Rank Bins
+			#	Sort node indices by centrality ascending; the rank_pos-th
+			#	lowest-centrality node lands in bin ceil(rank_pos * K / n),
+			#	giving ~N/K nodes per bin to match the analytic tau-b's
+			#	uniform-observed assumption.
+				order = sortperm(collect(centrality))
+				bin_index = Vector{Int}(undef, n)
+				@inbounds for rank_pos in 1:n
+					node = order[rank_pos]
+					bin_index[node] = Int(cld(rank_pos * K, n))
+				end
+
+		#	Solve the Logistic Tilt (reused from network_reconstruction)
+			#	(retained, missing) = (N - k, k) map onto reconstruction's
+			#	(N, N_add); q is the target per-bin distribution of the missing
+			#	set; status carries the ceiling decision to the caller.
+				k = clamp(Int(round(pi_node * n)), 1, n - 1)
+				solve  = _solve_bin_distribution(target_rho, K, n - k, k)
+				q      = solve.q
+				beta   = solve.beta
+				status = solve.status
+
+		#	Map q to a Per-Node Relative Propensity (node-mean 1)
+			#	d_i = K * q[bin_i]: with ~N/K nodes per bin the node-mean is
+			#	sum_b (N/K)/N * (K*q_b) = sum_b q_b = 1. At beta = 0, q_b = 1/K
+			#	so d_i = 1 for all i (constant -> MCAR).
+				d = Vector{Float64}(undef, n)
+				@inbounds for i in 1:n
+					d[i] = K * q[bin_index[i]]
+				end
+
+		#	Return
+			return (d = d, q = q, beta = beta, bin_index = bin_index, status = status)
+	end
+
+#	Helper Weight Removal: survival-tilted, budget-hitting integer weight-unit removal
+	function _sample_weight_removal(adj::SparseMatrixCSC,
+										d::AbstractVector{<:Real},
+										pi_edge::Real,
+										sample_seed::Integer)
+		"""
+		Args:
+			adj::SparseMatrixCSC: weighted integer-count adjacency (from
+				_weighted_adjacency), canonical node order.
+			d::AbstractVector{<:Real}: per-node relative propensity from
+				_solve_propensity_field (node-mean 1). Higher d_i => node i's
+				incident weight is preferentially removed.
+			pi_edge::Real: fraction of TOTAL true weight to remove; in [0, 1).
+			sample_seed::Integer: seed for the multinomial removal draws.
+		Returns:
+			NamedTuple: (removed, W_true, W_removed, organic_losses, n_edges_zeroed)
+				- removed::SparseMatrixCSC{Float64,Int}: same sparsity pattern and
+					node order as adj; removed[i,j] = units removed from edge (i,j).
+					Edge entries are PRESERVED even when fully removed (zeros
+					retained); subtract from adj to get the degraded weights.
+				- W_true::Int: total weight before removal.
+				- W_removed::Int: total weight actually removed (= round(pi_edge*W_true)).
+				- organic_losses::Vector{Int}: node indices whose incident weight is
+					fully removed (zero remaining), sorted ascending.
+				- n_edges_zeroed::Int: count of edges driven to zero weight.
+		Notes:
+			Implements the unified edge-degradation stage. Each weight unit on
+			edge (i,j) is removed with probability proportional to its edge's
+			survival-tilted hazard: edge weight w_ij carries a per-unit removal
+			tendency tied to its endpoints' propensities via INDEPENDENT ENDPOINT
+			SURVIVAL — the unit survives iff it survives at both endpoints, so
+			the removal hazard scales with 1 - (1-s*d_i)(1-s*d_j) for a small base
+			rate s. We implement this with the batched, current-weight-proportional
+			draw from the Bellutta Chapter-3 prototype (induce_edge_weight_missingness):
+			sample units proportional to (current weight * endpoint tilt), clip
+			per-edge removals to available weight, decrement, and redistribute the
+			clipped quota until the W_removed budget is met.
+
+			At target_rho = 0 the propensity field is constant (d_i = 1 for all i),
+			so the endpoint tilt is uniform and removal is exactly proportional to
+			current weight — the Bellutta MCAR corner, matching the prototype.
+
+			Edges are PRESERVED at zero weight (the dyad was observed-as-sampled);
+			row count is invariant. A node whose every incident edge reaches zero
+			is an ORGANIC LOSS (no observed incident weight) — these are the
+			tie-degradation-induced missing nodes handed to the node-accounting
+			stage. Because low-weight (weak-tie, peripheral) nodes have the least
+			weight to lose, organic losses concentrate on the periphery by
+			construction, even at rho = 0.
+
+			Determinism: all draws derive from sample_seed via a single Xoshiro
+			stream, so the removal is reproducible in sample_seed.
+
+			Edge cases:
+			- pi_edge = 0: returns an all-zero removal matrix, W_removed = 0, no
+			  organic losses. Caller skips the edge stage in this case.
+			- W_removed >= W_true: clamped to W_true (cannot remove more than
+			  exists); every edge zeroed, every node an organic loss.
+		"""
+
+		#	Guards
+			n = size(adj, 1)
+			size(adj, 2) == n || throw(ArgumentError("adj must be square"))
+			length(d) == n || throw(ArgumentError("d length $(length(d)) != N $n"))
+			(0.0 <= pi_edge < 1.0) || throw(ArgumentError("pi_edge must be in [0, 1), got $pi_edge"))
+
+		#	Materialize Edge List from Sparsity Pattern
+			#	Walk the CSC once to collect (i, j, w) triples plus an endpoint
+			#	tilt per edge. The tilt uses independent endpoint survival on the
+			#	normalized propensities scaled into [0,1] via d/(2*max(d)) so that
+			#	the constant-d (rho=0) case yields a uniform tilt and removal
+			#	reduces to current-weight-proportional.
+				rows = rowvals(adj)
+				nzv  = nonzeros(adj)
+				n_edges = nnz(adj)
+				edge_i = Vector{Int}(undef, n_edges)
+				edge_j = Vector{Int}(undef, n_edges)
+				weight = Vector{Float64}(undef, n_edges)
+				W_true = 0.0
+				let e = 0
+					@inbounds for j in 1:n
+						for k in nzrange(adj, j)
+							e += 1
+							i = rows[k]
+							edge_i[e] = i
+							edge_j[e] = j
+							weight[e] = nzv[k]
+							W_true   += nzv[k]
+						end
+					end
+				end
+				W_true_int = Int(round(W_true))
+
+		#	Budget
+			W_removed = min(Int(round(pi_edge * W_true)), W_true_int)
+			removed = zeros(Int, n_edges)
+
+		#	Early exit on no-op
+			if W_removed <= 0 || n_edges == 0
+				#	Build empty removal matrix (same pattern) and return.
+					rem_mat = _rebuild_sparse(adj, removed, edge_i, edge_j)
+					return (removed = rem_mat, W_true = W_true_int, W_removed = 0,
+							organic_losses = Int[], n_edges_zeroed = 0)
+			end
+
+		#	Endpoint Tilt per Edge (independent endpoint survival)
+			#	s_i = d_i / (2*max(d)) in [0, 0.5]; survival at an endpoint is
+			#	(1 - s); the edge's removal hazard is 1 - (1-s_i)(1-s_j). At
+			#	constant d (rho=0) every s is equal so hazard is constant across
+			#	edges => removal proportional to current weight only.
+				dmax = maximum(d)
+				dmax <= 0 && (dmax = 1.0)
+				s = (d ./ (2.0 * dmax))
+				tilt = Vector{Float64}(undef, n_edges)
+				@inbounds for e in 1:n_edges
+					si = s[edge_i[e]]
+					sj = s[edge_j[e]]
+					tilt[e] = 1.0 - (1.0 - si) * (1.0 - sj)
+				end
+
+		#	Batched Current-Weight-Proportional Removal (clip + redistribute)
+			rng = Xoshiro(sample_seed)
+			remaining = W_removed
+			#	avail[e] = weight[e] - removed[e] tracked implicitly via removed
+				safety_iters = 0
+				while remaining > 0 && safety_iters < 10_000
+					safety_iters += 1
+					#	Build current sampling weights: (current weight) * tilt,
+					#	zero where the edge is exhausted.
+						probs = Vector{Float64}(undef, n_edges)
+						total = 0.0
+						@inbounds for e in 1:n_edges
+							avail = weight[e] - removed[e]
+							pe = avail > 0 ? avail * tilt[e] : 0.0
+							probs[e] = pe
+							total += pe
+						end
+						total <= 0 && break
+					#	Draw `remaining` units multinomially over edges, then clip
+					#	each edge's draw to its available weight; decrement, and
+					#	loop with the unmet quota.
+						draws = _multinomial_counts(rng, probs ./ total, remaining)
+						drawn_total = 0
+						@inbounds for e in 1:n_edges
+							avail = Int(round(weight[e])) - removed[e]
+							take  = min(draws[e], avail)
+							removed[e] += take
+							drawn_total += take
+						end
+						remaining = W_removed - sum(removed)
+						#	Defensive: if a full pass removed nothing (all clipped),
+						#	force a single deterministic unit onto the max-available
+						#	edge to guarantee progress.
+							if drawn_total == 0
+								best_e = 0; best_avail = 0
+								@inbounds for e in 1:n_edges
+									avail = Int(round(weight[e])) - removed[e]
+									if avail > best_avail
+										best_avail = avail; best_e = e
+									end
+								end
+								best_e == 0 && break
+								removed[best_e] += 1
+								remaining = W_removed - sum(removed)
+							end
+				end
+
+		#	Organic Losses and Zeroed Edges
+			#	Per-node remaining incident weight; a node with zero remaining is
+			#	an organic loss. Edges with full removal are counted.
+				node_remaining = zeros(Float64, n)
+				n_edges_zeroed = 0
+				@inbounds for e in 1:n_edges
+					rem_w = weight[e] - removed[e]
+					if rem_w <= 1e-9
+						n_edges_zeroed += 1
+					end
+					node_remaining[edge_i[e]] += rem_w
+					node_remaining[edge_j[e]] += rem_w
+				end
+				organic_losses = Int[]
+				@inbounds for v in 1:n
+					#	A node is an organic loss only if it had incident weight and
+					#	now has effectively none. Float tolerance guards non-integer
+					#	weights; isolates are filtered out below via had_incident.
+						node_remaining[v] <= 1e-9 || continue
+						push!(organic_losses, v)
+				end
+				#	Filter to nodes that originally had incident weight: a true
+				#	isolate has node_remaining == 0 but was never "lost". Recompute
+				#	original incidence and intersect.
+					had_incident = falses(n)
+					@inbounds for e in 1:n_edges
+						had_incident[edge_i[e]] = true
+						had_incident[edge_j[e]] = true
+					end
+					organic_losses = sort!([v for v in organic_losses if had_incident[v]])
+
+		#	Build Removal Matrix (same pattern as adj)
+			rem_mat = _rebuild_sparse(adj, removed, edge_i, edge_j)
+
+		#	Return
+			return (removed = rem_mat,
+					W_true = W_true_int,
+					W_removed = sum(removed),
+					organic_losses = organic_losses,
+					n_edges_zeroed = n_edges_zeroed)
+	end
+
+#	Helper Function for _three_prior_gate: E/I-by-degree-rank profile of a node subgraph
+	function _ei_rank_profile(adj_binary::SparseMatrixCSC,
+								community::AbstractVector{<:Integer},
+								keep::AbstractVector{Bool},
+								n_rank_bins::Int,
+								n_ei_bins::Int)
+		"""
+		Args:
+			adj_binary::SparseMatrixCSC: binarized adjacency, canonical node order.
+			community::AbstractVector{<:Integer}: per-node TRUE community labels.
+			keep::AbstractVector{Bool}: node mask defining the subgraph to profile
+				(all-true for the true network; survivors for the degraded one).
+			n_rank_bins::Int: number of degree-rank bins.
+			n_ei_bins::Int: number of E/I bins on the fixed [-1, 1] range.
+		Returns:
+			Matrix{Float64}: n_rank_bins x n_ei_bins, row-stochastic per occupied
+				rank bin — row r is P(E/I bin | degree-rank bin r) among the kept
+				nodes. Empty rank bins are left as a zero row (occupancy reported
+				separately) so the caller can weight/skip them.
+			Also returns per-rank-bin occupancy counts as the second tuple element.
+		Notes:
+			The E/I-by-degree-rank profile at the heart of prior 3. Both E/I and
+			degree rank are computed ON THE SUBGRAPH induced by `keep` — an edge
+			counts only if BOTH endpoints are kept — so removal genuinely re-ranks
+			survivors and re-scores their brokerage (a node whose same-community
+			neighbors were dropped reads as more external on the thinned graph).
+			Community LABELS are ground truth (passed in); only incidence thins.
+
+			Degree rank is rank-equal over the KEPT nodes (bin = ceil(rank*K/M),
+			M = #kept), so the true-network profile and the survivor profile are
+			compared by RELATIVE rank position — scale-free and robust to the
+			change in node count after removal. E/I is binned on the fixed [-1, 1]
+			range so both profiles share an identical E/I axis.
+
+			Returns the conditional P(E/I | rank) per bin (row-normalized), not the
+			joint, so that the degree-tilt prior 2 already controls does not enter
+			the comparison; prior 3 is purely the brokerage-given-rank relationship.
+		"""
+
+		#	Subgraph degree + E/I on kept nodes only (both endpoints kept)
+			n = size(adj_binary, 1)
+			rows = rowvals(adj_binary)
+			deg = zeros(Int, n)
+			internal = zeros(Int, n)
+			external = zeros(Int, n)
+			@inbounds for j in 1:n
+				keep[j] || continue
+				for k in nzrange(adj_binary, j)
+					i = rows[k]
+					keep[i] || continue
+					deg[i] += 1; deg[j] += 1
+					if community[i] == community[j]
+						internal[i] += 1; internal[j] += 1
+					else
+						external[i] += 1; external[j] += 1
+					end
+				end
+			end
+
+		#	Kept node indices and their within-subgraph degree rank
+			kept = findall(keep)
+			M = length(kept)
+			profile = zeros(Float64, n_rank_bins, n_ei_bins)
+			occ = zeros(Int, n_rank_bins)
+			M == 0 && return (profile, occ)
+
+			#	Rank kept nodes by subgraph degree (ascending); rank_pos -> rank bin
+				order = sort(kept; by = v -> deg[v])
+				rank_bin = Dict{Int,Int}()
+				@inbounds for rank_pos in 1:M
+					rank_bin[order[rank_pos]] = Int(cld(rank_pos * n_rank_bins, M))
+				end
+
+		#	Accumulate E/I counts per rank bin
+			@inbounds for v in kept
+				rb = clamp(rank_bin[v], 1, n_rank_bins)
+				tot = internal[v] + external[v]
+				eiv = tot == 0 ? 0.0 : (external[v] - internal[v]) / tot
+				eb = clamp(Int(cld((eiv + 1.0) / 2.0 * n_ei_bins, 1)), 1, n_ei_bins)
+				profile[rb, eb] += 1.0
+				occ[rb] += 1
+			end
+
+		#	Row-normalize occupied rank bins to P(E/I | rank bin)
+			@inbounds for rb in 1:n_rank_bins
+				occ[rb] > 0 && (profile[rb, :] ./= occ[rb])
+			end
+
+		#	Return profile + occupancy
+			return (profile, occ)
+	end
+
+#	Helper Function for _three_prior_gate: worst per-rank-bin profile distortion (survivors vs truth)
+	function _profile_distortion(true_profile::Matrix{Float64},
+									true_occ::AbstractVector{<:Integer},
+									surv_profile::Matrix{Float64},
+									surv_occ::AbstractVector{<:Integer};
+									min_count::Int = 5)
+		"""
+		Args:
+			true_profile::Matrix{Float64}: n_rank_bins x n_ei_bins, P(E/I | rank)
+				on the TRUE network (computed once at setup).
+			true_occ::AbstractVector{<:Integer}: per-rank-bin counts on the true
+				network.
+			surv_profile::Matrix{Float64}: same shape, on the SURVIVING subgraph.
+			surv_occ::AbstractVector{<:Integer}: per-rank-bin counts among survivors.
+			min_count::Int: minimum survivor count for a rank bin to contribute
+				(default 5; mirrors the framework's min-nodes-per-bin floors).
+		Returns:
+			Float64: the MAXIMUM per-rank-bin total-variation distance between the
+				survivor and true E/I-given-rank distributions, taken over rank
+				bins that clear min_count (the "worst-bin" distortion), in [0, 1].
+				NaN if no rank bin clears min_count (caller treats NaN as "prior 3
+				not assessable" and skips it).
+		Notes:
+			Compares the survivors' E/I-by-degree-rank curve to the true network's
+			RELATIVE-rank curve, bin for bin, and reports the WORST qualifying bin.
+
+			Why the worst bin rather than an average: broker-stripping — the
+			canonical malignant removal — concentrates its distortion in the HIGH-
+			degree rank bins, because brokers are high-degree by construction.
+			Averaging the per-bin TVD across all rank bins dilutes that signal by
+			roughly a factor of n_rank_bins (only the top bin moves), which can hide
+			a real bend below the gate tolerance. Taking the max over qualifying
+			bins keeps prior 3 sensitive to a distortion that lives in a single bin,
+			which is exactly the broker-stripping signature.
+
+			The min_count guard still excludes thinly populated bins from
+			contributing, so a one- or two-node bin cannot trip the gate on sampling
+			noise; among the bins that DO clear min_count, the worst one governs.
+
+			A benign removal leaves survivor P(E/I | rank) ~ true P(E/I | rank) in
+			every bin, so the worst-bin TVD stays small; a removal that strips
+			brokers bends the top bin and the worst-bin TVD jumps.
+
+			TOLERANCE NOTE: because this returns a max rather than a mean, the gate's
+			ei_tvd_tol is on a different (strictly larger) scale than under the prior
+			occupancy-weighted mean — recalibrate ei_tvd_tol against a real network
+			before trusting it in the corpus.
+		"""
+
+		#	Guards
+			size(true_profile) == size(surv_profile) ||
+				throw(ArgumentError("profile shapes must match"))
+			n_rank_bins = size(true_profile, 1)
+
+		#	Worst per-rank-bin TVD among bins clearing min_count
+			worst = -1.0
+			any_qual = false
+			@inbounds for rb in 1:n_rank_bins
+				surv_occ[rb] >= min_count || continue
+				true_occ[rb] > 0 || continue
+				any_qual = true
+				tvd = 0.5 * sum(abs.(surv_profile[rb, :] .- true_profile[rb, :]))
+				tvd > worst && (worst = tvd)
+			end
+
+		#	Return worst qualifying bin (or NaN if none qualified)
+			return any_qual ? worst : NaN
+	end
+
+#	Helper Three-Prior Gate: end-of-pipeline contract check on the combined missing set
+	function _three_prior_gate(missing_nodes::AbstractVector{<:Integer},
+								centrality::AbstractVector{<:Real},
+								true_community::AbstractVector{<:Integer},
+								adj_binary::SparseMatrixCSC,
+								true_profile::Matrix{Float64},
+								true_occ::AbstractVector{<:Integer},
+								pi_node::Real,
+								target_rho::Real;
+								rho_tol::Real = 0.02,
+								ei_tvd_tol::Real = 0.25,
+								n_rank_bins::Int = 4,
+								n_ei_bins::Int = 3,
+								min_count::Int = 5)
+		"""
+		Args:
+			missing_nodes::AbstractVector{<:Integer}: combined missing set.
+			centrality::AbstractVector{<:Real}: per-node centrality, canonical order.
+			true_community::AbstractVector{<:Integer}: per-node community label on the
+				TRUE network (precomputed once at setup), canonical order.
+			adj_binary::SparseMatrixCSC: binarized adjacency of the TRUE network.
+			true_profile::Matrix{Float64}: the TRUE network's E/I-by-degree-rank
+				profile (n_rank_bins x n_ei_bins, P(E/I | rank)), precomputed once
+				at setup via _ei_rank_profile on all nodes.
+			true_occ::AbstractVector{<:Integer}: per-rank-bin occupancy of the true
+				profile.
+			pi_node::Real: nominal missing-node fraction.
+			target_rho::Real: nominal correlation.
+			rho_tol::Real: tolerance on |realized_rho - target_rho| (default 0.02).
+			ei_tvd_tol::Real: tolerance on the survivor-vs-true profile distortion
+				(default 0.25).
+			n_rank_bins, n_ei_bins::Int: profile binning; must match the binning
+				used to build true_profile.
+			min_count::Int: minimum survivor count for a rank bin to contribute to
+				the distortion (default 5).
+		Returns:
+			NamedTuple: (passed, realized_pi_node, realized_rho, ei_tvd,
+						 prior1_ok, prior2_ok, prior3_ok)
+		Notes:
+			The single end-of-pipeline gate (Spec v3 Section 4.4). Validates the
+			final missing set against the three priors:
+			  1. proportion: realized |missing|/N ~= pi_node (near-exact).
+			  2. correlation: Kendall tau-b(missing-indicator, centrality) ~= target_rho.
+			  3. E/I-by-degree-rank distortion: does removing these nodes BEND the
+			     observed E/I-versus-degree-rank relationship away from the truth?
+			     The SURVIVING subgraph's E/I-by-degree-rank profile is compared to
+			     the TRUE network's profile (occupancy-weighted per-rank-bin TVD via
+			     _profile_distortion); a benign removal leaves the curve intact, a
+			     malignant one (stripping brokers so the new high-rank nodes are
+			     disproportionately internal/external) inflates the distortion.
+			Both E/I and degree rank for the survivor profile are recomputed ON THE
+			THINNED subgraph (community labels are ground truth; incidence thins),
+			so re-ranking and re-scored brokerage are captured. Uses the precomputed
+			true profile, so no per-replicate community detection runs.
+
+			Prior 3 is skipped (prior3_ok = true) when there is no usable community
+			structure (single community) or no survivor rank bin clears min_count
+			(distortion NaN); the binary-undirected floor still gets priors 1 and 2.
+		"""
+
+		#	Guards
+			n = length(centrality)
+			length(true_community) == n ||
+				throw(ArgumentError("true_community length != N"))
+
+		#	Prior 1: proportion
+			is_missing = falses(n)
+			@inbounds for v in missing_nodes
+				(1 <= v <= n) || throw(ArgumentError("missing node $v out of range"))
+				is_missing[v] = true
+			end
+			realized_pi_node = count(is_missing) / n
+			prior1_ok = isapprox(realized_pi_node, pi_node; atol = 1.0 / n + 1e-9)
+
+		#	Prior 2: Kendall tau-b correlation
+			realized_rho = StatsBase.corkendall(Float64.(is_missing), Vector{Float64}(centrality))
+			isnan(realized_rho) && (realized_rho = 0.0)
+			prior2_ok = abs(realized_rho - target_rho) <= rho_tol
+
+		#	Prior 3: E/I-by-degree-rank distortion of the SURVIVING network vs truth
+			#	Build the survivor profile on the thinned subgraph (E/I and degree
+			#	rank both recomputed on survivors; true community labels), then
+			#	score its occupancy-weighted per-rank-bin distortion from the
+			#	precomputed true profile. NaN distortion (no rank bin clears
+			#	min_count, or single community) => prior 3 not assessable => pass.
+				ei_tvd = NaN
+				prior3_ok = true
+				ncomm = length(unique(true_community))
+				if ncomm >= 2
+					keep = .!is_missing
+					surv_profile, surv_occ = _ei_rank_profile(adj_binary, true_community,
+															   keep, n_rank_bins, n_ei_bins)
+					ei_tvd = _profile_distortion(true_profile, true_occ,
+												  surv_profile, surv_occ;
+												  min_count = min_count)
+					prior3_ok = isnan(ei_tvd) ? true : (ei_tvd <= ei_tvd_tol)
+				end
+
+		#	Return
+			passed = prior1_ok && prior2_ok && prior3_ok
+			return (passed = passed,
+					realized_pi_node = realized_pi_node,
+					realized_rho = realized_rho,
+					ei_tvd = ei_tvd,
+					prior1_ok = prior1_ok,
+					prior2_ok = prior2_ok,
+					prior3_ok = prior3_ok)
+	end
+
 #	Helper Topological Degeneracy: gc fraction, node count, edge count + threshold flags
 	function _topological_degeneracy(adj::SparseMatrixCSC,
 										dropped_nodes::AbstractVector{<:Integer};
@@ -847,435 +1394,106 @@ module network_degeneracy
 				any_topo_degenerate      = any_topo)
 	end
 
-#	Generate Missingness Mask: full per-replicate record for one (network, target) draw
-	function generate_missingness_mask(edges::DataFrame;
-										nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing,
-										directed::Bool,
-										target_rate::Real,
-										target_rho::Real,
-										seed::Integer,
-										centrality::Union{Nothing,AbstractVector{<:Real}} = nothing,
-										gc_threshold::Real = 0.30,
-										min_n::Int         = 25,
-										min_edges::Int     = 1,
-										bisection_tol::Real      = 0.02,
-										bisection_max_iters::Int = 50,
-										bisection_M::Int         = 50)
+#	Helper Function for build_degeneration_corpus: TRUE-network community labels (precomputed once)
+	function _true_communities(adj_binary::SparseMatrixCSC)
 		"""
 		Args:
-			edges::DataFrame: original edge list with :src, :dst (weights ignored)
-			nodes::Union{Nothing,DataFrame,Vector}: optional node universe
-				(includes isolates)
-			directed::Bool: true for directed networks, false for undirected;
-				selects the centrality driver (binarized in-degree vs degree)
-			target_rate::Real: target fraction of nodes to drop; in (0, 1)
-			target_rho::Real: target induced correlation between prob_i and
-				centrality; in (-1, 1)
-			seed::Integer: master seed for this replicate; deterministically
-				split into bisection and sampling sub-seeds
-			centrality::Union{Nothing,Vector{<:Real}}: optional precomputed
-				centrality vector. When nothing, computed via
-				_centrality_for_sampler internally. Pass the cached value when
-				calling repeatedly for one network (the orchestrator
-				build_degeneration_corpus does this).
-			gc_threshold::Real: passed through to _topological_degeneracy
-			min_n::Int: passed through to _topological_degeneracy
-			min_edges::Int: passed through to _topological_degeneracy
-			bisection_tol::Real: convergence tolerance, passed to bisection
-			bisection_max_iters::Int: iteration cap, passed to bisection
+			adj_binary::SparseMatrixCSC: binarized adjacency of the TRUE network.
 		Returns:
-			NamedTuple per Section 4.3 of the validation roadmap:
-				(dropped_nodes, nominal, realized_rate, realized_rho,
-				 bisection_status, sampler_degeneracy, seed)
+			Vector{Int}: per-node community label, canonical node order.
 		Notes:
-			This is the public per-replicate sampler. One call produces one
-			degraded network's full record. The orchestrator
-			build_degeneration_corpus invokes this in a loop over the
-			(network, rho, rate, replicate) grid.
+			Computed ONCE per true network at setup so the per-replicate three-prior
+			E/I check is O(|missing|) with no per-replicate detection (Spec v3
+			Section 4.4). This is the ground-truth reference for the gate; the
+			noisier observed-network detection stays in Phase 1.5.
 
-			Seed splitting. The master seed produces two sub-seeds via Xoshiro
-			advancement — one consumed by _bisect_b_for_target_rho (for the
-			deterministic prob-vector construction at each candidate b), the
-			other consumed by _sample_missingness (for the prob vector and
-			weighted-without-replacement draw that produces dropped_nodes).
-			The splitting is itself deterministic, so the same master seed
-			always produces the same record (Test 4).
-
-			Centrality caching. When the caller knows it will call this
-			function many times for the same network (the grid orchestrator
-			does, 30 times), it should compute centrality once via
-			_centrality_for_sampler and pass it in. When called one-off (tests,
-			diagnostics), pass nothing and accept the per-call recompute.
-
-			Record fields. The returned NamedTuple matches the per-replicate
-			record specified in the validation roadmap Section 4.3:
-				- dropped_nodes::Vector{Int}    sorted ascending
-				- nominal::NamedTuple           (rate, rho) target
-				- realized_rate::Float64        actual fraction dropped
-				- realized_rho::Float64         realized cor(is_dropped, c)
-				- bisection_status::Symbol      :converged, :ceiling_hit, :failed_other
-				- sampler_degeneracy::NT        from _topological_degeneracy
-				- seed::Int                     the master seed for this record
-			The measure_degeneracy and framework_degeneracy fields specified
-			in Section 4.3 are NOT populated here — they're populated by the
-			measure code and framework code respectively when they run.
-
-			Failure modes. When the bisection returns :ceiling_hit, sampling
-			still proceeds at b = 1 (the closest the formula can get to
-			target rho), and the realized_rho will reflect the achievable
-			ceiling. When the bisection returns :failed_other (constant
-			centrality, max_iters exceeded, etc.), sampling is NOT performed
-			and the returned record has empty dropped_nodes, NaN realized
-			values, and degeneracy fields filled with placeholders. The
-			caller should treat :failed_other records as unusable and either
-			retry with a different seed or exclude from analysis.
+			SEAM: this default labels weakly-connected components, which is
+			dependency-free and always available. When the community-detection
+			sibling's public entrypoint is wired in, replace the body with the
+			CHAMP/Leiden call (e.g. network_community_detection.detect(...)) and
+			keep this signature. Single-community outputs cause the gate to skip
+			prior 3 (E/I undefined), so the connected-components fallback degrades
+			gracefully on networks with one weak component.
 		"""
 
-		#	Guards
-			(0.0 < target_rate < 1.0) || throw(ArgumentError("target_rate must be in (0, 1), got $target_rate"))
-			(-1.0 < target_rho < 1.0) || throw(ArgumentError("target_rho must be in (-1, 1), got $target_rho"))
-
-		#	Centrality: compute or accept cached
-			c = isnothing(centrality) ?
-				_centrality_for_sampler(edges; nodes=nodes, directed=directed) :
-				centrality
-			n = length(c)
-
-		#	Seed Splitting: master seed → (bisection_seed, sample_seed)
-			#	Advance a master RNG twice to produce two independent UInt
-			#	sub-seeds. This is deterministic in `seed` and gives the two
-			#	internal functions non-overlapping random streams.
-				master_rng     = Xoshiro(seed)
-				bisection_seed = Int(rand(master_rng, UInt32))
-				sample_seed    = Int(rand(master_rng, UInt32))
-
-		#	Bisection: find b such that realized cor(is_dropped, c) ~ |target_rho|
-			bisection = _bisect_b_for_target_rho(c, target_rho, target_rate, bisection_seed;
-												  tol = bisection_tol,
-												  max_iters = bisection_max_iters,
-												  M = bisection_M)
-
-		#	Failure-mode short-circuit: :failed_other yields a placeholder record
-			if bisection.status == :failed_other
-				#	Need adj for the degeneracy-fields placeholder; cheaper to
-				#	skip and emit zeros than to build adj on a failed record.
-				#	Caller treats :failed_other as unusable.
-					return (dropped_nodes      = Int[],
-							nominal            = (rate = target_rate, rho = target_rho),
-							realized_rate      = NaN,
-							realized_rho       = NaN,
-							bisection_status   = :failed_other,
-							sampler_degeneracy = (gc_fraction_of_remaining = NaN,
-													n_observed             = 0,
-													n_edges_observed       = 0,
-													gc_collapse            = true,
-													too_small              = true,
-													no_edges               = true,
-													any_topo_degenerate    = true),
-							seed               = Int(seed))
+		#	Weakly-connected component labeling via union-find over the pattern
+			n = size(adj_binary, 1)
+			parent = collect(1:n)
+			find(x) = begin
+				root = x
+				while parent[root] != root; root = parent[root]; end
+				while parent[x] != root; parent[x], x = root, parent[x]; end
+				root
 			end
-
-		#	Sampling: draw the dropped-node set at the bisected b
-			draw = _sample_missingness(c, target_rate, bisection.b, bisection.sign, sample_seed)
-
-		#	Build adj for the topological degeneracy check
-			#	Use the same binarized adjacency the centrality computation
-			#	used; pass weighted=false explicitly.
-				adj, _, _ = isnothing(nodes) ?
-					_graph_to_sparse_matrix(edges; weighted=false) :
-					_graph_to_sparse_matrix(edges; nodes=nodes, weighted=false)
-
-		#	Topological degeneracy on the degraded network
-			degen = _topological_degeneracy(adj, draw.dropped_nodes;
-											gc_threshold = gc_threshold,
-											min_n        = min_n,
-											min_edges    = min_edges)
-
-		#	Assemble per-replicate record
-			return (dropped_nodes      = draw.dropped_nodes,
-					nominal            = (rate = target_rate, rho = target_rho),
-					realized_rate      = draw.realized_rate,
-					realized_rho       = draw.realized_rho,
-					bisection_status   = bisection.status,
-					sampler_degeneracy = degen,
-					seed               = Int(seed))
-	end
-	@doc raw"""
-	**Description**
-	Generates one per-replicate missingness record for the Phase~1 degeneration
-	grid. Given a network and a target $(\text{rate}, \rho)$ cell, this function
-	composes the full sampler pipeline --- centrality computation, bisection
-	for the mixing scalar~$b$, weighted-without-replacement sampling of the
-	dropped-node set, and topological-degeneracy detection --- into a single
-	record matching the schema in Section~4.3 of the validation roadmap.
-
-	**Usage**
-	`generate_missingness_mask(edges; nodes=nothing, directed=true, target_rate=0.10, target_rho=0.25, seed=1, ...)`
-
-	**Arguments**
-	- `edges::DataFrame`: original edge list with `:src`, `:dst`. Weights ignored.
-	- `nodes::Union{Nothing,DataFrame,Vector}`: optional node universe.
-	- `directed::Bool`: directedness of the network (selects centrality driver).
-	- `target_rate::Real`: nominal missingness rate, in $(0, 1)$.
-	- `target_rho::Real`: nominal induced correlation, in $(-1, 1)$.
-	- `seed::Integer`: master seed; deterministically split into bisection
-	  and sampling sub-seeds.
-	- `centrality::Union{Nothing,Vector}`: precomputed centrality vector;
-	  when `nothing`, computed internally. Cache and reuse across all 30
-	  $(\rho, \text{rate})$ cells of a single network.
-	- `gc_threshold`, `min_n`, `min_edges`: passed to topological degeneracy.
-	- `bisection_tol`, `bisection_max_iters`: passed to bisection.
-
-	**Value**
-	`NamedTuple` per Section~4.3:
-	- `dropped_nodes::Vector{Int}` --- sorted ascending
-	- `nominal::NamedTuple` --- `(rate, rho)` target
-	- `realized_rate::Float64`
-	- `realized_rho::Float64`
-	- `bisection_status::Symbol` --- `:converged`, `:ceiling_hit`, or `:failed_other`
-	- `sampler_degeneracy::NamedTuple` --- from `_topological_degeneracy`
-	- `seed::Int` --- the master seed for this record
-
-	The companion fields `measure_degeneracy` and `framework_degeneracy`
-	(Section~4.3) are populated by the measure code and framework code when
-	they run, not by this function.
-
-	**Notes**
-	Deterministic in the master seed: identical $(edges, nodes, directed,
-	\text{rate}, \rho, \text{seed})$ inputs produce identical records (Test~4).
-
-	When `bisection_status == :ceiling_hit`, sampling still proceeds at $b = 1$
-	and `realized_rho` reflects the achievable ceiling. When
-	`bisection_status == :failed_other`, sampling is skipped and the record
-	is a placeholder marked as fully degenerate; the caller should treat such
-	records as unusable.
-
-	**See Also**
-	`apply_missingness`, `build_degeneration_corpus`,
-	`_bisect_b_for_target_rho`, `_sample_missingness`,
-	`_topological_degeneracy`
-
-	**References**
-	- Smith, J. A., Morgan, J. H., & Moody, J. (2022). Network sampling
-	  coverage III. *Social Networks*, 68, 148--178.
-	""" generate_missingness_mask
-
-#	Apply Missingness: materialize degraded (edges, nodes) from original + dropped set
-	function apply_missingness(edges::DataFrame,
-								dropped_nodes::AbstractVector{<:Integer};
-								nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing)
-		"""
-		Args:
-			edges::DataFrame: original edge list with :src, :dst, optionally
-				:weight and other columns; all columns preserved in the output
-			dropped_nodes::AbstractVector{<:Integer}: node indices to drop, in
-				the canonical node order (matching _centrality_for_sampler /
-				_graph_to_sparse_matrix). Need not be sorted.
-			nodes::Union{Nothing,DataFrame,Vector}: original node universe.
-				When nothing, the node universe is inferred from the edges
-				(no isolates), matching _graph_to_sparse_matrix's convention.
-		Returns:
-			NamedTuple: (edges, nodes)
-				- edges::DataFrame: filtered edge list. Same columns as input;
-					rows where either endpoint was dropped are removed.
-				- nodes::DataFrame: filtered node list. Same columns as input;
-					rows corresponding to dropped indices removed. When `nodes`
-					argument was a Vector, the returned `nodes` is a DataFrame
-					with a single :name column (matching internal conventions).
-		Notes:
-			Surviving node IDs are NOT re-indexed. The analysis compares
-			degraded-network per-node measures against full-network per-node
-			measures, which requires the surviving nodes to keep their
-			original identifiers. Re-indexing would break this comparison
-			and is not what the validation pipeline wants.
-
-			Edge filtering: an edge is dropped iff either endpoint is dropped.
-			This is listwise deletion at the edge level, the standard
-			convention from SMM 2022 and Galaskiewicz (1991).
-
-			The node universe convention matches _graph_to_sparse_matrix: if
-			the caller passes `nodes`, that order defines the canonical
-			indexing; otherwise the index is derived from edges. Either way
-			`dropped_nodes` must use the same indexing the centrality vector
-			used.
-
-			Edge-case: when dropped_nodes is empty, the returned edges and
-			nodes are identical to the input (modulo DataFrame copy
-			semantics). When dropped_nodes contains every index, the
-			returned edges DataFrame is empty (zero rows, same columns) and
-			the nodes DataFrame is empty.
-
-			This is the full-node-removal mechanism: both the node and ALL
-			of its edges (incoming and outgoing) are removed. For the SMM-
-			style outgoing-edge-only mechanism, where the node remains in
-			the roster with its incoming edges intact, use
-			apply_missingness_outgoing_only.
-		"""
-
-		#	Resolve canonical node order
-			#	Mirror _graph_to_sparse_matrix's node-ordering logic so that
-			#	dropped_nodes indices match the centrality vector indices.
-				if isnothing(nodes)
-					node_names = sort!(unique(vcat(string.(edges.src), string.(edges.dst))))
-				elseif nodes isa DataFrame
-					#	Convention: the first :name column (or :id, :node, etc.)
-					#	is the canonical order. Match what _graph_to_sparse_matrix
-					#	does — fall back to the first String-typed column if no
-					#	well-known name is present.
-						node_names = string.(nodes[!, 1])
-				else
-					node_names = string.(collect(nodes))
+			union!(a, b) = begin
+				ra, rb = find(a), find(b)
+				ra != rb && (parent[ra] = rb)
+			end
+			rows = rowvals(adj_binary)
+			@inbounds for j in 1:n
+				for k in nzrange(adj_binary, j)
+					union!(rows[k], j)
 				end
-				n = length(node_names)
-
-		#	Guards
-			@inbounds for idx in dropped_nodes
-				(1 <= idx <= n) || throw(ArgumentError("dropped node index $idx out of range [1, $n]"))
 			end
 
-		#	Build dropped-name set for O(1) edge filtering
-			is_dropped_idx = falses(n)
-			@inbounds for idx in dropped_nodes
-				is_dropped_idx[idx] = true
+		#	Compact root ids to 1..C
+			label = Vector{Int}(undef, n)
+			remap = Dict{Int,Int}()
+			next_id = 0
+			@inbounds for v in 1:n
+				r = find(v)
+				if !haskey(remap, r)
+					next_id += 1
+					remap[r] = next_id
+				end
+				label[v] = remap[r]
 			end
-			dropped_name_set = Set{String}(node_names[i] for i in 1:n if is_dropped_idx[i])
-
-		#	Filter edges: keep rows where neither endpoint is dropped
-			keep_edge = BitVector(undef, nrow(edges))
-			@inbounds for r in 1:nrow(edges)
-				s = string(edges.src[r])
-				d = string(edges.dst[r])
-				keep_edge[r] = !(s in dropped_name_set || d in dropped_name_set)
-			end
-			degraded_edges = edges[keep_edge, :]
-
-		#	Filter nodes: keep rows for surviving indices
-			keep_node = .!is_dropped_idx
-			if isnothing(nodes)
-				#	No nodes DataFrame supplied; emit a minimal one
-					degraded_nodes = DataFrame(name = node_names[keep_node])
-			elseif nodes isa DataFrame
-				degraded_nodes = nodes[keep_node, :]
-			else
-				degraded_nodes = DataFrame(name = node_names[keep_node])
-			end
-
-		#	Return
-			return (edges = degraded_edges, nodes = degraded_nodes)
+			return label
 	end
-	@doc raw"""
-	**Description**
-	Materializes the degraded $(\text{edges}, \text{nodes})$ pair from an
-	original network and a dropped-node set. Pure data manipulation: no
-	random draws, no degeneracy checks. Called just before the measure
-	battery runs, implementing the lazy-materialization design --- degraded
-	networks are constructed on demand from the original plus the dropped-node
-	set, not stored to disk.
 
-	This is the full-node-removal mechanism: the dropped nodes are removed
-	from the node roster along with all of their edges, incoming and
-	outgoing. For the SMM-style mechanism where non-respondents remain in
-	the roster with their incoming edges preserved and only outgoing edges
-	removed, use `apply_missingness_outgoing_only`.
-
-	**Usage**
-	`apply_missingness(edges, dropped_nodes; nodes=nothing)`
-
-	**Arguments**
-	- `edges::DataFrame`: original edge list. All columns are preserved.
-	- `dropped_nodes::AbstractVector{<:Integer}`: indices in the canonical
-	  node order (matching `_centrality_for_sampler`).
-	- `nodes::Union{Nothing,DataFrame,Vector}`: original node universe.
-
-	**Value**
-	`NamedTuple(edges, nodes)` where both are filtered to surviving nodes
-	and surviving edges. Surviving node IDs are not re-indexed --- they
-	retain their original identifiers, which the comparison against the
-	full-network measures requires.
-
-	**See Also**
-	`apply_missingness_outgoing_only`, `generate_missingness_mask`,
-	`build_degeneration_corpus`
-
-	**References**
-	- Galaskiewicz, J. (1991). Estimating point centrality using different
-	  network sampling techniques. *Social Networks*, 13(4), 347--386.
-	""" apply_missingness
-
-#	Apply Missingness (Outgoing-Only Variant): SMM-style materialization
-	function apply_missingness_outgoing_only(edges::DataFrame,
-												dropped_nodes::AbstractVector{<:Integer};
-												nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing,
-												directed::Bool = true)
+#	Materialize Missing Nodes: compose full-removal and nominations automatically per node
+	function _materialize_missing_nodes(edges::DataFrame,
+											missing_nodes::AbstractVector{<:Integer};
+											nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing,
+											directed::Bool)
 		"""
 		Args:
-			edges::DataFrame: original edge list with :src, :dst, optionally
-				:weight and other columns
-			dropped_nodes::AbstractVector{<:Integer}: indices in canonical
-				node order; the same vector produced by _sample_missingness
-			nodes::Union{Nothing,DataFrame,Vector}: optional node universe;
-				canonical-order convention identical to apply_missingness
-			directed::Bool: must be true for this mechanism; the function
-				throws on undirected input. Default true. See Notes.
+			edges::DataFrame: edge list (already edge-degraded if weighted), with
+				:src, :dst and any other columns preserved.
+			missing_nodes::AbstractVector{<:Integer}: combined missing set in
+				canonical node order.
+			nodes::Union{Nothing,DataFrame,Vector}: optional node universe.
+			directed::Bool: directedness; controls nomination vs full-removal.
 		Returns:
-			NamedTuple: (edges, nodes)
-				- edges::DataFrame: filtered edge list. Edges where SRC is
-					a dropped node are removed; edges where DST is a dropped
-					node are PRESERVED (these are the observed actors'
-					nominations TO the non-respondent, which the survey
-					instrument captured even though the non-respondent
-					didn't reply themselves).
-				- nodes::DataFrame: UNCHANGED from input. The non-respondent
-					nodes remain in the network with their in-degree intact
-					but their out-degree zeroed.
+			NamedTuple: (edges, nodes, n_full_removal, n_nominations)
+				The materialized degraded network plus the per-node materialization
+				counts.
 		Notes:
-			This is the SMM 2022 missing-data mechanism: non-respondents are
-			treated as actors who failed to provide nomination data, but
-			whose existence is known because others nominated them. The
-			degraded network is the same node set as the original (the
-			roster is intact) with only the outgoing-edge information from
-			non-respondents removed.
+			The unified materializer (Spec v3 Section 4.3). Each missing
+			(non-responding) node loses its OUTGOING edges; whether it is a
+			NOMINATION or a FULL REMOVAL is decided automatically:
+			  - directed network AND the node still has a surviving incoming edge
+			    (some retained node points to it) => NOMINATION: it stays in the
+			    roster with its incoming edges, outgoing zeroed.
+			  - otherwise (no surviving incoming, or undirected network) =>
+			    FULL REMOVAL: the node and all incident edges are dropped, no trace.
+			Undirected networks have no in/out asymmetry, so every missing node is
+			a full removal. This composes both mechanisms in one degraded network
+			rather than emitting separate per-mechanism corpus rows.
 
-			Contrast with apply_missingness, which removes the entire node
-			(both outgoing and incoming edges plus the node itself from the
-			node list). The two mechanisms correspond to different missing-
-			data scenarios in the literature: apply_missingness corresponds
-			to fully unobserved nodes (the Stage 1 case in the design
-			document), apply_missingness_outgoing_only corresponds to
-			nominated non-respondents (the Stage 0.5 case in the design
-			document).
+			Implementation: first strip every missing node's outgoing edges (src in
+			missing set). Then, on the surviving edges, a missing node is a
+			nomination iff it appears as a dst; the rest are full removals and are
+			deleted from the roster along with any remaining incident edges.
 
-			This function is for directed networks only. Undirected
-			networks have no 'outgoing' direction — every edge is mutual by
-			definition — so the SMM mechanism is undefined. Calling this
-			function with directed=false throws an ArgumentError; the
-			caller should use apply_missingness on undirected networks
-			instead, with documentation noting the mechanism mismatch.
-
-			Selection invariance: this function consumes the SAME dropped_nodes
-			vector that _sample_missingness produces and that apply_missingness
-			would use. The selection of which nodes are non-respondents is
-			driven by the same centrality-correlated sampler; only the
-			materialization of the degraded network differs between the two
-			mechanisms. This means a single validation grid can produce both
-			mechanism variants for each (network, rho, rate, replicate)
-			cell by running both materializers on the same sampler output.
-
-			Edge cases:
-			- dropped_nodes is empty: returned edges and nodes are identical
-			  to input (modulo DataFrame copy semantics).
-			- dropped_nodes contains every index: returned edges is empty
-			  (every edge has at least one dropped src) and nodes is unchanged.
-			- An edge is dropped iff src is in dropped_nodes; dst membership
-			  is irrelevant. An edge from a non-respondent A to another
-			  non-respondent B is removed (because A is dropped); an edge
-			  from a respondent A to non-respondent B is kept (because A
-			  is not dropped).
+			Mirrors the per-node filtering logic of the standalone full-removal
+			and outgoing-only materializers (now in network_reconstruction),
+			reimplemented inline here because this composes BOTH per node by
+			partitioning the missing set — neither standalone materializer does
+			that split.
 		"""
 
-		directed || throw(ArgumentError("apply_missingness_outgoing_only is defined for directed networks only; use apply_missingness for undirected networks"))
-
-		#	Resolve canonical node order (same convention as apply_missingness)
+		#	Resolve canonical node order (same convention as the materializers)
 			if isnothing(nodes)
 				node_names = sort!(unique(vcat(string.(edges.src), string.(edges.dst))))
 			elseif nodes isa DataFrame
@@ -1285,504 +1503,714 @@ module network_degeneracy
 			end
 			n = length(node_names)
 
-		#	Guard dropped_nodes indices
-			@inbounds for idx in dropped_nodes
-				(1 <= idx <= n) || throw(ArgumentError("dropped node index $idx out of range [1, $n]"))
+		#	Missing mask + name set
+			is_missing = falses(n)
+			@inbounds for v in missing_nodes
+				(1 <= v <= n) || throw(ArgumentError("missing node index $v out of range [1, $n]"))
+				is_missing[v] = true
 			end
+			missing_name_set = Set{String}(node_names[i] for i in 1:n if is_missing[i])
 
-		#	Build dropped-name set keyed by SRC only
-			is_dropped_idx = falses(n)
-			@inbounds for idx in dropped_nodes
-				is_dropped_idx[idx] = true
+		#	Step 1: strip outgoing edges of missing nodes (src in missing set).
+		#	Undirected networks have both directions present in the edge list (or
+		#	are symmetric), so a missing node's incident edges are removed as src
+		#	on one orientation; the dst-side survival check below then determines
+		#	nomination vs removal. For undirected we force full removal regardless.
+			keep_edge = BitVector(undef, nrow(edges))
+			@inbounds for r in 1:nrow(edges)
+				keep_edge[r] = !(string(edges.src[r]) in missing_name_set)
 			end
-			dropped_src_set = Set{String}(node_names[i] for i in 1:n if is_dropped_idx[i])
+			after_out = edges[keep_edge, :]
 
-		#	Filter edges: keep rows where SRC is NOT a dropped node
-			#	dst is checked nowhere; observed actors' nominations to
-			#	non-respondents survive as in-degree to the non-respondent.
-				keep_edge = BitVector(undef, nrow(edges))
-				@inbounds for r in 1:nrow(edges)
-					keep_edge[r] = !(string(edges.src[r]) in dropped_src_set)
+		#	Step 2: classify each missing node as nomination (directed + surviving
+		#	incoming) or full removal.
+			surviving_dst = Set{String}()
+			if directed
+				@inbounds for r in 1:nrow(after_out)
+					d = string(after_out.dst[r])
+					(d in missing_name_set) && push!(surviving_dst, d)
 				end
-				degraded_edges = edges[keep_edge, :]
+			end
+			#	Undirected => surviving_dst stays empty => all missing are full removals.
 
-		#	Nodes: unchanged (the roster includes everyone, respondents and not)
-			if isnothing(nodes)
-				degraded_nodes = DataFrame(name = node_names)
-			elseif nodes isa DataFrame
-				degraded_nodes = nodes
+			n_nominations = length(surviving_dst)
+			full_removal_names = Set{String}(nm for nm in missing_name_set if !(nm in surviving_dst))
+			n_full_removal = length(full_removal_names)
+
+		#	Step 3: drop edges incident (either endpoint) to a full-removal node,
+		#	and drop those nodes from the roster. Nomination nodes stay with their
+		#	incoming edges (already retained in after_out).
+			keep_edge2 = BitVector(undef, nrow(after_out))
+			@inbounds for r in 1:nrow(after_out)
+				s = string(after_out.src[r]); d = string(after_out.dst[r])
+				keep_edge2[r] = !(s in full_removal_names || d in full_removal_names)
+			end
+			degraded_edges = after_out[keep_edge2, :]
+
+		#	Roster: drop full-removal nodes; keep nominations and respondents.
+			keep_node = BitVector(undef, n)
+			@inbounds for i in 1:n
+				keep_node[i] = !(node_names[i] in full_removal_names)
+			end
+			if isnothing(nodes) || !(nodes isa DataFrame)
+				degraded_nodes = DataFrame(name = node_names[keep_node])
 			else
-				degraded_nodes = DataFrame(name = node_names)
+				degraded_nodes = nodes[keep_node, :]
 			end
 
 		#	Return
-			return (edges = degraded_edges, nodes = degraded_nodes)
+			return (edges = degraded_edges,
+					nodes = degraded_nodes,
+					n_full_removal = n_full_removal,
+					n_nominations = n_nominations)
 	end
-	@doc raw"""
-	**Description**
-	Materializes the SMM-style degraded $(\text{edges}, \text{nodes})$ pair
-	from an original directed network and a dropped-node set. Non-respondents
-	remain in the node roster but their outgoing edges are removed; their
-	incoming edges (from observed actors who nominated them) are preserved.
-	Pure data manipulation; no randomness.
 
-	**Usage**
-	`apply_missingness_outgoing_only(edges, dropped_nodes; nodes=nothing, directed=true)`
+#	Apply Weight Removal: materialize diffuse weight depletion onto the edge list (zeros retained)
+	function apply_weight_removal(edges::DataFrame,
+									removed::SparseMatrixCSC;
+									nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing)
+		"""
+		Args:
+			edges::DataFrame: original edge list with :src, :dst, :weight and any
+				other columns preserved.
+			removed::SparseMatrixCSC: per-edge units removed, same node order and
+				sparsity pattern as the weighted adjacency (_weighted_adjacency).
+			nodes::Union{Nothing,DataFrame,Vector}: optional node universe.
+		Returns:
+			DataFrame: a copy of edges with :weight reduced by the removed amount
+				per edge. Edges whose weight reaches zero are RETAINED (zeros kept,
+				per the edge-preservation decision); row count is invariant.
+		Notes:
+			Materializes the diffuse edge-degradation stage. Maps each edge row to
+			its (i, j) indices in canonical node order, subtracts removed[i, j] from
+			:weight, and floors at zero. The edge skeleton is preserved so that
+			downstream a fully-depleted edge remains an observed-as-zero dyad,
+			which is what makes node loss the LIMIT of weight loss rather than a
+			separate primitive.
+		"""
 
-	**Arguments**
-	- `edges::DataFrame`: original edge list. All columns preserved.
-	- `dropped_nodes::AbstractVector{<:Integer}`: indices of non-respondents
-	  in the canonical node order, identical in semantics to the dropped_nodes
-	  consumed by `apply_missingness`.
-	- `nodes::Union{Nothing,DataFrame,Vector}`: optional node universe.
-	- `directed::Bool`: must be `true`; defined for directed networks only.
+		#	Resolve canonical node order and a name->index map
+			if isnothing(nodes)
+				node_names = sort!(unique(vcat(string.(edges.src), string.(edges.dst))))
+			elseif nodes isa DataFrame
+				node_names = string.(nodes[!, 1])
+			else
+				node_names = string.(collect(nodes))
+			end
+			idx = Dict{String,Int}(nm => i for (i, nm) in enumerate(node_names))
 
-	**Value**
-	`NamedTuple(edges, nodes)` where `edges` has rows removed for any edge
-	whose source is a non-respondent. The `nodes` DataFrame is returned
-	unchanged --- non-respondents remain in the roster as actors with zeroed
-	out-degree.
+		#	Guard: a weight column is required
+			("weight" in names(edges)) ||
+				throw(ArgumentError("apply_weight_removal requires a :weight column"))
 
-	**Notes**
-	This is the missing-data mechanism described in Smith, Morgan, and
-	Moody (2022) for survey actor non-response: the non-respondent's roster
-	entry remains, their incoming nominations from others are still recorded
-	on the survey, but their own nomination data is unrecorded. The selection
-	of non-respondents is unchanged from `apply_missingness` --- both functions
-	consume the same dropped-node set produced by the centrality-correlated
-	sampler.
+		#	Copy and decrement per edge
+			out = copy(edges)
+			w = Float64.(out.weight)
+			@inbounds for r in 1:nrow(out)
+				i = get(idx, string(out.src[r]), 0)
+				j = get(idx, string(out.dst[r]), 0)
+				(i == 0 || j == 0) && continue
+				rem_units = removed[i, j]
+				neww = w[r] - rem_units
+				w[r] = neww < 0 ? 0.0 : neww
+			end
+			out.weight = w
 
-	**See Also**
-	`apply_missingness`, `generate_missingness_mask`, `build_degeneration_corpus`
+		#	Return (zeros retained; row count invariant)
+			return out
+	end
 
-	**References**
-	- Smith, J. A., Morgan, J. H., & Moody, J. (2022). *Social Networks*, 68.
-	""" apply_missingness_outgoing_only
-
-#	Build Degeneration Corpus: orchestrate the full grid across networks, rhos, rates,
-#	replicates, AND mechanisms (full_removal and/or outgoing_only)
-	function build_degeneration_corpus(networks::Dict;
-										target_rhos::AbstractVector{<:Real} = [-0.75, -0.25, 0.0, 0.25, 0.75],
-										target_rates::AbstractVector{<:Real} = [0.05, 0.10, 0.15, 0.25, 0.40, 0.50],
-										n_replicates::Int = 100,
-										replicates_per_network::Dict{String,Int} = Dict{String,Int}(),
-										mechanisms::Vector{Symbol} = [:full_removal],
-										master_seed::Integer = 42,
+#	Generate Missingness Mask: full per-replicate record for one (network, target) draw
+	function generate_missingness_mask(edges::DataFrame;
+										nodes::Union{Nothing,DataFrame,AbstractVector{<:AbstractString}} = nothing,
+										directed::Bool,
+										weighted::Bool,
+										target_pi_node::Real,
+										target_pi_edge::Real,
+										target_rho::Real,
+										seed::Integer,
+										centrality::Union{Nothing,AbstractVector{<:Real}} = nothing,
+										true_community::Union{Nothing,AbstractVector{<:Integer}} = nothing,
+										adj_binary::Union{Nothing,SparseMatrixCSC} = nothing,
+										adj_weighted::Union{Nothing,SparseMatrixCSC} = nothing,
+										K::Int = 4,
 										gc_threshold::Real = 0.30,
 										min_n::Int         = 25,
 										min_edges::Int     = 1,
-										bisection_tol::Real      = 0.02,
-										bisection_max_iters::Int = 50,
-										bisection_M::Int         = 50,
+										rho_tol::Real      = 0.02,
+										ei_tvd_tol::Real   = 0.25,
+										n_rank_bins::Int   = 4,
+										n_ei_bins::Int     = 3,
+										ei_min_count::Int  = 5,
+										max_retries::Int   = 10)
+		"""
+		Args:
+			edges::DataFrame: original edge list with :src, :dst (+ :weight if weighted).
+			nodes::Union{Nothing,DataFrame,Vector}: optional node universe.
+			directed::Bool: directedness (selects centrality driver and nominations).
+			weighted::Bool: whether the edge-degradation stage runs (needs :weight).
+			target_pi_node::Real: target missing-node fraction; in (0, 1).
+			target_pi_edge::Real: diffuse weight-degradation budget (fraction of
+				true weight); in [0, 1). Forced to 0 on unweighted input.
+			target_rho::Real: target Kendall tau-b of the missing set vs centrality.
+			seed::Integer: master seed; deterministically split, retries advance
+				a deterministic sub-seed sequence.
+			centrality, true_community, adj_binary, adj_weighted: optional
+				precomputed per-network artifacts (the orchestrator caches them).
+			K::Int: rank-bin count for the propensity field.
+			gc_threshold, min_n, min_edges: passed to topological degeneracy.
+			rho_tol, ei_tvd_tol: passed to the three-prior gate.
+			max_retries::Int: bounded whole-replicate re-run budget (default 10).
+		Returns:
+			NamedTuple: the per-replicate record (see Notes for fields).
+		Notes:
+			The public per-replicate sampler, rewired for the unified pipeline
+			(Spec v3): edge degradation (weighted only) -> record organic losses +
+			edge-stage diagnostic -> conditional node top-up to pi_node ->
+			materialize (auto nomination/full-removal) -> single three-prior end
+			gate -> retry-on-stochastic-miss / accept-and-flag on :ceiling_hit.
+
+			There is no `mechanism` argument: full-removal vs nomination is decided
+			per node inside _materialize_missing_nodes.
+
+			Seed splitting + deterministic retries. The master seed seeds an
+			attempt-seed stream; attempt a in 1..max_retries derives
+			(edge_seed_a, topup_seed_a) deterministically, so the same master seed
+			yields the same accepted draw AND the same retry count.
+
+			Feasibility is NOT re-checked here — the orchestrator clamps target_rho
+			to the up-front envelope and flags :ceiling_hit before calling, so a
+			ceiling draw is accepted-and-flagged (no retry) and only stochastic
+			misses inside the feasible region trigger re-runs.
+
+			Record fields:
+				- missing_nodes::Vector{Int}, n_full_removal::Int, n_nominations::Int
+				- nominal::NamedTuple (pi_node, pi_edge, rho)
+				- realized_pi_node, realized_rho, realized_ei_score::Float64
+				- realized_pi_edge::Float64, edge diagnostic fields
+				  (W_true, W_removed, n_edges_zeroed, n_organic_losses, beta)
+				- gate_status::Symbol, contract_passed::Bool, retry_count::Int
+				- field_status::Symbol (propensity-field solve status)
+				- sampler_degeneracy::NamedTuple
+				- seed::Int
+		"""
+
+		#	Guards
+			(0.0 < target_pi_node < 1.0) ||
+				throw(ArgumentError("target_pi_node must be in (0, 1), got $target_pi_node"))
+			(0.0 <= target_pi_edge < 1.0) ||
+				throw(ArgumentError("target_pi_edge must be in [0, 1), got $target_pi_edge"))
+			(-1.0 < target_rho < 1.0) ||
+				throw(ArgumentError("target_rho must be in (-1, 1), got $target_rho"))
+
+		#	Weighted guard: no edge stage without weights
+			pi_edge = weighted ? Float64(target_pi_edge) : 0.0
+
+		#	Per-network artifacts: compute or accept cached
+			c = isnothing(centrality) ?
+				_centrality_for_sampler(edges; nodes=nodes, directed=directed) : centrality
+			n = length(c)
+			K_eff = clamp(K, 2, max(2, n))
+
+			adjb = isnothing(adj_binary) ?
+				(isnothing(nodes) ? _graph_to_sparse_matrix(edges; weighted=false)[1] :
+									 _graph_to_sparse_matrix(edges; nodes=nodes, weighted=false)[1]) :
+				adj_binary
+
+			comm = isnothing(true_community) ? fill(1, n) : true_community
+
+			#	True-network E/I-by-degree-rank profile for prior 3, computed once
+			#	(all nodes kept). Skipped to an empty profile when there is no
+			#	community structure; the gate then treats prior 3 as not assessable.
+				true_profile, true_occ = length(unique(comm)) >= 2 ?
+					_ei_rank_profile(adjb, comm, trues(n), n_rank_bins, n_ei_bins) :
+					(zeros(Float64, n_rank_bins, n_ei_bins), zeros(Int, n_rank_bins))
+
+			adjw = nothing
+			if pi_edge > 0.0
+				adjw = isnothing(adj_weighted) ? _weighted_adjacency(edges; nodes=nodes)[1] : adj_weighted
+			end
+
+		#	Propensity field (shared tilt); status recorded
+			field = _solve_propensity_field(c, target_rho, target_pi_node, K_eff)
+
+		#	Attempt loop: deterministic re-runs on stochastic gate miss
+			master_rng = Xoshiro(seed)
+			best = nothing
+			retry_count = 0
+			gate_status = :failed_other
+			for attempt in 1:max_retries
+				edge_seed  = Int(rand(master_rng, UInt32))
+				topup_seed = Int(rand(master_rng, UInt32))
+
+				#	Stage 1: edge degradation (weighted only) -> organic losses + diagnostic
+					organic = Int[]
+					W_true = 0; W_removed = 0; n_edges_zeroed = 0
+					degraded_edges = edges
+					if pi_edge > 0.0
+						wr = _sample_weight_removal(adjw, field.d, pi_edge, edge_seed)
+						organic        = wr.organic_losses
+						W_true         = wr.W_true
+						W_removed      = wr.W_removed
+						n_edges_zeroed = wr.n_edges_zeroed
+						degraded_edges = apply_weight_removal(edges, wr.removed; nodes=nodes)
+					end
+
+				#	Stage 2: node accounting (conditional top-up to pi_node)
+					topup = _topup_missing_nodes(c, organic, target_pi_node, target_rho,
+												  topup_seed; K = K_eff)
+					missing_nodes = topup.missing_nodes
+
+				#	Stage 3: materialize (auto nomination/full-removal)
+					mat = _materialize_missing_nodes(degraded_edges, missing_nodes;
+													  nodes=nodes, directed=directed)
+
+				#	Stage 4: three-prior end gate
+					gate = _three_prior_gate(missing_nodes, c, comm, adjb,
+											  true_profile, true_occ,
+											  target_pi_node, target_rho;
+											  rho_tol = rho_tol, ei_tvd_tol = ei_tvd_tol,
+											  n_rank_bins = n_rank_bins, n_ei_bins = n_ei_bins,
+											  min_count = ei_min_count)
+
+				#	Record the candidate
+					candidate = (missing_nodes = missing_nodes,
+								  n_full_removal = mat.n_full_removal,
+								  n_nominations  = mat.n_nominations,
+								  realized_pi_node = gate.realized_pi_node,
+								  realized_rho     = gate.realized_rho,
+								  realized_ei_score = gate.ei_tvd,
+								  realized_pi_edge = W_true > 0 ? W_removed / W_true : 0.0,
+								  W_true = W_true, W_removed = W_removed,
+								  n_edges_zeroed = n_edges_zeroed,
+								  n_organic_losses = length(organic),
+								  beta = field.beta,
+								  gate = gate)
+
+				#	Accept on pass; otherwise keep the best-so-far for the
+				#	exhaustion path and re-run.
+					if gate.passed
+						best = candidate; gate_status = :converged; retry_count = attempt - 1
+						break
+					elseif field.status == :ceiling_hit
+						#	Structurally unreachable rho: accept-and-flag, no retry.
+							best = candidate; gate_status = :ceiling_hit; retry_count = attempt - 1
+						break
+					else
+						best = candidate; retry_count = attempt - 1
+					end
+			end
+			if gate_status == :failed_other && best !== nothing && best.gate.passed
+				gate_status = :converged
+			elseif !(gate_status in (:converged, :ceiling_hit))
+				gate_status = :failed_other
+			end
+
+		#	Degeneracy on the final missing set (binary adjacency + missing mask)
+			degen = _topological_degeneracy(adjb, best.missing_nodes;
+											gc_threshold = gc_threshold,
+											min_n        = min_n,
+											min_edges    = min_edges)
+
+		#	Assemble per-replicate record
+			return (missing_nodes      = best.missing_nodes,
+					n_full_removal      = best.n_full_removal,
+					n_nominations       = best.n_nominations,
+					nominal             = (pi_node = Float64(target_pi_node),
+											pi_edge = Float64(pi_edge),
+											rho     = Float64(target_rho)),
+					realized_pi_node    = best.realized_pi_node,
+					realized_rho        = best.realized_rho,
+					realized_ei_score   = best.realized_ei_score,
+					realized_pi_edge    = best.realized_pi_edge,
+					W_true              = best.W_true,
+					W_removed           = best.W_removed,
+					n_edges_zeroed      = best.n_edges_zeroed,
+					n_organic_losses    = best.n_organic_losses,
+					beta                = best.beta,
+					field_status        = field.status,
+					gate_status         = gate_status,
+					contract_passed     = best.gate.passed,
+					retry_count         = retry_count,
+					sampler_degeneracy  = degen,
+					seed                = Int(seed))
+	end
+	@doc raw"""
+	**Description**
+	Generates one per-replicate missingness record for the unified Phase~1
+	degeneration pipeline (Spec~v3). Runs edge degradation (weighted networks
+	only), records organic node losses, tops the missing set up to the target
+	node fraction via the shared logistic-$\beta$ propensity field, materializes
+	the degraded network (composing nominations and full removal per node), and
+	verifies a single three-prior end gate with bounded deterministic re-runs.
+
+	**Usage**
+	`generate_missingness_mask(edges; nodes, directed, weighted, target_pi_node, target_pi_edge, target_rho, seed, ...)`
+
+	**Arguments**
+	- `edges::DataFrame`: edge list with `:src`, `:dst` (and `:weight` if `weighted`).
+	- `directed::Bool`, `weighted::Bool`: network type; gate which stages run.
+	- `target_pi_node`, `target_pi_edge`, `target_rho`: the two dials and the
+	  shared correlation. `target_pi_edge` is forced to 0 on unweighted input.
+	- `seed::Integer`: master seed; retries advance a deterministic sub-seed stream.
+	- `centrality`, `true_community`, `adj_binary`, `adj_weighted`: optional cached
+	  per-network artifacts (the orchestrator supplies these).
+	- `K`, `gc_threshold`, `min_n`, `min_edges`, `rho_tol`, `ei_tvd_tol`,
+	  `max_retries`: tuning knobs.
+
+	**Value**
+	`NamedTuple` carrying the combined missing set, materialization counts, final
+	realized priors, the non-gating edge-stage diagnostic, the gate/field status,
+	the retry count, sampler degeneracy, and the master seed.
+
+	**Notes**
+	Deterministic in the master seed: identical inputs produce identical records
+	and identical retry counts. `:ceiling_hit` (from the propensity-field solve /
+	the orchestrator's up-front feasibility clamp) is accepted-and-flagged without
+	retry; only stochastic gate misses inside the feasible region re-run.
+
+	**See Also**
+	`_solve_propensity_field`, `_sample_weight_removal`, `_topup_missing_nodes`,
+	`_materialize_missing_nodes`, `_three_prior_gate`, `build_degeneration_corpus`
+	""" generate_missingness_mask
+
+#	Build Degeneration Corpus: orchestrate the unified grid across networks, rhos, and the two dials
+	function build_degeneration_corpus(networks::Dict;
+										target_rhos::AbstractVector{<:Real} = [-0.75, -0.25, 0.0, 0.25, 0.75],
+										target_pi_nodes::AbstractVector{<:Real} = [0.05, 0.10, 0.15, 0.25, 0.40, 0.50],
+										target_pi_edges::AbstractVector{<:Real} = [0.0, 0.10, 0.25],
+										n_replicates::Int = 100,
+										replicates_per_network::Dict{String,Int} = Dict{String,Int}(),
+										reverse_edges::Bool = false,
+										master_seed::Integer = 42,
+										K::Int             = 4,
+										gc_threshold::Real = 0.30,
+										min_n::Int         = 25,
+										min_edges::Int     = 1,
+										rho_tol::Real      = 0.02,
+										ei_tvd_tol::Real   = 0.25,
+										max_retries::Int   = 10,
 										parallel::Bool     = true,
 										show_progress::Bool = true)
 		"""
 		Args:
-			networks::Dict: corpus keyed by network name → NamedTuple with
-				:edges (DataFrame), :nodes (DataFrame), :metadata (NamedTuple
-				containing at least :directed::Bool)
-			target_rhos::AbstractVector{<:Real}: nominal rho grid
-			target_rates::AbstractVector{<:Real}: nominal rate grid
-			n_replicates::Int: default replicate count per cell (default 100)
-			replicates_per_network::Dict{String,Int}: per-network override
-			mechanisms::Vector{Symbol}: which materialization mechanisms to
-				run. Valid values: :full_removal (apply_missingness) and
-				:outgoing_only (apply_missingness_outgoing_only). Default
-				[:full_removal] preserves single-mechanism behavior. Pass
-				[:full_removal, :outgoing_only] for the doubled-mechanism
-				grid. :outgoing_only is silently skipped on undirected
-				networks (a startup diagnostic lists which networks will
-				be skipped).
-			master_seed::Integer: master seed; per-replicate seeds derived
-				deterministically from (name, rho, rate, rep, master_seed)
-				— mechanism NOT included in the seed because both mechanisms
-				on a cell consume the same sampler output
-			gc_threshold, min_n, min_edges: passed to topological degeneracy
-			bisection_tol, bisection_max_iters, bisection_M: passed to bisection
-			parallel::Bool: parallelize the flat-grid loop (default true)
-			show_progress::Bool: display a progress bar (default true)
+			networks::Dict: corpus keyed by network name → NamedTuple with :edges
+				(DataFrame), :nodes (DataFrame), :metadata (NamedTuple with at least
+				:directed::Bool and :weighted::Bool).
+			target_rhos::AbstractVector{<:Real}: nominal rho grid.
+			target_pi_nodes::AbstractVector{<:Real}: nominal node-missingness grid.
+			target_pi_edges::AbstractVector{<:Real}: nominal edge-degradation grid
+				(fraction of weight). 0.0 means node-only; entries > 0 apply only to
+				weighted networks (forced to 0 on unweighted, deduplicated).
+			n_replicates::Int: default replicate count per cell.
+			replicates_per_network::Dict{String,Int}: per-network override.
+			reverse_edges::Bool: explicit orientation flag (default false). When
+				true, src/dst are transposed at the boundary so all internal logic
+				stays direction-fixed; affects only the asymmetric nomination path.
+				Cannot be trusted to metadata — supplied per run.
+			master_seed::Integer: master seed; per-replicate seeds derived from
+				(name, rho, pi_node, pi_edge, rep, master_seed).
+			K, gc_threshold, min_n, min_edges, rho_tol, ei_tvd_tol, max_retries:
+				passed through to generate_missingness_mask.
+			parallel::Bool, show_progress::Bool: execution controls.
 		Returns:
-			DataFrame with one row per (network, target_rho, target_rate,
-			replicate_idx, mechanism) tuple. Columns:
-				- network_name::String
-				- nominal_rho::Float64
-				- nominal_rate::Float64
-				- replicate_idx::Int
-				- mechanism::Symbol             (:full_removal or :outgoing_only)
-				- seed::Int
-				- dropped_nodes::Vector{Int}
-				- realized_rate::Float64
-				- realized_rho::Float64
-				- bisection_status::Symbol
-				- gc_fraction_of_remaining::Float64
-				- n_observed::Int
-				- n_edges_observed::Int
-				- gc_collapse::Bool
-				- too_small::Bool
-				- no_edges::Bool
-				- any_topo_degenerate::Bool
+			DataFrame with one row per (network, rho, pi_node, pi_edge, replicate)
+			tuple. There is NO mechanism column — full-removal vs nomination is
+			composed per node and reported via n_full_removal / n_nominations.
 		Notes:
-			The doubled-mechanism design exploits selection invariance: both
-			:full_removal and :outgoing_only consume the same dropped_nodes
-			vector from the same sampler call. The orchestrator runs
-			generate_missingness_mask once per (network, rho, rate, rep)
-			cell and emits one row per mechanism that applies to that
-			network. This means the doubled grid's marginal cost is just
-			the materializer calls (cheap) plus the doubled output rows,
-			NOT a doubling of sampler calls.
+			The unified orchestrator (Spec v3). For each network it follows the
+			shared front-matter: detect type → gate the dials by type
+			(pi_edge forced to {0} on unweighted) → up-front feasibility via
+			feasible_rho_range (warn + substitute the clamped rho, recording which
+			value was used) → run generate_missingness_mask per cell.
 
-			Degeneracy values (gc_fraction_of_remaining, n_observed, etc.)
-			are sampler-level quantities computed against the original
-			adjacency and the dropped-node mask. They are mechanism-agnostic:
-			the two rows for the same cell will share these values but
-			differ on mechanism. This reflects the design's separation of
-			concerns — sampler degeneracy describes the dropped set;
-			measure degeneracy (computed when measures run on the materialized
-			network) is a separate downstream concern.
+			Per-network artifacts (centrality, binarized adjacency, weighted
+			adjacency, and TRUE-network community labels for the E/I gate) are
+			computed once and cached, so per-replicate cost excludes detection.
 
-			Directedness handling: :outgoing_only is undefined for undirected
-			networks. When the corpus contains undirected networks AND
-			:outgoing_only is requested, those network-mechanism pairs are
-			silently skipped. A startup diagnostic lists which networks
-			will be skipped (so the user can verify the configuration
-			matches their intent).
+			reverse_edges canonicalization happens once per network at the
+			boundary; outputs reference original node identifiers (the transpose
+			only swaps the src/dst columns feeding the directed nomination logic).
 
-			Row ordering: name → rho → rate → replicate → mechanism, with
-			mechanism varying fastest. Consecutive output rows for the
-			same cell are the two mechanism variants — convenient for
-			downstream diffing.
+			Determinism: rep_seed = Int(hash((name, rho, pi_node, pi_edge, rep,
+			master_seed)) % UInt32); retries inside the mask advance a deterministic
+			sub-seed stream, so the corpus is bit-reproducible.
 
-			Seed scheme: identical to the prior single-mechanism design.
-			rep_seed = Int(hash((name, rho, rate, rep, master_seed)) % UInt32).
-			Mechanism is NOT in the seed because both mechanisms on a cell
-			use the same sampler output.
+			feasibility: out-of-envelope rho is clamped and flagged; the mask then
+			accepts the ceiling draw without burning retries.
 		"""
 
 		#	Guards
 			isempty(networks) && throw(ArgumentError("networks dict is empty"))
 			n_replicates >= 1 || throw(ArgumentError("n_replicates must be >= 1, got $n_replicates"))
-			isempty(mechanisms) && throw(ArgumentError("mechanisms must be non-empty"))
-			for m in mechanisms
-				m in (:full_removal, :outgoing_only) ||
-					throw(ArgumentError("invalid mechanism $m; valid: :full_removal, :outgoing_only"))
-			end
 
-		#	Compute centrality once per network
+		#	Per-network setup: detect type, canonicalize, cache artifacts, feasibility
 			network_names = sort!(collect(keys(networks)))
 			centrality_cache = Dict{String, Vector{Float64}}()
+			adjb_cache       = Dict{String, SparseMatrixCSC}()
+			adjw_cache       = Dict{String, Union{Nothing,SparseMatrixCSC}}()
+			comm_cache       = Dict{String, Vector{Int}}()
+			edges_cache      = Dict{String, DataFrame}()
+			pi_edges_for_net = Dict{String, Vector{Float64}}()
+			feasible_cache   = Dict{Tuple{String,Float64,Float64}, NTuple{2,Float64}}()
+
 			for name in network_names
 				net = networks[name]
-				centrality_cache[name] = _centrality_for_sampler(net.edges;
-																  nodes    = net.nodes,
-																  directed = net.metadata.directed)
+				directed = net.metadata.directed
+				weighted = net.metadata.weighted
+
+				#	Canonicalize orientation at the boundary
+					ed = net.edges
+					if reverse_edges
+						ed = copy(ed)
+						ed.src, ed.dst = ed.dst, ed.src
+					end
+					edges_cache[name] = ed
+
+				#	Cache centrality + binarized adjacency
+					centrality_cache[name] = _centrality_for_sampler(ed; nodes=net.nodes, directed=directed)
+					adjb_cache[name] = isnothing(net.nodes) ?
+						_graph_to_sparse_matrix(ed; weighted=false)[1] :
+						_graph_to_sparse_matrix(ed; nodes=net.nodes, weighted=false)[1]
+
+				#	Weighted adjacency only when needed
+					adjw_cache[name] = weighted ? _weighted_adjacency(ed; nodes=net.nodes)[1] : nothing
+
+				#	TRUE-network community labels for the E/I gate (precomputed once)
+					comm_cache[name] = _true_communities(adjb_cache[name])
+
+				#	Gate the pi_edge dial by type (unweighted -> {0.0})
+					pe = weighted ? sort!(unique(Float64.(target_pi_edges))) : [0.0]
+					pi_edges_for_net[name] = pe
 			end
 
-		#	Determine per-network applicable mechanisms
-			#	:outgoing_only requires directed; skip silently on undirected
-				mechanisms_for_network = Dict{String, Vector{Symbol}}()
-				skipped_undirected = String[]
-				for name in network_names
-					net = networks[name]
-					applicable = Symbol[]
-					for m in mechanisms
-						if m == :outgoing_only && !net.metadata.directed
-							push!(skipped_undirected, name)
-						else
-							push!(applicable, m)
-						end
-					end
-					mechanisms_for_network[name] = applicable
-				end
-				if show_progress && !isempty(skipped_undirected)
-					unique_skipped = unique(skipped_undirected)
-					println("Note: :outgoing_only skipped on undirected networks: ", join(unique_skipped, ", "))
-				end
-
-		#	Enumerate flat grid
-			#	Pre-count grid_size accounting for per-network mechanism applicability
-				grid_size = 0
+		#	Enumerate flat grid (no mechanism axis)
+			grid_size = 0
+			for name in network_names
+				n_reps = get(replicates_per_network, name, n_replicates)
+				grid_size += length(target_rhos) * length(target_pi_nodes) *
+							 length(pi_edges_for_net[name]) * n_reps
+			end
+			flat = Vector{Tuple{String,Float64,Float64,Float64,Int}}(undef, grid_size)
+			let idx = 1
 				for name in network_names
 					n_reps = get(replicates_per_network, name, n_replicates)
-					applicable = mechanisms_for_network[name]
-					grid_size += length(target_rhos) * length(target_rates) * n_reps * length(applicable)
-				end
-				flat_tuples = Vector{Tuple{String,Float64,Float64,Int,Symbol}}(undef, grid_size)
-				let idx = 1
-					for name in network_names
-						n_reps = get(replicates_per_network, name, n_replicates)
-						applicable = mechanisms_for_network[name]
-						for rho in target_rhos
-							for rate in target_rates
+					for rho in target_rhos
+						for pin in target_pi_nodes
+							for pie in pi_edges_for_net[name]
 								for rep in 1:n_reps
-									for mech in applicable
-										flat_tuples[idx] = (name, Float64(rho), Float64(rate), rep, mech)
-										idx += 1
-									end
+									flat[idx] = (name, Float64(rho), Float64(pin), Float64(pie), rep)
+									idx += 1
 								end
 							end
 						end
 					end
 				end
+			end
 
-		#	Pre-allocate result storage
-			results = Vector{NamedTuple}(undef, grid_size)
-
-		#	Progress bar
-			use_threads = parallel && Threads.nthreads() > 1 && grid_size > 1
-			desc        = "Degeneration grid (" * string(grid_size) * " rows, " *
-						  (use_threads ? "$(Threads.nthreads()) threads" : "serial") * ")"
-			prog        = show_progress ? Progress(grid_size, desc = desc, enabled = true) : nothing
-			prog_lock   = ReentrantLock()
-
-		#	Sampler-call cache per (name, rho, rate, rep) cell
-			#	Both mechanisms on the same cell consume the same sampler output.
-			#	Rather than re-running generate_missingness_mask for each mechanism,
-			#	we cache the record keyed by (name, rho, rate, rep) and apply
-			#	the materializers downstream when the per-row degeneracy is computed.
-			#	BUT: the current grid design computes degeneracy inside
-			#	generate_missingness_mask, so the cache key is just the sampler call;
-			#	the per-row output is constructed from the cached record. Cache
-			#	is mutable Dict; thread-safe via per-key locking via lock_dict.
-				sampler_cache = Dict{Tuple{String,Float64,Float64,Int}, NamedTuple}()
-				cache_lock = ReentrantLock()
-
-		#	Run flat-grid loop
-			if use_threads
-				Threads.@threads :static for k in 1:grid_size
-					name, rho, rate, rep, mech = flat_tuples[k]
-					cache_key = (name, rho, rate, rep)
-					#	Get or compute the sampler record
-						local record
-						lock(cache_lock) do
-							record = get(sampler_cache, cache_key, nothing)
-						end
-						if record === nothing
-							net = networks[name]
-							rep_seed = Int(hash((name, rho, rate, rep, master_seed)) % UInt32)
-							record = generate_missingness_mask(net.edges;
-																  nodes       = net.nodes,
-																  directed    = net.metadata.directed,
-																  target_rate = rate,
-																  target_rho  = rho,
-																  seed        = rep_seed,
-																  centrality  = centrality_cache[name],
-																  gc_threshold        = gc_threshold,
-																  min_n               = min_n,
-																  min_edges           = min_edges,
-																  bisection_tol       = bisection_tol,
-																  bisection_max_iters = bisection_max_iters,
-																  bisection_M         = bisection_M)
-							lock(cache_lock) do
-								sampler_cache[cache_key] = record
+		#	Up-front feasibility per (network, pi_node, pi_edge); clamp + warn
+			substituted = Dict{Tuple{String,Float64,Float64,Float64}, Float64}()
+			for name in network_names
+				net = networks[name]
+				for pin in target_pi_nodes
+					for pie in pi_edges_for_net[name]
+						key = (name, Float64(pin), Float64(pie))
+						haskey(feasible_cache, key) && continue
+						#	SEAM: feasible_rho_range currently takes a single
+						#	target_rate (positional nodes); v3 calls for generalizing
+						#	it to (pi_node, pi_edge) and the organic-loss tightening.
+						#	Until that reconstruction-side change lands, we probe the
+						#	envelope at the node rate, which is the binding axis for
+						#	the node-missingness correlation the gate checks.
+							fr = feasible_rho_range(edges_cache[name], net.nodes;
+													 directed    = net.metadata.directed,
+													 weighted    = net.metadata.weighted,
+													 target_rate = Float64(pin))
+							rng_lo, rng_hi = fr.rho_min, fr.rho_max
+						feasible_cache[key] = (rng_lo, rng_hi)
+						for rho in target_rhos
+							clamped = clamp(Float64(rho), rng_lo, rng_hi)
+							if !isapprox(clamped, rho; atol = 1e-9)
+								substituted[(name, Float64(rho), Float64(pin), Float64(pie))] = clamped
+								if show_progress
+									println("Note: rho=$rho infeasible for $name ",
+											 "(pi_node=$pin, pi_edge=$pie); using $clamped")
+								end
 							end
 						end
-					#	Per-mechanism row
-						rep_seed = Int(hash((name, rho, rate, rep, master_seed)) % UInt32)
-						results[k] = (name = name, rho = rho, rate = rate, rep = rep,
-									   mechanism = mech, seed = rep_seed, record = record)
-					if show_progress
-						lock(prog_lock) do
-							next!(prog)
-						end
-					end
-				end
-			else
-				for k in 1:grid_size
-					name, rho, rate, rep, mech = flat_tuples[k]
-					cache_key = (name, rho, rate, rep)
-					record = get(sampler_cache, cache_key, nothing)
-					if record === nothing
-						net = networks[name]
-						rep_seed = Int(hash((name, rho, rate, rep, master_seed)) % UInt32)
-						record = generate_missingness_mask(net.edges;
-															  nodes       = net.nodes,
-															  directed    = net.metadata.directed,
-															  target_rate = rate,
-															  target_rho  = rho,
-															  seed        = rep_seed,
-															  centrality  = centrality_cache[name],
-															  gc_threshold        = gc_threshold,
-															  min_n               = min_n,
-															  min_edges           = min_edges,
-															  bisection_tol       = bisection_tol,
-															  bisection_max_iters = bisection_max_iters,
-															  bisection_M         = bisection_M)
-						sampler_cache[cache_key] = record
-					end
-					rep_seed = Int(hash((name, rho, rate, rep, master_seed)) % UInt32)
-					results[k] = (name = name, rho = rho, rate = rate, rep = rep,
-								   mechanism = mech, seed = rep_seed, record = record)
-					if show_progress
-						next!(prog)
 					end
 				end
 			end
 
-		#	Flatten per-replicate records into rectangular DataFrame columns
+		#	Pre-allocate result storage
+			results = Vector{NamedTuple}(undef, grid_size)
+			use_threads = parallel && Threads.nthreads() > 1 && grid_size > 1
+			desc = "Degeneration grid (" * string(grid_size) * " rows, " *
+				   (use_threads ? "$(Threads.nthreads()) threads" : "serial") * ")"
+			prog = show_progress ? Progress(grid_size, desc = desc, enabled = true) : nothing
+			prog_lock = ReentrantLock()
+
+		#	Worker closure body factored for serial / threaded reuse
+			run_cell = function (k::Int)
+				name, rho, pin, pie, rep = flat[k]
+				net = networks[name]
+				#	Apply the feasibility substitution if any
+					rho_used = get(substituted, (name, rho, pin, pie), rho)
+				rep_seed = Int(hash((name, rho, pin, pie, rep, master_seed)) % UInt32)
+				rec = generate_missingness_mask(edges_cache[name];
+							nodes          = net.nodes,
+							directed       = net.metadata.directed,
+							weighted       = net.metadata.weighted,
+							target_pi_node = pin,
+							target_pi_edge = pie,
+							target_rho     = rho_used,
+							seed           = rep_seed,
+							centrality     = centrality_cache[name],
+							true_community = comm_cache[name],
+							adj_binary     = adjb_cache[name],
+							adj_weighted   = adjw_cache[name],
+							K = K, gc_threshold = gc_threshold, min_n = min_n,
+							min_edges = min_edges, rho_tol = rho_tol,
+							ei_tvd_tol = ei_tvd_tol, max_retries = max_retries)
+				results[k] = (name = name, rho = rho, pin = pin, pie = pie, rep = rep,
+							   rho_used = rho_used, seed = rep_seed, record = rec)
+			end
+
+		#	Run flat-grid loop
+			if use_threads
+				Threads.@threads :static for k in 1:grid_size
+					run_cell(k)
+					if show_progress
+						lock(prog_lock) do; next!(prog); end
+					end
+				end
+			else
+				for k in 1:grid_size
+					run_cell(k)
+					show_progress && next!(prog)
+				end
+			end
+
+		#	Flatten per-replicate records into a rectangular DataFrame
 			out = DataFrame(
-				network_name             = String[],
-				nominal_rho              = Float64[],
-				nominal_rate             = Float64[],
-				replicate_idx            = Int[],
-				mechanism                = Symbol[],
-				seed                     = Int[],
-				dropped_nodes            = Vector{Int}[],
-				realized_rate            = Float64[],
-				realized_rho             = Float64[],
-				bisection_status         = Symbol[],
+				network_name        = String[],
+				nominal_rho         = Float64[],
+				nominal_pi_node     = Float64[],
+				nominal_pi_edge     = Float64[],
+				replicate_idx       = Int[],
+				seed                = Int[],
+				substituted_rho     = Float64[],
+				rho_was_substituted = Bool[],
+				missing_nodes       = Vector{Int}[],
+				n_full_removal      = Int[],
+				n_nominations       = Int[],
+				realized_pi_node    = Float64[],
+				realized_rho        = Float64[],
+				realized_ei_score   = Float64[],
+				realized_pi_edge    = Float64[],
+				W_true              = Int[],
+				W_removed           = Int[],
+				n_edges_zeroed      = Int[],
+				n_organic_losses    = Int[],
+				beta                = Float64[],
+				field_status        = Symbol[],
+				gate_status         = Symbol[],
+				contract_passed     = Bool[],
+				retry_count         = Int[],
 				gc_fraction_of_remaining = Float64[],
-				n_observed               = Int[],
-				n_edges_observed         = Int[],
-				gc_collapse              = Bool[],
-				too_small                = Bool[],
-				no_edges                 = Bool[],
-				any_topo_degenerate      = Bool[],
+				n_observed          = Int[],
+				n_edges_observed    = Int[],
+				gc_collapse         = Bool[],
+				too_small           = Bool[],
+				no_edges            = Bool[],
+				any_topo_degenerate = Bool[],
 			)
 			for r in results
 				rec  = r.record
 				sdeg = rec.sampler_degeneracy
-				push!(out, (network_name             = r.name,
-							nominal_rho              = r.rho,
-							nominal_rate             = r.rate,
-							replicate_idx            = r.rep,
-							mechanism                = r.mechanism,
-							seed                     = r.seed,
-							dropped_nodes            = rec.dropped_nodes,
-							realized_rate            = rec.realized_rate,
-							realized_rho             = rec.realized_rho,
-							bisection_status         = rec.bisection_status,
+				push!(out, (network_name        = r.name,
+							nominal_rho         = r.rho,
+							nominal_pi_node     = r.pin,
+							nominal_pi_edge     = r.pie,
+							replicate_idx       = r.rep,
+							seed                = r.seed,
+							substituted_rho     = r.rho_used,
+							rho_was_substituted = !isapprox(r.rho_used, r.rho; atol = 1e-9),
+							missing_nodes       = rec.missing_nodes,
+							n_full_removal      = rec.n_full_removal,
+							n_nominations       = rec.n_nominations,
+							realized_pi_node    = rec.realized_pi_node,
+							realized_rho        = rec.realized_rho,
+							realized_ei_score   = rec.realized_ei_score,
+							realized_pi_edge    = rec.realized_pi_edge,
+							W_true              = rec.W_true,
+							W_removed           = rec.W_removed,
+							n_edges_zeroed      = rec.n_edges_zeroed,
+							n_organic_losses    = rec.n_organic_losses,
+							beta                = rec.beta,
+							field_status        = rec.field_status,
+							gate_status         = rec.gate_status,
+							contract_passed     = rec.contract_passed,
+							retry_count         = rec.retry_count,
 							gc_fraction_of_remaining = sdeg.gc_fraction_of_remaining,
-							n_observed               = sdeg.n_observed,
-							n_edges_observed         = sdeg.n_edges_observed,
-							gc_collapse              = sdeg.gc_collapse,
-							too_small                = sdeg.too_small,
-							no_edges                 = sdeg.no_edges,
-							any_topo_degenerate      = sdeg.any_topo_degenerate))
+							n_observed          = sdeg.n_observed,
+							n_edges_observed    = sdeg.n_edges_observed,
+							gc_collapse         = sdeg.gc_collapse,
+							too_small           = sdeg.too_small,
+							no_edges            = sdeg.no_edges,
+							any_topo_degenerate = sdeg.any_topo_degenerate))
 			end
 
 		return out
 	end
 	@doc raw"""
 	**Description**
-	Orchestrates the full degeneration grid. Given a corpus of networks and
-	a design grid (target $\rho$ values, target rates, replicate count,
-	missingness mechanisms), this function produces a per-replicate record
-	for every cell and materializer combination, and returns the results as
-	a single rectangular DataFrame.
-
-	The framework validates two missing-data mechanisms drawn from the
-	literature: full node removal (the dropped nodes and all of their edges
-	are removed from the network) and SMM-style outgoing-edge-only removal
-	(non-respondents remain in the roster with their incoming edges preserved
-	and only their outgoing edges removed). Both mechanisms operate on the
-	same centrality-correlated dropped-node set produced by the sampler;
-	only the materialization differs.
+	Orchestrates the unified degeneration grid (Spec~v3). For each network it
+	detects type, gates the two dials ($\pi_{\text{node}}$, $\pi_{\text{edge}}$)
+	by type, checks the up-front feasibility envelope (warning and substituting an
+	infeasible~$\rho$), and produces one per-replicate record per
+	$(\text{network}, \rho, \pi_{\text{node}}, \pi_{\text{edge}}, \text{rep})$
+	cell. Full-removal versus nomination is composed per node, so there is no
+	mechanism axis and no doubled rows.
 
 	**Usage**
 	```julia
-		corpus = build_degeneration_corpus(networks;
-			target_rhos    = [-0.75, -0.25, 0.0, 0.25, 0.75],
-			target_rates   = [0.05, 0.10, 0.15, 0.25, 0.40, 0.50],
-			n_replicates   = 100,
-			mechanisms     = [:full_removal, :outgoing_only],
-			master_seed    = 42,
-		)
+			corpus = build_degeneration_corpus(networks;
+				target_rhos     = [-0.75, -0.25, 0.0, 0.25, 0.75],
+				target_pi_nodes = [0.05, 0.10, 0.15, 0.25, 0.40, 0.50],
+				target_pi_edges = [0.0, 0.10, 0.25],
+				n_replicates    = 100,
+				reverse_edges   = false,
+				master_seed     = 42,
+			)
 	```
 
 	**Arguments**
-	- `networks::Dict`: corpus keyed by network name $\to$ NamedTuple with
-	  `:edges`, `:nodes`, `:metadata.directed`.
-	- `target_rhos::AbstractVector{<:Real}`: the $\rho$ grid. Default is the
-	  five levels in the validation roadmap, $\{-0.75, -0.25, 0.0, 0.25, 0.75\}$.
-	- `target_rates::AbstractVector{<:Real}`: the rate grid. Default is the
-	  six rates in the validation roadmap, $\{0.05, 0.10, 0.15, 0.25, 0.40, 0.50\}$.
-	- `n_replicates::Int`: default replicate count per cell (default 100).
-	- `replicates_per_network::Dict{String,Int}`: per-network override of
-	  replicate count (e.g., to reduce Marvel's count for budget reasons).
-	  Networks absent from this dict use `n_replicates`.
-	- `mechanisms::Vector{Symbol}`: which materialization mechanisms to run
-	  on each cell. Valid values are `:full_removal` and `:outgoing_only`.
-	  Default `[:full_removal]` preserves single-mechanism behavior; pass
-	  `[:full_removal, :outgoing_only]` for the doubled-mechanism grid.
-	  `:outgoing_only` is silently skipped on undirected networks; a
-	  startup diagnostic lists which networks will be skipped so the user
-	  can verify the configuration matches their intent.
-	- `master_seed::Integer`: master seed; per-replicate seeds derived
-	  deterministically from $(\text{name}, \rho, \text{rate}, \text{rep}, \text{master})$.
-	- `gc_threshold`, `min_n`, `min_edges`: passed to topological degeneracy
-	  detection inside `generate_missingness_mask`.
-	- `bisection_tol`, `bisection_max_iters`, `bisection_M`: passed to the
-	  Monte Carlo bisection inside `generate_missingness_mask`.
-	- `parallel::Bool`: parallelize the flat-grid loop (default true).
-	- `show_progress::Bool`: display a progress bar and startup diagnostics
-	  (default true).
+	- `networks::Dict`: keyed by name $\to$ `(:edges, :nodes, :metadata)` with
+	  `:metadata.directed` and `:metadata.weighted`.
+	- `target_rhos`, `target_pi_nodes`, `target_pi_edges`: the grid; `pi_edge`
+	  entries apply only to weighted networks.
+	- `reverse_edges::Bool`: explicit per-run orientation flag.
+	- `master_seed`, `K`, `gc_threshold`, `min_n`, `min_edges`, `rho_tol`,
+	  `ei_tvd_tol`, `max_retries`, `parallel`, `show_progress`: controls.
 
 	**Value**
-	`DataFrame` with one row per
-	$(\text{network}, \rho, \text{rate}, \text{rep}, \text{mechanism})$ tuple.
-	Seventeen columns: identifiers and provenance (`network_name`,
-	`nominal_rho`, `nominal_rate`, `replicate_idx`, `mechanism`, `seed`),
-	the sampler output (`dropped_nodes`, `realized_rate`, `realized_rho`,
-	`bisection_status`), and the topological degeneracy fields flattened
-	from `sampler_degeneracy` (`gc_fraction_of_remaining`, `n_observed`,
-	`n_edges_observed`, `gc_collapse`, `too_small`, `no_edges`,
-	`any_topo_degenerate`).
-
-	Row ordering: $\text{name} \to \rho \to \text{rate} \to \text{rep} \to \text{mechanism}$,
-	with mechanism varying fastest. Consecutive rows for the same cell are
-	the mechanism variants of that cell --- convenient for downstream
-	diffing and per-cell summaries.
+	A `DataFrame` with the unified schema: keys, the realized priors and gate
+	status, the non-gating edge-stage diagnostic, materialization counts, and
+	sampler degeneracy. Diffuse weight removal is regenerable from the seed and
+	is not stored per edge.
 
 	**Notes**
-	The DataFrame contains every replicate, including those flagged
-	degenerate or with `bisection_status == :failed_other`. Filtering is the
-	consumer's job: a coverage analysis might restrict to
-	`any_topo_degenerate == false`, while a degeneracy-rate analysis wants
-	all rows. Per-cell degeneracy rates (used for grid trimming) are
-	computed via grouping on
-	(`network_name`, `nominal_rho`, `nominal_rate`, `mechanism`) and
-	summarizing `any_topo_degenerate`.
-
-	The doubled-mechanism grid exploits selection invariance: both
-	`:full_removal` and `:outgoing_only` consume the same dropped-node set
-	from the same sampler call. The orchestrator runs the sampler once per
-	$(\text{network}, \rho, \text{rate}, \text{rep})$ cell and emits one
-	row per applicable mechanism. The marginal cost of adding `:outgoing_only`
-	to the grid is the materializer overhead and the doubled output rows,
-	NOT a doubling of sampler calls.
-
-	The degeneracy columns describe the sampler-level structural state of
-	the network when the dropped-node mask is applied to the original
-	adjacency. They are mechanism-agnostic by design: both mechanism rows
-	for the same cell share these values. This reflects the separation of
-	concerns in the validation framework --- sampler degeneracy describes
-	the dropped set, while measure degeneracy (computed downstream when
-	the framework's measure code runs on the materialized network) is a
-	separate concern tracked in its own output columns.
-
-	Threading is enabled by default and uses `Threads.@threads :static`
-	with pre-allocated per-tuple result storage. The sampler-record cache
-	uses a `ReentrantLock` to coordinate read-then-compute-then-write
-	across threads. Output is deterministic in `master_seed` regardless
-	of thread count: the seed scheme is keyed by
-	$(\text{name}, \rho, \text{rate}, \text{rep}, \text{master})$ with
-	mechanism deliberately excluded, ensuring that the two mechanism rows
-	for the same cell share the same seed and the same sampler record.
+	Regenerating this corpus invalidates the Phase~1.5 community corpus, whose
+	join keys must drop `mechanism`. Bit-reproducible from the master seed.
 
 	**See Also**
-	`generate_missingness_mask`, `apply_missingness`,
-	`apply_missingness_outgoing_only`, `_centrality_for_sampler`,
-	`_bisect_b_for_target_rho`
-
-	**References**
-	- Smith, J. A., Morgan, J. H., & Moody, J. (2022). Network sampling
-	  coverage III: Imputation of missing network data under different
-	  network and missing data conditions. *Social Networks*, 68, 148--178.
+	`generate_missingness_mask`, `feasible_rho_range`, `_materialize_missing_nodes`
 	""" build_degeneration_corpus
 
 #   Exports (public API)
     export generate_missingness_mask,
-           apply_missingness,
+           apply_weight_removal,
            build_degeneration_corpus
 
 end # module network_degeneracy

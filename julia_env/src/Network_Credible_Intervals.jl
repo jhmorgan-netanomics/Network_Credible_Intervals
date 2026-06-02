@@ -26,19 +26,25 @@ THE SOFTWARE.
 
 module Network_Credible_Intervals
 
+#   Setting Reconstruction Function Constants
+    const DEFAULT_J                 = 3
+    const EI_SEMANTIC_THRESHOLDS_J3 = (-0.33, 0.33)
+    const LAPLACE_NUMERATOR_ADD     = 1.0
+    const LAPLACE_DENOMINATOR_ADD   = 2.0
+
 #   Load submodules
     include("graphml_io.jl")
     include("network_community_detection.jl")
     include("network_statistics.jl")
-    include("network_degeneracy_functions.jl")
     include("network_reconstruction_functions.jl")
+    include("network_degeneracy_functions.jl")
 
 #   Pull their exports into the parent namespace
     using .graphml_io
     using .network_community_detection
     using .network_statistics
-    using .network_degeneracy
     using .network_reconstruction
+    using .network_degeneracy
 
 #   Re-export to users of Network_Credible_Intervals
     export write_graphml,

@@ -1253,6 +1253,282 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			)
 	end
 
+#	Run R setups × B replicates per setup for one Phase 2 RG contract cell
+	function _replicate_contract_cell(net::NamedTuple,
+									   rho_input::Float64,
+									   rate_input::Float64;
+									   R::Int = 20,
+									   B::Int = 5,
+									   K::Int = 4,
+									   J::Int = 3,
+									   master_seed::Int = 42)
+		"""
+		Args:
+			net::NamedTuple: (edges, nodes, metadata) in corpus format
+			rho_input::Float64: nominal target rho for Phase 1
+			rate_input::Float64: nominal target rate for Phase 1
+			R::Int: number of Phase 1 -> Setup iterations
+			B::Int: number of generate_replicate calls per setup
+			K::Int: degree bins
+			J::Int: E/I bins
+			master_seed::Int: seed for Phase 1 calls
+		Returns:
+			NamedTuple matching the schema of _algorithmic_contract_cell
+			plus replicate-level diagnostic fields.
+		Notes:
+			Extends _algorithmic_contract_cell by adding, per (Phase 1 + Setup)
+			iteration, B generate_replicate draws from the constructed setup.
+			Per-rep prior_1, prior_2, prior_3 now reflect replicate-level
+			contracts in addition to setup-level ones:
+
+			Prior 1: (existing rate arithmetic) AND (every replicate has
+			         nrow(augmented_nodes) == N_obs + N_add and exactly N_add
+			         :added rows).
+			Prior 2: empirical degree-bin counts of added nodes
+			         (aggregated across B replicates) consistent with
+			         Multinomial(B * N_add, setup.q) via Pearson chi-squared
+			         GoF. Per-rep gate at p > 0.001 (Bonferroni-style across
+			         R reps to keep aggregate Type I error ~5%). Chi-squared
+			         was chosen over max-abs-dev because the latter doesn't
+			         scale with sample size: with N_add * B in the 30-50
+			         range typical for small corpus networks, max-abs-dev
+			         at fixed tolerance 0.05 fails 90%+ of reps even when
+			         the sampler is correct.
+			Prior 3: (existing ei_conditional row-stochasticity and matched-
+			         empirical) AND empirical E/I-given-degree-bin from
+			         added-node samples matches setup.ei_conditional within
+			         max abs deviation 0.10.
+
+			realized_rho values from r.diag[:realized_rho] are recorded for
+			diagnostics but don't gate (bin-index proxy with systematic
+			finite-sample bias against the centrality-based analytic target).
+		"""
+
+		#	Pre-Compute G_true Centrality (reused across replicates)
+			centrality_true = Network_Credible_Intervals.network_degeneracy._centrality_for_sampler(
+				net.edges; nodes = net.nodes, directed = net.metadata.directed)
+
+		#	Storage (existing schema)
+			rep_realized_rhos     = Float64[]
+			rep_realized_rates    = Float64[]
+			rep_n_dropped         = Int[]
+			rep_n_add             = Int[]
+			rep_beta              = Float64[]
+			rep_beta_realized     = Float64[]
+			rep_beta_status       = Symbol[]
+			rep_prior_1           = Bool[]
+			rep_prior_2           = Bool[]
+			rep_prior_3           = Bool[]
+			rep_ei_row_stochastic = Bool[]
+			rep_ei_matches_emp    = Bool[]
+			n_skipped             = 0
+
+		#	Storage (new: replicate-level diagnostics)
+			rep_chi2_stat_q          = Float64[]
+			rep_p_value_q            = Float64[]
+			rep_empirical_q_max_dev  = Float64[]
+			rep_empirical_ei_max_dev = Float64[]
+			rep_replicate_mean_rho   = Float64[]
+			rep_replicate_rho_dev    = Float64[]
+
+		#	Tolerances
+			tol_prior_1        = 0.02   # rate arithmetic (existing)
+			tol_prior_2_pvalue = 0.001  # Prior 2 chi-squared p-threshold (NEW)
+			tol_prior_3        = 0.10   # empirical ei_conditional vs setup.ei_conditional
+			tol_analytic       = 1e-3   # setup-level analytic checks
+			tol_stochastic     = 1e-10  # row-stochasticity
+
+		#	Per-Replicate Loop
+			for rep in 1:R
+				rep_seed = Int(hash((rho_input, rate_input, rep, master_seed)) % UInt32)
+
+				#	Phase 1
+					record = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
+						net.edges;
+						nodes       = net.nodes,
+						directed    = net.metadata.directed,
+						target_rate = rate_input,
+						target_rho  = rho_input,
+						seed        = rep_seed,
+						centrality  = centrality_true)
+
+					if record.bisection_status == :failed_other
+						n_skipped += 1
+						continue
+					end
+
+				#	Materialize G_obs
+					dropped = collect(record.dropped_nodes)
+					materialized = Network_Credible_Intervals.network_degeneracy.apply_missingness(
+						net.edges, dropped; nodes = net.nodes)
+
+				#	CHAMP on G_obs
+					champ_result = Network_Credible_Intervals.network_community_detection.champ_community_detection(
+						materialized.edges;
+						nodes         = materialized.nodes,
+						weighted      = net.metadata.weighted,
+						directed      = net.metadata.directed,
+						seed          = rep_seed + 1000,
+						show_progress = false)
+
+				#	Phase 2 Setup with Phase 1's realized values as inputs
+					setup = Network_Credible_Intervals.network_reconstruction.compute_setup(
+						materialized.edges, materialized.nodes,
+						champ_result.membership;
+						directed = net.metadata.directed,
+						weighted = net.metadata.weighted,
+						pi_node  = record.realized_rate,
+						pi_edge  = 0.0,
+						rho      = record.realized_rho,
+						K        = K,
+						J        = J)
+
+				#	Setup-Level Diagnostics
+					N_obs = nrow(setup.nodes) - length(setup.partially_observed)
+					N_add = setup.N_add
+					observed_rate = N_add / (N_obs + N_add)
+					prior_1_rate_ok = abs(observed_rate - record.realized_rate) < tol_prior_1
+
+					realized_at_beta = Network_Credible_Intervals.network_reconstruction._realized_rho_for_beta(
+						setup.beta, setup.K, N_obs, N_add)
+
+					ei_cond = setup.ei_conditional
+					row_sums = sum(ei_cond, dims = 2)
+					ei_row_stochastic = all(isapprox.(row_sums, 1.0; atol = tol_stochastic))
+
+					J_eff = size(ei_cond, 2)
+					empirical_cond = zeros(Float64, K, J_eff)
+					for i in 1:length(setup.degree_bins)
+						b = setup.degree_bins[i]
+						j = setup.ei_bins[i]
+						empirical_cond[b, j] += 1.0
+					end
+					for b in 1:K
+						rs = sum(empirical_cond[b, :])
+						if rs > 0
+							empirical_cond[b, :] ./= rs
+						else
+							empirical_cond[b, :] .= 1.0 / J_eff
+						end
+					end
+					ei_matches_emp = isapprox(ei_cond, empirical_cond; atol = tol_analytic)
+
+				#	Phase 2 RG: Generate B Replicates from this Setup
+					replicates = [
+						Network_Credible_Intervals.network_reconstruction.generate_replicate(
+							setup, rep_seed + 2000 + b)
+						for b in 1:B
+					]
+
+				#	Prior 1 (RG): Rate Arithmetic + Replicate Structural Counts
+					expected_nrow = nrow(setup.nodes) + N_add
+					prior_1_struct_ok = all(
+						nrow(rp.augmented_nodes) == expected_nrow &&
+						count(==(:added), rp.augmented_nodes.node_type) == N_add
+						for rp in replicates
+					)
+					prior_1_ok = prior_1_rate_ok && prior_1_struct_ok
+
+				#	Prior 2 (RG): Pearson Chi-Squared GoF on Empirical Degree-Bin Counts
+					empirical_q_counts = zeros(Float64, K)
+					for rp in replicates
+						for b in rp.diag[:added_degree_bins]
+							empirical_q_counts[b] += 1.0
+						end
+					end
+					n_total_q = sum(empirical_q_counts)
+					if n_total_q > 0
+						expected_counts = n_total_q .* setup.q
+						chi2_stat_q = sum((empirical_q_counts .- expected_counts).^2 ./ expected_counts)
+						p_value_q = ccdf(Chisq(K - 1), chi2_stat_q)
+						empirical_q_max_dev = maximum(abs.((empirical_q_counts ./ n_total_q) .- setup.q))
+						prior_2_ok = p_value_q > tol_prior_2_pvalue
+					else
+						chi2_stat_q = 0.0
+						p_value_q = 1.0
+						empirical_q_max_dev = 0.0
+						prior_2_ok = false
+					end
+
+				#	Prior 3 (RG): Setup-Level ei_conditional + Empirical-from-Replicate Match
+					empirical_ei_cond = zeros(Float64, K, J_eff)
+					for rp in replicates
+						for (b, j) in zip(rp.diag[:added_degree_bins], rp.diag[:added_ei_bins])
+							empirical_ei_cond[b, j] += 1.0
+						end
+					end
+					empirical_ei_max_dev = 0.0
+					for b in 1:K
+						rs = sum(empirical_ei_cond[b, :])
+						if rs > 0
+							empirical_ei_cond[b, :] ./= rs
+							row_dev = maximum(abs.(empirical_ei_cond[b, :] .- setup.ei_conditional[b, :]))
+							empirical_ei_max_dev = max(empirical_ei_max_dev, row_dev)
+						end
+					end
+					prior_3_ok = ei_row_stochastic && ei_matches_emp &&
+								 (empirical_ei_max_dev < tol_prior_3)
+
+				#	Diagnostic: Mean Bin-Index Realized rho (informational only)
+					rho_samples = [rp.diag[:realized_rho] for rp in replicates]
+					mean_replicate_rho = mean(rho_samples)
+					replicate_rho_dev = abs(mean_replicate_rho - setup.rho)
+
+				#	Record Per-Rep
+					push!(rep_realized_rhos, record.realized_rho)
+					push!(rep_realized_rates, record.realized_rate)
+					push!(rep_n_dropped, length(dropped))
+					push!(rep_n_add, N_add)
+					push!(rep_beta, setup.beta)
+					push!(rep_beta_realized, realized_at_beta)
+					push!(rep_beta_status, setup.beta_status)
+					push!(rep_prior_1, prior_1_ok)
+					push!(rep_prior_2, prior_2_ok)
+					push!(rep_prior_3, prior_3_ok)
+					push!(rep_ei_row_stochastic, ei_row_stochastic)
+					push!(rep_ei_matches_emp, ei_matches_emp)
+					push!(rep_chi2_stat_q, chi2_stat_q)
+					push!(rep_p_value_q, p_value_q)
+					push!(rep_empirical_q_max_dev, empirical_q_max_dev)
+					push!(rep_empirical_ei_max_dev, empirical_ei_max_dev)
+					push!(rep_replicate_mean_rho, mean_replicate_rho)
+					push!(rep_replicate_rho_dev, replicate_rho_dev)
+			end
+
+		#	Aggregate Gates
+			prior_1_pass = !isempty(rep_prior_1) && all(rep_prior_1)
+			prior_2_pass = !isempty(rep_prior_2) && all(rep_prior_2)
+			prior_3_pass = !isempty(rep_prior_3) && all(rep_prior_3)
+
+			cell_id = "rho=$(round(rho_input, digits=2)), rate=$(round(rate_input, digits=2))"
+			return (
+				cell_id                  = cell_id,
+				n_completed              = length(rep_prior_1),
+				n_skipped                = n_skipped,
+				prior_1_pass             = prior_1_pass,
+				prior_2_pass             = prior_2_pass,
+				prior_3_pass             = prior_3_pass,
+				rep_realized_rhos        = rep_realized_rhos,
+				rep_realized_rates       = rep_realized_rates,
+				rep_n_dropped            = rep_n_dropped,
+				rep_n_add                = rep_n_add,
+				rep_beta                 = rep_beta,
+				rep_beta_realized        = rep_beta_realized,
+				rep_beta_status          = rep_beta_status,
+				rep_prior_1              = rep_prior_1,
+				rep_prior_2              = rep_prior_2,
+				rep_prior_3              = rep_prior_3,
+				rep_ei_row_stochastic    = rep_ei_row_stochastic,
+				rep_ei_matches_emp       = rep_ei_matches_emp,
+				rep_chi2_stat_q          = rep_chi2_stat_q,
+				rep_p_value_q            = rep_p_value_q,
+				rep_empirical_q_max_dev  = rep_empirical_q_max_dev,
+				rep_empirical_ei_max_dev = rep_empirical_ei_max_dev,
+				rep_replicate_mean_rho   = rep_replicate_mean_rho,
+				rep_replicate_rho_dev    = rep_replicate_rho_dev,
+			)
+	end
+
 #	Print a formatted contract-cell report
 	function _print_contract_cell(cell::NamedTuple)
 		println("  Cell: $(cell.cell_id)")
@@ -5038,3 +5314,384 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			return all_pass
 	end
 	test_generate_replicate_undirected()
+
+#	Test 31: Moreno replicate-generation contract calibration
+	function test_replicate_calibration_moreno()
+		"""
+		Args: none
+		Returns:
+			Bool: true if test passes
+		Notes:
+			Replicate-generation contract calibration on Moreno (directed,
+			N=70). Phase-2-RG analog of Test 19 (Setup calibration on Moreno).
+
+			Three cells at K=4, rho ∈ {0, +0.5, -0.5}, rate=0.10. R=20
+			(Phase 1 + Setup iterations); B=5 (generate_replicate draws
+			per setup). Per-rep gates aggregate:
+
+			- Prior 1: rate arithmetic at Setup AND structural counts on
+			  every one of the B replicates from that Setup.
+			- Prior 2: empirical degree-bin counts of added nodes
+			  (aggregated across the B replicates) consistent with
+			  Multinomial(B × N_add, setup.q) by Pearson chi-squared GoF;
+			  per-rep gate p > 0.001 (Bonferroni-style across R reps).
+			- Prior 3: ei_conditional row-stochasticity and matched-empirical
+			  AND empirical E/I-given-degree-bin from the B replicates'
+			  added-node samples matches setup.ei_conditional within 0.10.
+
+			Expected behavior:
+			- Prior 1: PASS.
+			- Prior 2: PASS — chi-squared adapts to the n = B × N_add ≈ 35
+			  samples per rep; per-bin expected counts (~9 at uniform q) are
+			  above the chi-squared rule-of-thumb threshold of 5.
+			- Prior 3: PASS for populated rows.
+			- Informational: Phase 1's symmetric Kendall ceiling on Moreno
+			  at rate=0.10 is roughly ±0.27, so the ±0.5 cells are
+			  ceiling-pulled — setup.rho on those cells comes in around
+			  ±0.13 / ±0.18, and Phase 2 verifies against the realized
+			  values, not the originally-targeted ±0.5.
+
+			Wall-clock estimate: under a minute at R=20, B=5.
+		"""
+		println("─" ^ 70)
+		println("Test 31: Replicate-generation contract calibration on Moreno")
+		println("─" ^ 70)
+
+		#	Load Moreno from Disk
+			graphml_path = "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data/GraphML_Test_Networks/moreno_highschool_unweighted.graphml"
+			net = Network_Credible_Intervals.load_graphml(graphml_path)
+			println("  Loaded: moreno")
+			println("  N = $(nrow(net.nodes)), E = $(nrow(net.edges))")
+			println("  Directed: $(net.metadata.directed), Weighted: $(net.metadata.weighted)")
+			println()
+
+		#	Run Three Replicate-Contract Cells at K=4
+			K = 4
+			J = 3
+			R = 20
+			B = 5
+			cells = [
+				(0.0,  0.10),
+				(0.5,  0.10),
+				(-0.5, 0.10),
+			]
+
+			cell_results = NamedTuple[]
+			for (rho_input, rate_input) in cells
+				print("  Running cell (rho=$rho_input, rate=$rate_input)... ")
+				flush(stdout)
+				cell = _replicate_contract_cell(net, rho_input, rate_input;
+												  R = R, B = B, K = K, J = J)
+				push!(cell_results, cell)
+				println("done.")
+			end
+
+			println()
+			println("=" ^ 70)
+			println("REPLICATE-GENERATION CONTRACT RESULTS (Moreno, K=$K, B=$B)")
+			println("=" ^ 70)
+			for cell in cell_results
+				_print_contract_cell(cell)
+			end
+
+		#	Gates
+			gate_1 = all(c.prior_1_pass for c in cell_results)
+			gate_2 = all(c.prior_2_pass for c in cell_results)
+			gate_3 = all(c.prior_3_pass for c in cell_results)
+
+			total_ceiling_hit = sum(count(s -> s == :ceiling_hit, c.rep_beta_status)
+									for c in cell_results)
+
+			println("=" ^ 70)
+			println("Gates (replicate contract, Moreno K=$K):")
+			println("  Prior 1 (rate + replicate structure):       $(gate_1 ? "PASS" : "FAIL")")
+			println("  Prior 2 (chi-squared GoF on empirical q):   $(gate_2 ? "PASS" : "FAIL")")
+			println("  Prior 3 (ei_conditional + empirical match): $(gate_3 ? "PASS" : "FAIL")")
+			println("  Informational: ceiling_hit count:            $total_ceiling_hit / $(3 * R) reps")
+			println("=" ^ 70)
+
+			all_pass = gate_1 && gate_2 && gate_3
+
+			println()
+			println("  Test 31 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+
+		return all_pass
+	end
+	test_replicate_calibration_moreno()
+
+#	Test 32: Scotland K=4 replicate-generation contract calibration
+	function test_replicate_calibration_scotland_k4()
+		"""
+		Args: none
+		Returns:
+			Bool: true if test passes
+		Notes:
+			Replicate-generation contract calibration on Scotland (undirected,
+			N=108) at K=4. Phase-2-RG analog of Test 20.
+
+			Three cells at K=4, rho ∈ {0, +0.5, -0.5}, rate=0.10. R=20,
+			B=5. With N_add ≈ 11 and B=5, n = 55 samples per rep across
+			K=4 bins gives per-bin expected counts of ~14 at uniform q —
+			comfortably above the chi-squared rule-of-thumb threshold of 5.
+
+			Wall-clock estimate: 1-2 minutes at R=20, B=5.
+		"""
+		println("─" ^ 70)
+		println("Test 32: Replicate-generation contract calibration on Scotland (K=4)")
+		println("─" ^ 70)
+
+		#	Load Scotland from Disk
+			graphml_path = "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data/GraphML_Test_Networks/scotland_interlock_unweighted.graphml"
+			net = Network_Credible_Intervals.load_graphml(graphml_path)
+			println("  Loaded: scotland")
+			println("  N = $(nrow(net.nodes)), E = $(nrow(net.edges))")
+			println("  Directed: $(net.metadata.directed), Weighted: $(net.metadata.weighted)")
+			println()
+
+		#	Run Three Replicate-Contract Cells at K=4
+			K = 4
+			J = 3
+			R = 20
+			B = 5
+			cells = [
+				(0.0,  0.10),
+				(0.5,  0.10),
+				(-0.5, 0.10),
+			]
+
+			cell_results = NamedTuple[]
+			for (rho_input, rate_input) in cells
+				print("  Running cell (rho=$rho_input, rate=$rate_input)... ")
+				flush(stdout)
+				cell = _replicate_contract_cell(net, rho_input, rate_input;
+												  R = R, B = B, K = K, J = J)
+				push!(cell_results, cell)
+				println("done.")
+			end
+
+			println()
+			println("=" ^ 70)
+			println("REPLICATE-GENERATION CONTRACT RESULTS (Scotland, K=$K, B=$B)")
+			println("=" ^ 70)
+			for cell in cell_results
+				_print_contract_cell(cell)
+			end
+
+		#	Gates
+			gate_1 = all(c.prior_1_pass for c in cell_results)
+			gate_2 = all(c.prior_2_pass for c in cell_results)
+			gate_3 = all(c.prior_3_pass for c in cell_results)
+
+			total_ceiling_hit = sum(count(s -> s == :ceiling_hit, c.rep_beta_status)
+									for c in cell_results)
+
+			println("=" ^ 70)
+			println("Gates (replicate contract, Scotland K=$K):")
+			println("  Prior 1 (rate + replicate structure):       $(gate_1 ? "PASS" : "FAIL")")
+			println("  Prior 2 (chi-squared GoF on empirical q):   $(gate_2 ? "PASS" : "FAIL")")
+			println("  Prior 3 (ei_conditional + empirical match): $(gate_3 ? "PASS" : "FAIL")")
+			println("  Informational: ceiling_hit count:            $total_ceiling_hit / $(3 * R) reps")
+			println("=" ^ 70)
+
+			all_pass = gate_1 && gate_2 && gate_3
+
+			println()
+			println("  Test 32 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+
+		return all_pass
+	end
+	test_replicate_calibration_scotland_k4()
+
+#	Test 33: Scotland K=10 replicate-generation contract calibration
+	function test_replicate_calibration_scotland_k10()
+		"""
+		Args: none
+		Returns:
+			Bool: true if test passes
+		Notes:
+			Same Scotland network as Test 32 at higher bin count K=10.
+			Phase-2-RG analog of Test 20b. Exercises the K-dependent
+			feasibility ceiling: with K=10 and rate=0.10 on N=108, some
+			cells may hit ceiling_hit at Phase 1, which then propagates
+			to Phase 2 setup as a (smaller) realized rho target.
+
+			B is increased from 5 to 20 for this test specifically. With
+			K=10 and N_add ≈ 11, the default B=5 gives n = 55 samples
+			spread across 10 bins (~5.5 per bin at uniform q) — right at
+			the chi-squared rule-of-thumb threshold of 5, and for the
+			skewed-q cells some bins would fall below it. Bumping to
+			B=20 gives n ≈ 220, per-bin expected count ≈ 22 at uniform q,
+			well into the chi-squared asymptotic regime. Wall-clock cost
+			of the increase is modest because Scotland is small.
+
+			Wall-clock estimate: 3-5 minutes at R=20, B=20.
+		"""
+		println("─" ^ 70)
+		println("Test 33: Replicate-generation contract calibration on Scotland (K=10)")
+		println("─" ^ 70)
+
+		#	Load Scotland from Disk
+			graphml_path = "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data/GraphML_Test_Networks/scotland_interlock_unweighted.graphml"
+			net = Network_Credible_Intervals.load_graphml(graphml_path)
+			println("  Loaded: scotland")
+			println("  N = $(nrow(net.nodes)), E = $(nrow(net.edges))")
+			println("  Directed: $(net.metadata.directed), Weighted: $(net.metadata.weighted)")
+			println()
+
+		#	Run Three Replicate-Contract Cells at K=10 with Boosted B
+			K = 10
+			J = 3
+			R = 20
+			B = 20  # boosted from default 5 because K=10 spreads samples thin
+			cells = [
+				(0.0,  0.10),
+				(0.5,  0.10),
+				(-0.5, 0.10),
+			]
+
+			cell_results = NamedTuple[]
+			for (rho_input, rate_input) in cells
+				print("  Running cell (rho=$rho_input, rate=$rate_input)... ")
+				flush(stdout)
+				cell = _replicate_contract_cell(net, rho_input, rate_input;
+												  R = R, B = B, K = K, J = J)
+				push!(cell_results, cell)
+				println("done.")
+			end
+
+			println()
+			println("=" ^ 70)
+			println("REPLICATE-GENERATION CONTRACT RESULTS (Scotland, K=$K, B=$B)")
+			println("=" ^ 70)
+			for cell in cell_results
+				_print_contract_cell(cell)
+			end
+
+		#	Gates
+			gate_1 = all(c.prior_1_pass for c in cell_results)
+			gate_2 = all(c.prior_2_pass for c in cell_results)
+			gate_3 = all(c.prior_3_pass for c in cell_results)
+
+			total_ceiling_hit = sum(count(s -> s == :ceiling_hit, c.rep_beta_status)
+									for c in cell_results)
+
+			println("=" ^ 70)
+			println("Gates (replicate contract, Scotland K=$K):")
+			println("  Prior 1 (rate + replicate structure):       $(gate_1 ? "PASS" : "FAIL")")
+			println("  Prior 2 (chi-squared GoF on empirical q):   $(gate_2 ? "PASS" : "FAIL")")
+			println("  Prior 3 (ei_conditional + empirical match): $(gate_3 ? "PASS" : "FAIL")")
+			println("  Informational: ceiling_hit count:            $total_ceiling_hit / $(3 * R) reps")
+			println("=" ^ 70)
+
+			all_pass = gate_1 && gate_2 && gate_3
+
+			println()
+			println("  Test 33 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+
+		return all_pass
+	end
+	test_replicate_calibration_scotland_k10()
+
+#	Test 34: Marvel replicate-generation contract calibration (stress test)
+	function test_replicate_calibration_marvel()
+		"""
+		Args: none
+		Returns:
+			Bool: true if test passes
+		Notes:
+			Replicate-generation contract calibration on Marvel (undirected,
+			N=6,486). Phase-2-RG analog of Test 21.
+
+			With N_add ≈ 648 per setup × B=5 = 3,240 added-bin samples per
+			rep, the chi-squared GoF on empirical q has near-exact
+			calibration: per-bin expected counts (~324 at uniform q with
+			K=10) are vastly above the rule-of-thumb threshold of 5. Same
+			for Prior 3's per-row checks. Stress comes from wall clock,
+			not from sample size.
+
+			Expected behavior:
+			- Prior 1: PASS (arithmetic + structural).
+			- Prior 2: PASS (chi-squared GoF with abundant samples).
+			- Prior 3: PASS.
+			- Informational: some ceiling_hit on negative-rho cell expected;
+			  Marvel has asymmetric feasibility ceilings ~+0.41 / ~-0.03
+			  at rate=0.10, K=10.
+
+			Wall-clock estimate: ~40 minutes at R=20, B=5. The added
+			generate_replicate cost on top of Test 21's ~30-minute Phase 1
+			+ CHAMP + Setup pipeline is ~10 minutes total across three
+			cells.
+		"""
+		println("─" ^ 70)
+		println("Test 34: Replicate-gen. contract calibration on Marvel (STRESS TEST)")
+		println("─" ^ 70)
+		println("  WARNING: This test runs Phase 1 + CHAMP + Setup + 5 replicates")
+		println("           per Phase-1 seed, 20 seeds per cell, 3 cells.")
+		println("  Estimated wall clock: ~40 minutes at R=20, B=5")
+		println()
+
+		#	Load Marvel from Disk
+			graphml_path = "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data/GraphML_Test_Networks/marvel_universe_unweighted.graphml"
+			net = Network_Credible_Intervals.load_graphml(graphml_path)
+			println("  Loaded: marvel")
+			println("  N = $(nrow(net.nodes)), E = $(nrow(net.edges))")
+			println("  Directed: $(net.metadata.directed), Weighted: $(net.metadata.weighted)")
+			println()
+
+		#	Run Three Replicate-Contract Cells at K=10 (design default)
+			K = 10
+			J = 3
+			R = 20
+			B = 5
+			cells = [
+				(0.0,  0.10),
+				(0.5,  0.10),
+				(-0.5, 0.10),
+			]
+
+			cell_results = NamedTuple[]
+			for (rho_input, rate_input) in cells
+				print("  Running cell (rho=$rho_input, rate=$rate_input)... ")
+				flush(stdout)
+				cell = _replicate_contract_cell(net, rho_input, rate_input;
+												  R = R, B = B, K = K, J = J)
+				push!(cell_results, cell)
+				println("done.")
+			end
+
+			println()
+			println("=" ^ 70)
+			println("REPLICATE-GENERATION CONTRACT RESULTS (Marvel, K=$K, B=$B)")
+			println("=" ^ 70)
+			for cell in cell_results
+				_print_contract_cell(cell)
+			end
+
+		#	Gates
+			gate_1 = all(c.prior_1_pass for c in cell_results)
+			gate_2 = all(c.prior_2_pass for c in cell_results)
+			gate_3 = all(c.prior_3_pass for c in cell_results)
+
+			total_ceiling_hit = sum(count(s -> s == :ceiling_hit, c.rep_beta_status)
+									for c in cell_results)
+
+			println("=" ^ 70)
+			println("Gates (replicate contract, Marvel K=$K):")
+			println("  Prior 1 (rate + replicate structure):       $(gate_1 ? "PASS" : "FAIL")")
+			println("  Prior 2 (chi-squared GoF on empirical q):   $(gate_2 ? "PASS" : "FAIL")")
+			println("  Prior 3 (ei_conditional + empirical match): $(gate_3 ? "PASS" : "FAIL")")
+			println("  Informational: ceiling_hit count:            $total_ceiling_hit / $(3 * R) reps")
+			println("=" ^ 70)
+
+			all_pass = gate_1 && gate_2 && gate_3
+
+			println()
+			println("  Test 34 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+			println()
+
+		return all_pass
+	end
+	test_replicate_calibration_marvel()  

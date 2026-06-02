@@ -126,45 +126,74 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		return (edges = edges, nodes = nodes, metadata = metadata)
 	end
 
-#	Draw n_reps replicates for one (network, rho, rate) cell; return per-rep records
+#	Draw n_reps replicates for one (network, pi_node, pi_edge, rho) cell; return per-rep records
 	function _draw_replicates(net::NamedTuple;
+								target_pi_node::Real,
 								target_rho::Real,
-								target_rate::Real,
+								target_pi_edge::Real = 0.0,
 								n_reps::Int,
-								master_seed::Integer = 1)
+								master_seed::Integer = 1,
+								weighted::Bool = get(net.metadata, :weighted, false),
+								true_community::Union{Nothing,AbstractVector{<:Integer}} = nothing)
 		"""
 		Args:
 			net::NamedTuple: (edges, nodes, metadata) in corpus format
-			target_rho::Real: nominal rho for this cell
-			target_rate::Real: nominal rate for this cell
+			target_pi_node::Real: nominal missing-node fraction for this cell
+			target_rho::Real: nominal Kendall tau-b for this cell
+			target_pi_edge::Real: nominal weight-degradation budget (default 0.0;
+				forced to 0 internally on unweighted input by the mask)
 			n_reps::Int: number of replicates to draw
 			master_seed::Integer: seeds the per-replicate seed derivation
+			weighted::Bool: whether the edge-degradation stage runs; defaults to
+				the network's :weighted metadata (false for the constructed
+				star/ring fixtures, which omit that field)
+			true_community::Union{Nothing,AbstractVector{<:Integer}}: optional
+				ground-truth community labels. When supplied, the mask's prior-3
+				survivor-profile check is active; when nothing (the default), the
+				mask falls back to a single community and prior 3 is skipped —
+				which ISOLATES the basic sampling tests (priors 1 and 2) from
+				prior-3 behavior.
 		Returns:
 			Vector{NamedTuple}: each element is the record returned by
 				generate_missingness_mask for that replicate.
 		Notes:
-			Centrality is computed once and cached across the n_reps calls,
-			mirroring the build_degeneration_corpus orchestrator. Per-
-			replicate seeds are derived via hash((target_rho, target_rate,
-			rep_idx, master_seed)) so identical inputs reproduce identical
-			records (the determinism contract).
+			Per-network artifacts (centrality, binarized adjacency, and the
+			weighted adjacency when weighted) are computed once and cached across
+			the n_reps calls, mirroring the build_degeneration_corpus orchestrator.
+			Per-replicate seeds are derived via hash((target_rho, target_pi_node,
+			target_pi_edge, rep, master_seed)) so identical inputs reproduce
+			identical records (the determinism contract).
+
+			This is the unified-pipeline harness: it drives the two-dial mask
+			(pi_node + pi_edge under one rho). It does NOT pass a mechanism — full
+			removal vs nomination is composed per node inside the mask.
 		"""
-		#	Cache centrality once
+		directed = net.metadata.directed
+
+		#	Cache per-network artifacts once
 			centrality = Network_Credible_Intervals.network_degeneracy._centrality_for_sampler(
-				net.edges; nodes = net.nodes, directed = net.metadata.directed)
+				net.edges; nodes = net.nodes, directed = directed)
+			adj_binary = _graph_to_sparse_matrix(net.edges; nodes = net.nodes, weighted = false)[1]
+			adj_weighted = weighted ?
+				_graph_to_sparse_matrix(net.edges; nodes = net.nodes, weighted = true)[1] : nothing
 
 		#	Draw replicates
 			records = Vector{NamedTuple}(undef, n_reps)
 			for rep in 1:n_reps
-				rep_seed = Int(hash((target_rho, target_rate, rep, master_seed)) % UInt32)
+				rep_seed = Int(hash((target_rho, target_pi_node, target_pi_edge, rep, master_seed)) % UInt32)
 				records[rep] = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
 					net.edges;
-					nodes       = net.nodes,
-					directed    = net.metadata.directed,
-					target_rate = target_rate,
-					target_rho  = target_rho,
-					seed        = rep_seed,
-					centrality  = centrality)
+					nodes          = net.nodes,
+					directed       = directed,
+					weighted       = weighted,
+					target_pi_node = target_pi_node,
+					target_pi_edge = target_pi_edge,
+					target_rho     = target_rho,
+					seed           = rep_seed,
+					centrality     = centrality,
+					true_community = true_community,
+					adj_binary     = adj_binary,
+					adj_weighted   = adj_weighted)
 			end
 		return records
 	end
@@ -241,209 +270,192 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 #		- The driver runs sub-tests in order, prints a one-line status per
 #		  test, and returns the conjunction Bool.
 
-#	Test Bisection Convergence
-	function test_bisection_convergence_scotland(networks::Dict;
-                                              n_reps::Int = 100,
-                                              target_rho::Real = 0.10,
-                                              target_rate::Real = 0.10,
-                                              tol_mean_rho::Real = 0.03)
+#	Test Rho Convergence: analytic field + rejection gate reaches target rho
+	function test_rho_convergence_scotland(networks::Dict;
+											n_reps::Int = 100,
+											target_pi_node::Real = 0.10,
+											target_rho::Real = 0.10,
+											tol_mean_rho::Real = 0.03,
+											min_converged_frac::Real = 0.80)
 		"""
 		Args:
 			networks::Dict: corpus dict; must contain "scotland_interlock_unweighted"
 			n_reps::Int: number of replicates (default 100)
-			target_rho::Real: target Kendall tau-b (default 0.10 — interior
-				to the rate-bounded ceiling at rate=0.10)
-			target_rate::Real: target rate (default 0.10)
+			target_pi_node::Real: target missing-node fraction (default 0.10)
+			target_rho::Real: target Kendall tau-b (default 0.10 — interior to the
+				rate-bounded ceiling 2p(1-p)=0.18 at pi_node=0.10, so the gate can
+				accept)
 			tol_mean_rho::Real: tolerance on |mean(realized_rho) - target_rho|
-				across n_reps replicates (default 0.03)
+				across the CONVERGED replicates (default 0.03)
+			min_converged_frac::Real: minimum fraction of replicates that must
+				reach gate_status == :converged (default 0.80)
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies that the bisection actually solves cor_kendall(is_dropped, c) =
-			target_rho in expectation across replicates. Single-replicate
-			realized_rho is noisy; the assertion is on the mean across
-			n_reps draws.
+			Replaces the old bisection-convergence test. There is no bisection in
+			the unified pipeline: the rho-tilt is solved analytically by
+			_solve_propensity_field, the missing set is drawn from that field by
+			_topup_missing_nodes, and the three-prior end gate accepts a draw only
+			when |realized_rho - target_rho| <= rho_tol (the mask's default
+			rho_tol = 0.02), retrying up to max_retries on a miss.
 
-			RATE-BOUNDED CEILING. Under Kendall tau-b, the realized
-			correlation between a binary indicator (is_dropped) and a
-			continuous variable (centrality) is structurally bounded by
-			|tau| <= 2*p*(1-p) where p is the missingness rate. At
-			rate=0.10, the ceiling is ~0.18. The default target_rho of
-			0.10 is comfortably inside this ceiling, leaving room for
-			the bisection to converge without saturating.
+			Two consequences reshape what this test asserts:
 
-			This is the Kendall-era replacement for the previous Pearson
-			default of target_rho=0.25, which under Kendall would
-			structurally exceed the rate-bounded ceiling and produce
-			:ceiling_hit rather than :converged. The test now exercises
-			the bisection's normal convergence path; the explicit
-			rate-bounded ceiling check lives in
-			test_rate_bounded_ceiling_scotland (Test 1b).
+			(1) For any record with gate_status == :converged, realized_rho is
+			    within the gate's rho_tol of target BY CONSTRUCTION — the gate
+			    enforced it. So "mean realized_rho ≈ target" is a sanity check on
+			    gate semantics, not the core assertion; it cannot fail unless the
+			    gate is mislabeling status.
 
-			Scotland (undirected, N=108, degree Gini ~0.48) is the
-			natural fixture: moderate skew, large enough that 100
-			replicates give a tight estimate of mean realized tau, small
-			enough that the whole test runs in seconds.
+			(2) The core assertion is the CONVERGENCE RATE. The gate does rejection
+			    sampling against a single-draw Kendall tau-b whose sampling SD at
+			    pi_node=0.10, N=108 is roughly 0.065. With rho_tol = 0.02 the
+			    per-attempt acceptance probability is well below 1, so a fraction of
+			    cells exhaust max_retries and return :failed_other. We require
+			    >= min_converged_frac converged rather than all-converged.
 
-			The bisection status must be :converged for every replicate.
+			CALIBRATION CAVEAT: min_converged_frac = 0.80 is an estimate pending the
+			first real run. The analytic field's expected realized rho is only
+			approximate for degradation (the solve assumes uniform retained; carving
+			out the missing set violates that), so the draw cloud may be biased off
+			target, lowering acceptance. If the observed converged fraction is far
+			below 0.80, that is NOT a signal to loosen this test — it is the signal
+			that the gate's fixed rho_tol is too tight relative to the single-draw
+			noise floor, i.e. the module-side fix is to make rho_tol rate/N-aware.
+			The details string reports the converged fraction so a low rate is
+			diagnostic rather than a bare FAIL.
+
+			Prior 3 is intentionally OFF here (no true_community passed), isolating
+			the test to priors 1 (proportion) and 2 (correlation). Scotland
+			(undirected, N=108, moderate degree skew) runs in seconds.
 		"""
 		println("─" ^ 70)
-		println("Test 1: Bisection convergence on Scotland (rho=$target_rho, rate=$target_rate)")
+		println("Test 1: Rho convergence on Scotland (rho=$target_rho, pi_node=$target_pi_node)")
 		println("─" ^ 70)
 
 		haskey(networks, "scotland_interlock_unweighted") ||
 			return (passed = false, details = "Scotland missing from corpus")
 
 		net     = networks["scotland_interlock_unweighted"]
-		records = _draw_replicates(net; target_rho = target_rho,
-									  target_rate = target_rate,
-									  n_reps      = n_reps)
+		records = _draw_replicates(net; target_pi_node = target_pi_node,
+									  target_rho = target_rho,
+									  n_reps     = n_reps)
 
-		#	Check 1a: every replicate converged
-			all_converged = all(r.bisection_status == :converged for r in records)
+		#	Check 1a: convergence rate at/above the floor
+			n_converged    = count(r -> r.gate_status == :converged, records)
+			converged_frac = n_converged / n_reps
+			rate_ok        = converged_frac >= min_converged_frac
 
-		#	Check 1b: mean realized rho is close to target
-			realized_rhos = [r.realized_rho for r in records]
-			mean_rho      = mean(realized_rhos)
-			rho_delta     = abs(mean_rho - target_rho)
-			rho_in_tol    = rho_delta < tol_mean_rho
+		#	Check 1b: among converged replicates, mean realized rho ≈ target
+		#	(gate-guaranteed within rho_tol; this is a semantics sanity check)
+			conv_rhos = [r.realized_rho for r in records if r.gate_status == :converged]
+			mean_rho  = isempty(conv_rhos) ? NaN : mean(conv_rhos)
+			rho_delta = isempty(conv_rhos) ? Inf : abs(mean_rho - target_rho)
+			rho_in_tol = rho_delta < tol_mean_rho
 
 		#	Report
-			println("  Replicates:         $n_reps")
-			println("  All converged:      $(all_converged ? "YES" : "NO")")
-			println("  Mean realized rho:  $(round(mean_rho, digits=4))")
-			println("  Target rho:         $target_rho")
-			println("  |Δ|:                $(round(rho_delta, digits=4))  (tol $tol_mean_rho)")
-			println("  Rho in tolerance:   $(rho_in_tol ? "YES" : "NO")")
+			println("  Replicates:           $n_reps")
+			println("  Converged:            $n_converged / $n_reps  (frac $(round(converged_frac, digits=3)), floor $min_converged_frac)")
+			println("  Convergence rate OK:  $(rate_ok ? "YES" : "NO")")
+			println("  Mean realized rho:    $(round(mean_rho, digits=4))  (converged subset)")
+			println("  Target rho:           $target_rho")
+			println("  |Δ|:                  $(round(rho_delta, digits=4))  (tol $tol_mean_rho)")
+			println("  Rho in tolerance:     $(rho_in_tol ? "YES" : "NO")")
 
-			passed = all_converged && rho_in_tol
-			println("  Result:             $(passed ? "PASS ✓" : "FAIL ✗")")
+			passed = rate_ok && rho_in_tol
+			println("  Result:               $(passed ? "PASS ✓" : "FAIL ✗")")
 
 		return (passed  = passed,
-				details = "mean_rho=$(round(mean_rho, digits=4)) Δ=$(round(rho_delta, digits=4))")
+				details = "converged=$(round(converged_frac, digits=3)) mean_rho=$(round(mean_rho, digits=4)) Δ=$(round(rho_delta, digits=4))")
 	end
 
-#	Test Rate-Bounded Ceiling: Kendall tau-b structural ceiling under rate
+#	Test Rate-Bounded Ceiling: unreachable rho is rejected, realized respects sqrt(2p(1-p))
 	function test_rate_bounded_ceiling_scotland(networks::Dict;
-                                                n_reps::Int = 20,
-                                                target_rho::Real = 0.25,
-                                                target_rate::Real = 0.10)
+												n_reps::Int = 20,
+												target_pi_node::Real = 0.10,
+												target_rho::Real = 0.50)
 		"""
 		Args:
 			networks::Dict: corpus dict; must contain "scotland_interlock_unweighted"
-			n_reps::Int: number of replicates (default 20)
-			target_rho::Real: target tau (default 0.25 — above Scotland's
-				practical ceiling at rate=0.10, though well below the
-				theoretical absolute ceiling of ~0.42)
-			target_rate::Real: target rate (default 0.10)
+			n_reps::Int: replicates (default 20)
+			target_pi_node::Real: missing-node fraction (default 0.10)
+			target_rho::Real: target tau (default 0.50 — ABOVE the theoretical
+				absolute ceiling sqrt(2*0.1*0.9) = 0.424, so unreachable on any
+				network at this rate)
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies the Kendall tau-b rate-bounded ceiling property.
-			Under Kendall, the realized correlation between a binary
-			indicator (proportion p) and a continuous variable is
-			structurally bounded by
+			The unified pipeline has no bisection probe; an unreachable rho is
+			rejected by the end gate (it never reports :converged) and, when the
+			propensity-field solve self-detects infeasibility, surfaced as
+			:ceiling_hit (accept-and-flag, no retry). Because whether the
+			reconstruction-side solve flags :ceiling_hit vs. silently best-efforts
+			is its own concern, this test asserts the robust contract: NO replicate
+			is :converged, and realized_rho never exceeds the theoretical absolute
+			ceiling sqrt(2p(1-p)). It reports the :ceiling_hit / :failed_other split
+			for diagnosis. The designed up-front clamp is tested at the orchestrator
+			level (rho_was_substituted), not here.
 
-			    |tau|_max = sqrt(2 * k * (n-k) / (n * (n-1)))
-			              ≈ sqrt(2 * p * (1 - p))
-
-			where p = k/n is the missingness rate. At p = 0.10 the
-			theoretical absolute ceiling is sqrt(0.18) ≈ 0.42.
-
-			The TIES-BOUNDED CEILING. On unweighted networks the
-			centrality vector contains many ties (multiple nodes at
-			the same degree). Ties on the continuous variable reduce
-			the achievable tau-b below the theoretical absolute ceiling
-			(the +Ty term in tau-b's denominator). The practical
-			ceiling on a given network is therefore below sqrt(2*p*(1-p))
-			and depends on the network's centrality tie structure.
-			Scotland (N=108, many ties at low degree) has a practical
-			ceiling around 0.20-0.25 at rate=0.10 — well below the
-			theoretical absolute of 0.42.
-
-			Test design: request target_rho = 0.25 at rate = 0.10.
-			Scotland's practical ceiling is at or below this, so the
-			bisection should return :ceiling_hit consistently. Expected
-			behavior:
-			(a) Every replicate returns bisection_status = :ceiling_hit.
-			(b) Max realized rho across replicates does not exceed the
-			    theoretical absolute ceiling sqrt(2*p*(1-p)) (with
-			    small tolerance for floating-point and single-replicate
-			    saturation noise).
-
-			This is a NEW test introduced with the Pearson-to-Kendall
-			refactor. The rate-bounded ceiling is a structural property
-			of Kendall tau-b on binary indicators that didn't exist
-			under Pearson. Combined with the practical tie-bounded
-			ceiling, this gives the framework two distinct "you can't
-			reach this target" constraints to surface to users.
+			target_rho = 0.50 is chosen above the 0.424 theoretical max so the
+			target is unreachable regardless of the field's practical ceiling.
 		"""
 		println("─" ^ 70)
-		println("Test 1b: Rate-bounded ceiling on Scotland (rho=$target_rho at rate=$target_rate)")
+		println("Test 1b: Rate-bounded ceiling on Scotland (rho=$target_rho at pi_node=$target_pi_node)")
 		println("─" ^ 70)
 
 		haskey(networks, "scotland_interlock_unweighted") ||
 			return (passed = false, details = "Scotland missing from corpus")
 
 		net     = networks["scotland_interlock_unweighted"]
-		records = _draw_replicates(net; target_rho = target_rho,
-									  target_rate = target_rate,
-									  n_reps      = n_reps)
+		records = _draw_replicates(net; target_pi_node = target_pi_node,
+									  target_rho = target_rho,
+									  n_reps     = n_reps)
 
-		#	Compute theoretical absolute ceiling for diagnostic
-			theoretical_ceiling = sqrt(2.0 * target_rate * (1.0 - target_rate))
+		theoretical_ceiling = sqrt(2.0 * target_pi_node * (1.0 - target_pi_node))
 
-		#	Check 1: every replicate ceiling-hit
-			ceiling_hit_count = count(r -> r.bisection_status == :ceiling_hit, records)
-			all_ceiling_hit   = ceiling_hit_count == n_reps
+		n_converged   = count(r -> r.gate_status == :converged,   records)
+		n_ceiling     = count(r -> r.gate_status == :ceiling_hit,  records)
+		n_failed      = count(r -> r.gate_status == :failed_other, records)
+		none_converged = n_converged == 0
 
-		#	Check 2: realized rhos do not exceed the theoretical absolute ceiling
-		#	Allow modest tolerance for single-replicate saturation noise.
-			realized_rhos = [r.realized_rho for r in records]
-			max_realized  = maximum(realized_rhos)
-			mean_realized = mean(realized_rhos)
-			tolerance     = 0.05
-			respects_ceiling = max_realized <= theoretical_ceiling + tolerance
+		realized_rhos = [r.realized_rho for r in records]
+		max_realized  = maximum(abs.(realized_rhos))
+		tolerance     = 0.05
+		respects_ceiling = max_realized <= theoretical_ceiling + tolerance
 
-		#	Report
-			println("  Replicates:                $n_reps")
-			println("  Target rho:                $target_rho")
-			println("  Theoretical abs ceiling:   $(round(theoretical_ceiling, digits=4))  (sqrt(2*p*(1-p)))")
-			println("  :ceiling_hit count:        $ceiling_hit_count / $n_reps")
-			println("  All ceiling_hit:           $(all_ceiling_hit ? "YES" : "NO")")
-			println("  Mean realized rho:         $(round(mean_realized, digits=4))  (practical ceiling on Scotland)")
-			println("  Max realized rho:          $(round(max_realized, digits=4))")
-			println("  Respects abs ceiling:      $(respects_ceiling ? "YES" : "NO")  (max ≤ $(round(theoretical_ceiling + tolerance, digits=4)))")
+		println("  Replicates:                $n_reps")
+		println("  Target rho:                $target_rho")
+		println("  Theoretical abs ceiling:   $(round(theoretical_ceiling, digits=4))  (sqrt(2p(1-p)))")
+		println("  :converged / :ceiling / :failed:  $n_converged / $n_ceiling / $n_failed")
+		println("  None converged:            $(none_converged ? "YES" : "NO")")
+		println("  Max |realized rho|:        $(round(max_realized, digits=4))")
+		println("  Respects abs ceiling:      $(respects_ceiling ? "YES" : "NO")")
 
-			passed = all_ceiling_hit && respects_ceiling
-			println("  Result:                    $(passed ? "PASS ✓" : "FAIL ✗")")
+		passed = none_converged && respects_ceiling
+		println("  Result:                    $(passed ? "PASS ✓" : "FAIL ✗")")
 
 		return (passed  = passed,
-				details = "ceiling_hits=$ceiling_hit_count/$n_reps max_realized=$(round(max_realized, digits=4)) abs_ceiling=$(round(theoretical_ceiling, digits=4))")
+				details = "conv=$n_converged ceil=$n_ceiling fail=$n_failed max=$(round(max_realized, digits=4))")
 	end
 
-#   Extraction Rate Validation
-	function test_exact_rate_scotland_moreno(networks::Dict;
-												n_reps::Int = 10)
+#	Test Exact Proportion: every replicate yields exactly round(pi_node*N) missing nodes
+	function test_exact_proportion_scotland_moreno(networks::Dict;
+													n_reps::Int = 10)
 		"""
 		Args:
 			networks::Dict: corpus dict; needs Scotland and Moreno
-			n_reps::Int: replicates per (network, rho, rate) cell (default 10)
+			n_reps::Int: replicates per cell (default 10)
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies the exact-rate contract: every replicate drops exactly
-			round(target_rate * N) nodes. Asserts per-replicate (not on the
-			mean) because a bug where rho-targeting accidentally affected
-			rate would be subtle in mean terms.
-
-			Sweeps a small (rho, rate) sub-grid on both Scotland (undirected)
-			and Moreno (directed) so the test exercises both code paths.
-			Only 10 replicates per cell — the check is deterministic per
-			replicate, so 10 is enough to catch a systematic bug.
+			Prior-1 contract: with pi_edge = 0 the node-accounting stage fills the
+			missing set to exactly k = round(pi_node*N) regardless of gate status
+			(topup is pre-gate). Asserts |missing_nodes| == k per replicate across a
+			small (rho, pi_node) sub-grid on both Scotland (undirected) and Moreno
+			(directed). Independent of gate_status by design.
 		"""
 		println("─" ^ 70)
-		println("Test 2: Exact rate per replicate (Scotland + Moreno)")
+		println("Test 2: Exact proportion per replicate (Scotland + Moreno)")
 		println("─" ^ 70)
 
 		test_grid = [
@@ -455,17 +467,17 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		mismatches = 0
 		total      = 0
 
-		for (name, n_nodes, rhos, rates) in test_grid
+		for (name, n_nodes, rhos, pis) in test_grid
 			haskey(networks, name) || (all_passed = false; continue)
 			net = networks[name]
-			for rho in rhos, rate in rates
-				expected_k = Int(round(rate * n_nodes))
+			for rho in rhos, pin in pis
+				expected_k = Int(round(pin * n_nodes))
 				records    = _draw_replicates(net; target_rho = rho,
-													target_rate = rate,
+													target_pi_node = pin,
 													n_reps = n_reps)
 				for r in records
 					total += 1
-					if length(r.dropped_nodes) != expected_k
+					if length(r.missing_nodes) != expected_k
 						mismatches += 1
 						all_passed = false
 					end
@@ -474,118 +486,81 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		end
 
 		println("  Replicates checked:   $total")
-		println("  Rate mismatches:      $mismatches")
+		println("  Proportion mismatches:$mismatches")
 		println("  Result:               $(all_passed ? "PASS ✓" : "FAIL ✗")")
 
 		return (passed  = all_passed,
 				details = "$mismatches/$total mismatches")
 	end
 
-#   Test 3: Achievable-rho Ceiling
+#	Test Achievable-rho Ceiling on a star: extreme target rejected on extreme centrality
 	function test_achievable_rho_ceiling_star(; n_reps::Int = 20,
 												target_rho::Real = 0.95,
-												target_rate::Real = 0.10,
+												target_pi_node::Real = 0.10,
 												n_star::Int = 50)
 		"""
 		Args:
-			n_reps::Int: number of replicates to confirm ceiling status
-				(default 20; ceiling detection is near-deterministic in the
-				bisection, so few replicates suffice)
-			target_rho::Real: extreme positive target that should be
-				unreachable on a star fixture (default 0.95)
-			target_rate::Real: target rate (default 0.10)
-			n_star::Int: number of nodes in the constructed star fixture
-				(default 50)
+			n_reps::Int: replicates (default 20)
+			target_rho::Real: extreme positive target (default 0.95, unreachable)
+			target_pi_node::Real: missing-node fraction (default 0.10)
+			n_star::Int: star node count (default 50)
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies that the bisection correctly detects when target_rho
-			is beyond what the centrality distribution can produce. The
-			star fixture is the natural extreme case: one hub with in-degree
-			(n-1), all leaves with in-degree 0. The centrality vector is
-			(n-1, 0, 0, ..., 0) — maximally concentrated.
-
-			At b=1 the probability vector becomes c_normalized = (1, 0, ..., 0),
-			and the realized correlation with the indicator vector is bounded
-			by the structure: even when the hub is always dropped, the
-			remaining k-1 dropped nodes are chosen from zero-weighted leaves
-			via the uniform (1-b)*u term, which contributes nothing
-			deterministic. The achievable realized correlation on the star
-			at rate 0.10 is roughly 0.3-0.5, well below 0.95.
-
-			The bisection should return status = :ceiling_hit with b = 1
-			and realized_rho_pos at the achievable ceiling. All replicates
-			should converge on the same ceiling status because the bisection
-			is deterministic in (centrality, target_rho, target_rate) modulo
-			the MC noise in inner samples.
+			Same rejection contract as Test 1b on the extreme star fixture (one
+			hub, n-1 leaves). 0.95 exceeds both the theoretical sqrt(2p(1-p)) max
+			and any practical field ceiling. Asserts NO replicate :converged and
+			realized_rho respects the theoretical ceiling; reports the status split.
 		"""
 		println("─" ^ 70)
-		println("Test 3: Achievable-rho ceiling on star fixture (rho=$target_rho, n=$n_star)")
+		println("Test 3: Achievable-rho ceiling on star (rho=$target_rho, n=$n_star)")
 		println("─" ^ 70)
 
-		net = _build_star_fixture(n = n_star, directed = true)
-
+		net     = _build_star_fixture(n = n_star, directed = true)
 		records = _draw_replicates(net; target_rho = target_rho,
-									  target_rate = target_rate,
+									  target_pi_node = target_pi_node,
 									  n_reps = n_reps)
 
-		#	Check 3a: all replicates report :ceiling_hit
-			ceiling_count = count(r -> r.bisection_status == :ceiling_hit, records)
-			all_ceiling   = ceiling_count == n_reps
+		theoretical_ceiling = sqrt(2.0 * target_pi_node * (1.0 - target_pi_node))
+		n_converged = count(r -> r.gate_status == :converged,   records)
+		n_ceiling   = count(r -> r.gate_status == :ceiling_hit,  records)
+		n_failed    = count(r -> r.gate_status == :failed_other, records)
+		none_converged = n_converged == 0
+		max_realized   = maximum(abs.(r.realized_rho for r in records))
+		respects_ceiling = max_realized <= theoretical_ceiling + 0.05
 
-		#	Check 3b: the recorded ceiling value is meaningfully below target
-			#	If the achievable ceiling is actually >= target_rho - tol, the
-			#	bisection should have converged rather than hit the ceiling.
-			#	The very fact that it returned :ceiling_hit implies the gap
-			#	is non-trivial; we just verify the realized values are sane.
-				ceiling_rhos = [abs(r.realized_rho) for r in records]
-				mean_ceiling = isempty(ceiling_rhos) ? NaN : mean(ceiling_rhos)
-				ceiling_below_target = mean_ceiling < target_rho
+		println("  Replicates:             $n_reps")
+		println("  :converged / :ceiling / :failed:  $n_converged / $n_ceiling / $n_failed")
+		println("  None converged:         $(none_converged ? "YES" : "NO")")
+		println("  Max |realized rho|:     $(round(max_realized, digits=4))  (ceiling $(round(theoretical_ceiling, digits=4)))")
 
-		#	Report
-			println("  Replicates:             $n_reps")
-			println("  :ceiling_hit count:     $ceiling_count / $n_reps")
-			println("  Mean realized |rho|:    $(round(mean_ceiling, digits=4))")
-			println("  Target rho:             $target_rho")
-			println("  Ceiling below target:   $(ceiling_below_target ? "YES" : "NO")")
-
-			passed = all_ceiling && ceiling_below_target
-			println("  Result:                 $(passed ? "PASS ✓" : "FAIL ✗")")
+		passed = none_converged && respects_ceiling
+		println("  Result:                 $(passed ? "PASS ✓" : "FAIL ✗")")
 
 		return (passed  = passed,
-				details = "$ceiling_count/$n_reps ceiling_hit, mean=$(round(mean_ceiling, digits=4))")
+				details = "conv=$n_converged ceil=$n_ceiling fail=$n_failed max=$(round(max_realized, digits=4))")
 	end
 
-#   Test 4: Seed Reproducibility
+#	Test Seed Reproducibility: identical inputs produce identical records
 	function test_seed_reproducibility(networks::Dict;
 										n_reps::Int = 10,
 										target_rho::Real = 0.25,
-										target_rate::Real = 0.10)
+										target_pi_node::Real = 0.10)
 		"""
 		Args:
-			networks::Dict: corpus dict; uses Moreno (directed) for the check
-			n_reps::Int: number of independent (seed, replicate) pairs to
-				verify (default 10)
-			target_rho::Real: target rho for the test (default 0.25)
-			target_rate::Real: target rate (default 0.10)
+			networks::Dict: corpus dict; uses Moreno (directed)
+			n_reps::Int: replicate pairs to verify (default 10)
+			target_rho::Real: target rho (default 0.25)
+			target_pi_node::Real: missing-node fraction (default 0.10)
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies the determinism contract: identical inputs (edges,
-			nodes, directed, target_rate, target_rho, seed) produce
-			identical records bit-for-bit. This includes the dropped_nodes
-			vector, realized_rate, realized_rho, bisection_status, and all
-			degeneracy fields.
-
-			The test runs each of n_reps replicates twice in succession
-			with the same seed and asserts equality. Failure here means the
-			seed-splitting, hash-derived inner seeds, or MC bisection
-			scheme has a non-determinism somewhere — most likely a missing
-			seed parameter or an RNG state leak across calls.
-
-			Runs on Moreno (directed) so the centrality driver exercises
-			the in-degree path; the property should hold identically on
-			any network.
+			Determinism contract: identical (edges, nodes, directed, weighted,
+			target_pi_node, target_pi_edge, target_rho, seed) reproduce identical
+			records, including the retry loop's deterministic sub-seed sequence.
+			Compares missing_nodes, realized_rho, gate_status, and retry_count.
+			realized_rho is never NaN in the record (the gate coerces NaN to 0.0),
+			so direct equality is safe.
 		"""
 		println("─" ^ 70)
 		println("Test 4: Seed reproducibility on Moreno")
@@ -595,27 +570,27 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 			return (passed = false, details = "Moreno missing from corpus")
 
 		net = networks["moreno_highschool_unweighted"]
-		c   = Network_Credible_Intervals.network_degeneracy._centrality_for_sampler(
-				net.edges; nodes = net.nodes, directed = net.metadata.directed)
+		ndg = Network_Credible_Intervals.network_degeneracy
+		c   = ndg._centrality_for_sampler(net.edges; nodes = net.nodes,
+											directed = net.metadata.directed)
+		adjb = _graph_to_sparse_matrix(net.edges; nodes = net.nodes, weighted = false)[1]
 
 		mismatches = 0
 		for rep in 1:n_reps
-			rep_seed = Int(hash((target_rho, target_rate, rep, 1)) % UInt32)
-			rec_a = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
-					  net.edges; nodes = net.nodes, directed = net.metadata.directed,
-					  target_rate = target_rate, target_rho = target_rho,
-					  seed = rep_seed, centrality = c)
-			rec_b = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
-					  net.edges; nodes = net.nodes, directed = net.metadata.directed,
-					  target_rate = target_rate, target_rho = target_rho,
-					  seed = rep_seed, centrality = c)
-			#	Compare structural fields
-				if rec_a.dropped_nodes  != rec_b.dropped_nodes  ||
-				   rec_a.realized_rate  != rec_b.realized_rate  ||
-				   rec_a.realized_rho   != rec_b.realized_rho   ||
-				   rec_a.bisection_status != rec_b.bisection_status
-					mismatches += 1
-				end
+			rep_seed = Int(hash((target_rho, target_pi_node, 0.0, rep, 1)) % UInt32)
+			args = (net.edges,)
+			kw = (nodes = net.nodes, directed = net.metadata.directed, weighted = false,
+				  target_pi_node = target_pi_node, target_pi_edge = 0.0,
+				  target_rho = target_rho, seed = rep_seed,
+				  centrality = c, adj_binary = adjb)
+			rec_a = ndg.generate_missingness_mask(args...; kw...)
+			rec_b = ndg.generate_missingness_mask(args...; kw...)
+			if rec_a.missing_nodes != rec_b.missing_nodes ||
+			   rec_a.realized_rho  != rec_b.realized_rho  ||
+			   rec_a.gate_status   != rec_b.gate_status   ||
+			   rec_a.retry_count   != rec_b.retry_count
+				mismatches += 1
+			end
 		end
 
 		passed = mismatches == 0
@@ -623,42 +598,38 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		println("  Reproducibility mismatches: $mismatches")
 		println("  Result:                     $(passed ? "PASS ✓" : "FAIL ✗")")
 
-		return (passed  = passed,
-				details = "$mismatches/$n_reps non-reproducible")
+		return (passed = passed, details = "$mismatches/$n_reps non-reproducible")
 	end
 
-#   Test 5: MCAR Baseline (rho = 0)
+#	Test MCAR Baseline: rho=0 yields a flat field (beta≈0) and unbiased realized rho
 	function test_mcar_baseline(networks::Dict;
 									n_reps::Int = 100,
-									target_rate::Real = 0.10,
-									tol_mean_rho::Real = 0.04)
+									target_pi_node::Real = 0.10,
+									tol_mean_rho::Real = 0.04,
+									tol_beta::Real = 1e-6)
 		"""
 		Args:
 			networks::Dict: corpus dict; uses Scotland
-			n_reps::Int: number of replicates (default 100)
-			target_rate::Real: target rate (default 0.10)
-			tol_mean_rho::Real: tolerance on |mean(realized_rho)|;
-				default 0.04
+			n_reps::Int: replicates (default 100)
+			target_pi_node::Real: missing-node fraction (default 0.10)
+			tol_mean_rho::Real: tolerance on |mean(realized_rho)| over ALL records
+			tol_beta::Real: tolerance on |beta| (default 1e-6)
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies that the MCAR fast-path produces an unbiased sampler
-			whose realized indicator correlations average to zero across
-			replicates. At target_rho = 0 the bisection short-circuits to
-			b = 0 (pure uniform sampling); the realized correlation per
-			replicate is sampling noise centered on zero.
-
-			Tolerance 0.04 matches Test 1's: with 100 reps and per-replicate
-			SE around 0.10 on Scotland, the mean's SE is roughly 0.01. The
-			0.04 tolerance is four SE — passes essentially always under the
-			null, catches a sign-flip or wrong fast-path with high power.
-
-			Additionally checks that the bisection_status is :converged for
-			all replicates (the MCAR fast-path is supposed to return
-			:converged immediately without entering the bisection loop).
+			The Bellutta MCAR corner. At target_rho = 0 the propensity-field solve
+			returns beta = 0 (flat field, uniform selection). This test asserts the
+			MCAR property DIRECTLY and independently of the gate:
+			  (a) beta ≈ 0 for every replicate (the field is flat), and
+			  (b) mean realized_rho over ALL records ≈ 0 (unbiased selection).
+			Mean is taken over all records, not just converged ones: under the
+			strict gate many individual rho=0 draws miss the 0.02 band and end
+			:failed_other, but their realized_rho is symmetric about 0, so the
+			grand mean is the right unbiasedness statistic and does not depend on
+			gate acceptance. Convergence rate is reported for diagnosis only.
 		"""
 		println("─" ^ 70)
-		println("Test 5: MCAR baseline on Scotland (rho=0, rate=$target_rate)")
+		println("Test 5: MCAR baseline on Scotland (rho=0, pi_node=$target_pi_node)")
 		println("─" ^ 70)
 
 		haskey(networks, "scotland_interlock_unweighted") ||
@@ -666,151 +637,118 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 
 		net     = networks["scotland_interlock_unweighted"]
 		records = _draw_replicates(net; target_rho = 0.0,
-									  target_rate = target_rate,
+									  target_pi_node = target_pi_node,
 									  n_reps      = n_reps)
 
-		#	Check 5a: all replicates converged via the fast-path
-			all_converged = all(r.bisection_status == :converged for r in records)
+		max_abs_beta = maximum(abs(r.beta) for r in records)
+		beta_flat    = max_abs_beta <= tol_beta
 
-		#	Check 5b: mean realized rho is near zero
-			realized_rhos = [r.realized_rho for r in records]
-			mean_rho      = mean(realized_rhos)
-			mean_in_tol   = abs(mean_rho) < tol_mean_rho
+		realized_rhos = [r.realized_rho for r in records]
+		mean_rho      = mean(realized_rhos)
+		mean_in_tol   = abs(mean_rho) < tol_mean_rho
 
-		#	Report
-			println("  Replicates:           $n_reps")
-			println("  All converged:        $(all_converged ? "YES" : "NO")")
-			println("  Mean realized rho:    $(round(mean_rho, digits=4))")
-			println("  |Mean| < tol:         $(mean_in_tol ? "YES" : "NO") (tol $tol_mean_rho)")
+		n_converged = count(r -> r.gate_status == :converged, records)
 
-			passed = all_converged && mean_in_tol
-			println("  Result:               $(passed ? "PASS ✓" : "FAIL ✗")")
+		println("  Replicates:           $n_reps")
+		println("  Max |beta|:           $(max_abs_beta)  (flat if ≤ $tol_beta)")
+		println("  Field flat (beta≈0):  $(beta_flat ? "YES" : "NO")")
+		println("  Mean realized rho:    $(round(mean_rho, digits=4))  (all records)")
+		println("  |Mean| < tol:         $(mean_in_tol ? "YES" : "NO") (tol $tol_mean_rho)")
+		println("  (diagnostic) converged: $n_converged / $n_reps")
 
-		return (passed  = passed,
-				details = "mean_rho=$(round(mean_rho, digits=4))")
+		passed = beta_flat && mean_in_tol
+		println("  Result:               $(passed ? "PASS ✓" : "FAIL ✗")")
+
+		return (passed = passed,
+				details = "beta_max=$(round(max_abs_beta, digits=8)) mean_rho=$(round(mean_rho, digits=4))")
 	end
 
-#   Test 6: Constant Centrality (Ties)             
+#	Test Constant Centrality: non-zero rho unreachable; uniform draw, rho coerced to 0
 	function test_ties_handled_regular_ring(; n_reps::Int = 10,
 												target_rho::Real = 0.25,
-												target_rate::Real = 0.10,
+												target_pi_node::Real = 0.10,
 												n_ring::Int = 50,
 												k_ring::Int = 4)
 		"""
 		Args:
-			n_reps::Int: number of replicates to verify (default 10;
-				property is deterministic-per-seed, few replicates suffice)
-			target_rho::Real: non-zero target rho (default 0.25); the test
-				checks that non-zero targets fail on constant centrality
-			target_rate::Real: target rate (default 0.10)
-			n_ring::Int: ring node count (default 50)
-			k_ring::Int: ring regularity (default 4 — every node degree 4)
+			n_reps::Int: replicates (default 10)
+			target_rho::Real: non-zero target (default 0.25)
+			target_pi_node::Real: missing-node fraction (default 0.10)
+			n_ring, k_ring::Int: regular-ring parameters (default 50, 4)
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies the ties contract: on a network where every node has
-			identical centrality, no value of b can produce a non-zero
-			target rho (because the prob vector contains no signal that
-			correlates with the constant centrality). The bisection should
-			detect this via NaN from _centrality_correlation_for_b and
-			return :failed_other.
+			On a k-regular ring every node has identical centrality, so no field can
+			create a non-zero rho correlation. Behavior under the unified pipeline
+			(NOT the old NaN short-circuit): the field solve still returns a beta
+			(field_status :converged), the node-accounting stage still fills the
+			missing set, but corkendall(indicator, constant) is undefined and the
+			gate coerces realized_rho to 0.0; prior 2 then fails for any non-zero
+			target, retries exhaust, and gate_status is :failed_other.
 
-			The 4-regular ring fixture has every node at degree exactly k,
-			so centrality is constant. The MCAR fast-path at target_rho = 0
-			would still succeed on this fixture (it doesn't need centrality
-			variance), but any non-zero target should fail.
-
-			The test asserts:
-			- bisection_status == :failed_other for all replicates
-			- realized_rho is NaN for all replicates
-			- dropped_nodes is empty (the sampler is bypassed on failure)
+			Asserts the new signature of this case:
+			  - gate_status == :failed_other for all replicates
+			  - realized_rho == 0.0 for all (NaN-coerced, the constant-centrality tell)
+			  - missing_nodes NON-empty, size == round(pi_node*N) (selection still ran)
+			This inverts the old test's "empty dropped set / NaN rho" expectations.
 		"""
 		println("─" ^ 70)
-		println("Test 6: Constant centrality on $(n_ring)x$(k_ring) regular ring (rho=$target_rho)")
+		println("Test 6: Constant centrality on $(n_ring)x$(k_ring) ring (rho=$target_rho)")
 		println("─" ^ 70)
 
-		net = _build_regular_ring_fixture(n = n_ring, k = k_ring)
-
+		net     = _build_regular_ring_fixture(n = n_ring, k = k_ring)
 		records = _draw_replicates(net; target_rho = target_rho,
-									  target_rate = target_rate,
+									  target_pi_node = target_pi_node,
 									  n_reps = n_reps)
 
-		#	Check 6a: all replicates :failed_other
-			all_failed = all(r.bisection_status == :failed_other for r in records)
+		expected_k = Int(round(target_pi_node * n_ring))
+		all_failed   = all(r.gate_status == :failed_other for r in records)
+		all_rho_zero = all(r.realized_rho == 0.0 for r in records)
+		all_filled   = all(length(r.missing_nodes) == expected_k for r in records)
 
-		#	Check 6b: all realized_rho are NaN
-			all_nan = all(isnan(r.realized_rho) for r in records)
+		println("  Replicates:                $n_reps")
+		println("  All :failed_other:         $(all_failed ? "YES" : "NO")")
+		println("  All realized_rho == 0:     $(all_rho_zero ? "YES" : "NO")")
+		println("  All missing filled to k:   $(all_filled ? "YES ($expected_k)" : "NO")")
 
-		#	Check 6c: all dropped_nodes are empty
-			all_empty = all(isempty(r.dropped_nodes) for r in records)
+		passed = all_failed && all_rho_zero && all_filled
+		println("  Result:                    $(passed ? "PASS ✓" : "FAIL ✗")")
 
-		#	Report
-			println("  Replicates:                $n_reps")
-			println("  All :failed_other:         $(all_failed ? "YES" : "NO")")
-			println("  All realized_rho NaN:      $(all_nan ? "YES" : "NO")")
-			println("  All dropped_nodes empty:   $(all_empty ? "YES" : "NO")")
-
-			passed = all_failed && all_nan && all_empty
-			println("  Result:                    $(passed ? "PASS ✓" : "FAIL ✗")")
-
-		return (passed  = passed,
-				details = "$(all_failed && all_nan && all_empty ? "fully handled" : "partial detection")")
+		return (passed = passed,
+				details = "failed=$all_failed rho0=$all_rho_zero filled=$all_filled")
 	end
 
-#   Test 7: Degeneracy Flagging Fires
+#	Test Degeneracy Flagging: adversarial pi_node/rho fire the topological flags
 	function test_degeneracy_flagging_fires(networks::Dict;
-                                            n_reps::Int = 100,
-                                            target_rho::Real = 0.75,
-                                            target_rate::Real = 0.65,
-                                            fire_rate_threshold::Real = 0.50,
-                                            fixture_name::String = "moreno_highschool_unweighted")
+											n_reps::Int = 100,
+											target_rho::Real = 0.75,
+											target_pi_node::Real = 0.65,
+											fire_rate_threshold::Real = 0.50,
+											fixture_name::String = "moreno_highschool_unweighted")
 		"""
 		Args:
 			networks::Dict: corpus dict; uses Moreno by default
-				(toledo is preferable if available — small network, easier
-				to degrade adversarially)
-			n_reps::Int: number of replicates (default 100)
-			target_rho::Real: target rho (default 0.75 — adversarial,
-				preferentially drops central nodes)
-			target_rate::Real: target rate (default 0.50 — adversarial,
-				drops half the nodes)
-			fire_rate_threshold::Real: minimum fraction of replicates that
-				must show any_topo_degenerate = true; default 0.50
-			fixture_name::String: which network to use; default Moreno
+			n_reps::Int: replicates (default 100)
+			target_rho::Real: adversarial rho (default 0.75)
+			target_pi_node::Real: adversarial missing fraction (default 0.65)
+			fire_rate_threshold::Real: min fraction with any_topo_degenerate (0.50)
+			fixture_name::String: network key
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies the degeneracy-detection contract: at sufficiently
-			adversarial (rho, rate) settings, the topological degeneracy
-			flags should fire on a meaningful fraction of replicates.
-			This is the opposite of Test 5 — instead of confirming the
-			sampler runs cleanly, we confirm that the sampler reports
-			degeneracy when degeneracy is present.
-
-			The threshold of 0.50 (over half of replicates flag) is
-			loose-but-meaningful: stochastic variation in dropped-set
-			composition means some replicates might land in non-degenerate
-			configurations even at adversarial settings. Asserting a hard
-			count of 100/100 would be over-strict. Asserting > 50% gives
-			the test the right shape: 'this regime should usually be
-			flagged as degenerate.'
-
-			At Moreno N=70 and rate=0.50, k=35 nodes are dropped, leaving
-			35. The min_n threshold of 25 is satisfied, so the too_small
-			flag should NOT fire. The gc_threshold of 0.30 of remaining
-			should fire frequently — dropping the most central 35 nodes
-			from a high-school friendship network will fragment the
-			remaining 35 substantially.
-
-			A failure here means either: (a) the degeneracy detector is
-			too lenient (gc_threshold too low for the actual fragmentation,
-			or no_edges/too_small not firing when they should), or
-			(b) the (rho, rate) setting isn't actually adversarial enough
-			on this network. The details string includes which flags fired
-			and at what frequency for diagnosis.
+			At adversarial settings the topological flags should fire on a
+			meaningful fraction of replicates. Degeneracy is assessed on EVERY
+			record, NOT a gate-filtered subset: even :failed_other records carry a
+			full-size missing set (topup fills to round(pi_node*N)) and a computed
+			sampler_degeneracy, and the collapse contract depends only on the
+			missing set's effect on connectivity, not on whether the rho gate
+			passed. (rho=0.75 is unreachable at pi_node=0.65, so most/all records
+			are :failed_other — filtering them out is what made an earlier version
+			report "cannot assess.") At Moreno N=70, pi_node=0.65 leaves ~24 nodes,
+			below min_n=25, so too_small fires on essentially every record.
 		"""
 		println("─" ^ 70)
-		println("Test 7: Degeneracy flagging on $fixture_name (rho=$target_rho, rate=$target_rate)")
+		println("Test 7: Degeneracy flagging on $fixture_name (rho=$target_rho, pi_node=$target_pi_node)")
 		println("─" ^ 70)
 
 		haskey(networks, fixture_name) ||
@@ -818,218 +756,291 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 
 		net     = networks[fixture_name]
 		records = _draw_replicates(net; target_rho = target_rho,
-									  target_rate = target_rate,
+									  target_pi_node = target_pi_node,
 									  n_reps      = n_reps)
 
-		#	Filter to records where bisection succeeded (we want to assess
-		#	degeneracy detection, not bisection failures)
-			ok_records = filter(r -> r.bisection_status != :failed_other, records)
-			n_ok = length(ok_records)
-			if n_ok == 0
-				println("  All replicates failed bisection; cannot assess degeneracy")
-				return (passed = false, details = "no successful bisections")
-			end
+		#	Assess degeneracy on EVERY record (see Notes): missing set and
+		#	sampler_degeneracy exist regardless of gate_status.
+			n_tot = length(records)
+			n_any = count(r -> r.sampler_degeneracy.any_topo_degenerate, records)
+			n_gc  = count(r -> r.sampler_degeneracy.gc_collapse,          records)
+			n_tsm = count(r -> r.sampler_degeneracy.too_small,            records)
+			n_ned = count(r -> r.sampler_degeneracy.no_edges,             records)
+			any_rate = n_any / n_tot
+			passed   = any_rate >= fire_rate_threshold
 
-		#	Count flag firing rates among successful bisections
-			n_any_topo  = count(r -> r.sampler_degeneracy.any_topo_degenerate, ok_records)
-			n_gc        = count(r -> r.sampler_degeneracy.gc_collapse,          ok_records)
-			n_too_small = count(r -> r.sampler_degeneracy.too_small,            ok_records)
-			n_no_edges  = count(r -> r.sampler_degeneracy.no_edges,             ok_records)
+		println("  Records:                    $n_tot / $n_reps")
+		println("  any_topo_degenerate rate:   $(round(any_rate, digits=3))  (threshold $fire_rate_threshold)")
+		println("  gc_collapse rate:           $(round(n_gc  / n_tot, digits=3))")
+		println("  too_small rate:             $(round(n_tsm / n_tot, digits=3))")
+		println("  no_edges rate:              $(round(n_ned / n_tot, digits=3))")
+		println("  Result:                     $(passed ? "PASS ✓" : "FAIL ✗")")
 
-			any_topo_rate = n_any_topo / n_ok
-			passed = any_topo_rate >= fire_rate_threshold
-
-		#	Report
-			println("  Replicates (bisection ok):  $n_ok / $n_reps")
-			println("  any_topo_degenerate rate:   $(round(any_topo_rate, digits=3))  (threshold $fire_rate_threshold)")
-			println("  gc_collapse rate:           $(round(n_gc        / n_ok, digits=3))")
-			println("  too_small rate:             $(round(n_too_small / n_ok, digits=3))")
-			println("  no_edges rate:              $(round(n_no_edges  / n_ok, digits=3))")
-			println("  Result:                     $(passed ? "PASS ✓" : "FAIL ✗")")
-
-		return (passed  = passed,
-				details = "any_topo=$(round(any_topo_rate, digits=3))")
+		return (passed = passed, details = "any_topo=$(round(any_rate, digits=3))")
 	end
 
-#   Test 8: apply_missingness_outgoing_only Contract 
-	function test_outgoing_only_materializer(networks::Dict;
-												target_rho::Real = 0.25,
-												target_rate::Real = 0.10,
-												seed::Integer = 1,
-												fixture_directed::String = "moreno_highschool_unweighted",
-												fixture_undirected::String = "scotland_interlock_unweighted")
+#	Test Materialize Composition: per-node nomination vs full-removal, auto-decided
+	function test_materialize_composition(; )
 		"""
-		Args:
-			networks::Dict: corpus dict; needs both Moreno (directed) and
-				Scotland (undirected) to exercise the directed path and
-				the undirected guard
-			target_rho::Real: target rho for the sampler call (default 0.25)
-			target_rate::Real: target rate (default 0.10)
-			seed::Integer: master seed (default 1)
-			fixture_directed::String: directed network for the four
-				assertions on the materializer
-			fixture_undirected::String: undirected network for the guard test
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Verifies four properties of apply_missingness_outgoing_only:
-
-			(a) Selection invariance: given the same dropped-node set,
-				the dropped-identifier set agrees between
-				apply_missingness and apply_missingness_outgoing_only.
-				Both functions consume the same sampler output; only
-				their materializations differ.
-
-			(b) Roster preservation: the returned nodes table has the
-				same row count as the input. Non-respondents remain in
-				the roster as zero-out-degree actors.
-
-			(c) Src-only edge filtering: no edge with src equal to a
-				dropped identifier survives; all original edges (u -> v)
-				where v is dropped and u is NOT dropped survive.
-
-			(d) Undirected guard: calling the function with directed=false
-				on an undirected network throws ArgumentError.
-
-			The test draws ONE sampler call per check rather than averaging
-			across replicates — these are deterministic properties of the
-			materializer for any given dropped set, not statistical
-			properties needing many draws.
+			Tests the unified materializer's per-node composition on a tiny
+			hand-checkable directed fixture A->B, B->C, A->C, C->D (nodes A,B,C,D in
+			canonical order 1..4). Three cases:
+			  (1) directed, missing {C}: C has surviving incoming (A->C, B->C) =>
+			      NOMINATION. n_nominations=1, n_full_removal=0, C kept in roster,
+			      C->D gone, A->C and B->C retained.
+			  (2) directed, missing {A}: A is a pure source (no incoming) =>
+			      FULL REMOVAL. n_full_removal=1, n_nominations=0, A dropped, no
+			      edge with A survives.
+			  (3) undirected, missing {C}: no in/out asymmetry => FULL REMOVAL.
+			      n_full_removal=1, n_nominations=0, C dropped, no edge touching C.
+			The two standalone materializers (apply_missingness,
+			apply_missingness_outgoing_only) moved to network_reconstruction; their
+			contracts are tested there, not here.
 		"""
 		println("─" ^ 70)
-		println("Test 8: apply_missingness_outgoing_only materializer contract")
+		println("Test 8: _materialize_missing_nodes composition (nomination vs full removal)")
 		println("─" ^ 70)
 
-		#	Setup: verify fixtures present
-			haskey(networks, fixture_directed) ||
-				return (passed = false, details = "$fixture_directed missing from corpus")
-			haskey(networks, fixture_undirected) ||
-				return (passed = false, details = "$fixture_undirected missing from corpus")
+		ndg   = Network_Credible_Intervals.network_degeneracy
+		nodes = DataFrame(id = ["A", "B", "C", "D"])
+		edges = DataFrame(src = ["A", "B", "A", "C"],
+						  dst = ["B", "C", "C", "D"],
+						  weight = ones(Int, 4))
 
-			net_dir = networks[fixture_directed]
-			net_und = networks[fixture_undirected]
+		#	Case 1: directed, missing {C} (index 3) -> nomination
+			m1 = ndg._materialize_missing_nodes(edges, [3]; nodes = nodes, directed = true)
+			c1_counts = m1.n_nominations == 1 && m1.n_full_removal == 0
+			c1_roster = "C" in string.(m1.nodes[!, 1])
+			e1 = Set((string(m1.edges.src[r]), string(m1.edges.dst[r])) for r in 1:nrow(m1.edges))
+			c1_edges = !(("C", "D") in e1) && (("A", "C") in e1) && (("B", "C") in e1)
+			check_1 = c1_counts && c1_roster && c1_edges
 
-		#	Draw one replicate to get a dropped-node set
-			rec = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
-					net_dir.edges; nodes = net_dir.nodes, directed = true,
-					target_rate = target_rate, target_rho = target_rho,
-					seed = seed)
-			dropped = rec.dropped_nodes
+		#	Case 2: directed, missing {A} (index 1) -> full removal
+			m2 = ndg._materialize_missing_nodes(edges, [1]; nodes = nodes, directed = true)
+			c2_counts = m2.n_full_removal == 1 && m2.n_nominations == 0
+			c2_roster = !("A" in string.(m2.nodes[!, 1]))
+			c2_edges  = !any(string(m2.edges.src[r]) == "A" || string(m2.edges.dst[r]) == "A"
+							 for r in 1:nrow(m2.edges))
+			check_2 = c2_counts && c2_roster && c2_edges
 
-			if isempty(dropped)
-				println("  Sampler returned empty dropped set; cannot test")
-				return (passed = false, details = "sampler returned empty dropped set")
-			end
+		#	Case 3: undirected, missing {C} -> full removal
+			m3 = ndg._materialize_missing_nodes(edges, [3]; nodes = nodes, directed = false)
+			c3_counts = m3.n_full_removal == 1 && m3.n_nominations == 0
+			c3_roster = !("C" in string.(m3.nodes[!, 1]))
+			c3_edges  = !any(string(m3.edges.src[r]) == "C" || string(m3.edges.dst[r]) == "C"
+							 for r in 1:nrow(m3.edges))
+			check_3 = c3_counts && c3_roster && c3_edges
 
-		#	Materialize via both functions
-			full_removal = Network_Credible_Intervals.network_degeneracy.apply_missingness(
-								net_dir.edges, dropped; nodes = net_dir.nodes)
-			outgoing_only = Network_Credible_Intervals.network_degeneracy.apply_missingness_outgoing_only(
-								net_dir.edges, dropped; nodes = net_dir.nodes, directed = true)
+		println("  (1) directed nomination:   $(check_1 ? "YES" : "NO")")
+		println("  (2) directed full removal: $(check_2 ? "YES" : "NO")")
+		println("  (3) undirected full removal:$(check_3 ? "YES" : "NO")")
 
-		#	Resolve identifiers for the dropped set
-			#	apply_missingness's canonical ordering uses the :id column when
-			#	a DataFrame is supplied; match that here.
-				dropped_ids = Set{String}(string.(net_dir.nodes[!, 1][dropped]))
+		passed = check_1 && check_2 && check_3
+		println("  Result:                    $(passed ? "PASS ✓" : "FAIL ✗")")
 
-		#	Check 8a: selection invariance
-			#	apply_missingness removed the dropped identifiers from its nodes table
-				full_removal_ids = Set{String}(string.(full_removal.nodes[!, 1]))
-				full_removal_dropped = setdiff(Set{String}(string.(net_dir.nodes[!, 1])),
-												  full_removal_ids)
-			#	apply_missingness_outgoing_only keeps the roster; dropped IDs
-			#	must still be present
-				outgoing_only_ids = Set{String}(string.(outgoing_only.nodes[!, 1]))
-
-				check_8a = (full_removal_dropped == dropped_ids) &&
-							issubset(dropped_ids, outgoing_only_ids)
-
-		#	Check 8b: roster preservation
-			n_input_nodes = nrow(net_dir.nodes)
-			n_out_nodes   = nrow(outgoing_only.nodes)
-			check_8b      = n_out_nodes == n_input_nodes
-
-		#	Check 8c: src-only edge filtering
-			#	No edge in outgoing-only has src in dropped_ids
-				edges_with_dropped_src = count(r -> string(outgoing_only.edges.src[r]) in dropped_ids,
-												  1:nrow(outgoing_only.edges))
-				check_8c_no_outgoing = edges_with_dropped_src == 0
-
-			#	All original edges (u, v) with u NOT dropped and v IN dropped
-			#	must be present in outgoing-only edges
-				orig_inbound_edges = Set{Tuple{String,String}}()
-				for r in 1:nrow(net_dir.edges)
-					s = string(net_dir.edges.src[r])
-					d = string(net_dir.edges.dst[r])
-					if !(s in dropped_ids) && (d in dropped_ids)
-						push!(orig_inbound_edges, (s, d))
-					end
-				end
-				out_edge_set = Set{Tuple{String,String}}()
-				for r in 1:nrow(outgoing_only.edges)
-					push!(out_edge_set,
-						  (string(outgoing_only.edges.src[r]),
-						   string(outgoing_only.edges.dst[r])))
-				end
-				missing_inbound = setdiff(orig_inbound_edges, out_edge_set)
-				check_8c_inbound = isempty(missing_inbound)
-
-			check_8c = check_8c_no_outgoing && check_8c_inbound
-
-		#	Check 8d: undirected guard
-			check_8d = false
-			try
-				Network_Credible_Intervals.network_degeneracy.apply_missingness_outgoing_only(
-					net_und.edges, Int[]; nodes = net_und.nodes, directed = false)
-				check_8d = false  # should have thrown
-			catch err
-				check_8d = err isa ArgumentError
-			end
-
-		#	Report
-			println("  Dropped set size:                $(length(dropped))")
-			println("  (a) Selection invariance:        $(check_8a ? "YES" : "NO")")
-			println("  (b) Roster preservation:         $(check_8b ? "YES ($n_out_nodes/$n_input_nodes)" : "NO ($n_out_nodes/$n_input_nodes)")")
-			println("  (c) No outgoing from dropped:    $(check_8c_no_outgoing ? "YES (0 edges)" : "NO ($edges_with_dropped_src edges)")")
-			println("  (c) Inbound to dropped preserved: $(check_8c_inbound ? "YES" : "NO ($(length(missing_inbound)) missing)")")
-			println("  (d) Undirected guard throws:     $(check_8d ? "YES" : "NO")")
-
-			passed = check_8a && check_8b && check_8c && check_8d
-			println("  Result:                          $(passed ? "PASS ✓" : "FAIL ✗")")
-
-		return (passed  = passed,
-				details = "a=$check_8a b=$check_8b c=$check_8c d=$check_8d")
+		return (passed = passed, details = "c1=$check_1 c2=$check_2 c3=$check_3")
 	end
 
-#   Execute Test 3-7
-	function run_phase1_sampler_tests(networks::Dict;
-										verbose::Bool = true)
+#	Test Weight Stage: budget hit, edges preserved at zero, organic losses peripheral
+	function test_weight_stage_contract(; n_seeds::Int = 40)
 		"""
 		Args:
-			networks::Dict: corpus dict containing at minimum
-				"scotland_interlock_unweighted" and "moreno_highschool_unweighted"
+			n_seeds::Int: seeds for the organic-loss frequency check (default 40)
+		Returns:
+			NamedTuple (passed::Bool, details::String)
+		Notes:
+			Tests _sample_weight_removal + apply_weight_removal directly on a small
+			weighted path A-B-C-D-E with weights 10,10,10,1 (E peripheral, total 31)
+			under a FLAT field (d = ones => Bellutta MCAR corner). Checks:
+			  (a) Budget: W_true == 31, W_removed == round(pi_edge*31) (clamped).
+			  (b) Edge preservation: apply_weight_removal keeps every edge ROW
+			      (row count invariant; depleted edges retained at weight 0).
+			  (c) Weight accounting: sum(orig) - sum(degraded) == W_removed.
+			  (d) Organic-loss periphery: across n_seeds, the low-weight node E is
+			      the most frequent organic loss (tie-first losses concentrate on
+			      the periphery even at rho=0). The frequency threshold is a
+			      first-run-calibrated heuristic; E should dominate clearly.
+		"""
+		println("─" ^ 70)
+		println("Test (weighted): weight-removal stage contract")
+		println("─" ^ 70)
+
+		ndg   = Network_Credible_Intervals.network_degeneracy
+		node_ids = ["A", "B", "C", "D", "E"]
+		nodes = DataFrame(id = node_ids, label = node_ids)
+		edges = DataFrame(src = ["A", "B", "C", "D"],
+						  dst = ["B", "C", "D", "E"],
+						  weight = [10, 10, 10, 1])
+		adj = _graph_to_sparse_matrix(edges; nodes = nodes, weighted = true)[1]
+		n   = size(adj, 1)
+		d_flat = ones(Float64, n)
+
+		#	(a)+(b)+(c) at pi_edge = 0.5
+			pi_edge = 0.5
+			wr = ndg._sample_weight_removal(adj, d_flat, pi_edge, 12345)
+			expected_budget = min(Int(round(pi_edge * 31)), 31)
+			check_budget = wr.W_true == 31 && wr.W_removed == expected_budget
+
+			degraded = ndg.apply_weight_removal(edges, wr.removed; nodes = nodes)
+			check_rows = nrow(degraded) == nrow(edges)
+			check_floor = all(degraded.weight .>= 0)
+			check_acct  = (sum(edges.weight) - sum(degraded.weight)) == wr.W_removed
+			check_b = check_rows && check_floor && check_acct
+
+		#	(d) organic-loss periphery across seeds (E = index 5)
+			freq = zeros(Int, n)
+			for s in 1:n_seeds
+				w = ndg._sample_weight_removal(adj, d_flat, pi_edge, 1000 + s)
+				for v in w.organic_losses
+					freq[v] += 1
+				end
+			end
+			e_idx = findfirst(==("E"), string.(nodes[!, 1]))
+			e_is_top = freq[e_idx] == maximum(freq) && freq[e_idx] > 0
+			check_d = e_is_top
+
+		println("  W_true / W_removed:        $(wr.W_true) / $(wr.W_removed)  (expected budget $expected_budget)")
+		println("  (a) budget hit:            $(check_budget ? "YES" : "NO")")
+		println("  (b) edges preserved:       $(check_b ? "YES" : "NO")  (rows $(nrow(degraded))/$(nrow(edges)))")
+		println("  (d) E most-frequent organic:$(check_d ? "YES" : "NO")  (freq E=$(freq[e_idx]) of $n_seeds)")
+
+		passed = check_budget && check_b && check_d
+		println("  Result:                    $(passed ? "PASS ✓" : "FAIL ✗")")
+
+		return (passed = passed,
+				details = "budget=$check_budget preserve=$check_b periphery=$check_d")
+	end
+
+#	Test Prior 3: survivor E/I-by-rank profile distortion (benign low, broker-stripping high)
+	function test_prior3_survivor_profile(; ei_tvd_tol::Real = 0.25)
+		"""
+		Args:
+			ei_tvd_tol::Real: the gate's prior-3 tolerance (default 0.25)
+		Returns:
+			NamedTuple (passed::Bool, details::String)
+		Notes:
+			Tests the redesigned prior 3 directly via _three_prior_gate on a
+			two-community fixture (two 8-node cliques, comm 1 and comm 2) bridged by
+			two high-degree BROKER nodes whose ties are heavily cross-community.
+			The true profile's high-degree-rank bin is broker-dominated (high
+			external E/I). Two removals at the same proportion:
+			  benign  = a few low-degree within-clique nodes -> survivors' E/I-by-rank
+			            curve ~ true curve -> low distortion -> prior3_ok = true.
+			  malign  = the brokers -> the high-rank bin is now clique-internal
+			            instead of broker-external -> the curve bends -> high
+			            distortion -> prior3_ok = false.
+			Asserts ei_tvd(benign) < ei_tvd(malign), prior3_ok(benign) == true, and
+			prior3_ok(malign) == false. Isolates prior 3 by reading prior3_ok / ei_tvd
+			directly (priors 1 and 2 are not the discriminator here). The tolerance
+			and the fixture's bridging strength may need first-run tuning to make the
+			malign case clearly exceed ei_tvd_tol.
+		"""
+		println("─" ^ 70)
+		println("Test (prior 3): survivor-profile distortion, benign vs broker-stripping")
+		println("─" ^ 70)
+
+		ndg = Network_Credible_Intervals.network_degeneracy
+
+		#	Build two cliques + 2 brokers
+			src = String[]; dst = String[]
+			c1 = ["a$i" for i in 1:8]
+			c2 = ["b$i" for i in 1:8]
+			brokers = ["k1", "k2"]
+			for grp in (c1, c2)            # internal clique edges
+				for i in 1:length(grp), j in (i+1):length(grp)
+					push!(src, grp[i]); push!(dst, grp[j])
+				end
+			end
+			for k in brokers              # brokers bridge both communities
+				for v in vcat(c1, c2)
+					push!(src, k); push!(dst, v)
+				end
+			end
+			node_ids = vcat(c1, c2, brokers)
+			nodes = DataFrame(id = node_ids, label = node_ids)
+			edges = DataFrame(src = src, dst = dst, weight = ones(Int, length(src)))
+
+			adj = _graph_to_sparse_matrix(edges; nodes = nodes, weighted = false)[1]
+			n   = size(adj, 1)
+			#	true community labels: brokers nominally in community 1
+				comm = vcat(fill(1, 8), fill(2, 8), fill(1, 2))
+			centrality = ndg._centrality_for_sampler(edges; nodes = nodes, directed = false)
+
+			n_rank_bins = 4; n_ei_bins = 3; min_count = 2
+			true_profile, true_occ = ndg._ei_rank_profile(adj, comm, trues(n),
+														   n_rank_bins, n_ei_bins)
+
+		#	index helpers
+			idx_of(name) = findfirst(==(name), node_ids)
+			benign_names = ["a1", "a2", "b1", "b2"]              # low-degree clique members
+			malign_names = ["k1", "k2", "a1", "a2"]             # brokers + filler, same count
+			benign = sort([idx_of(x) for x in benign_names])
+			malign = sort([idx_of(x) for x in malign_names])
+			pin = length(benign) / n
+
+		#	Gate each removal; isolate prior 3 by reading prior3_ok / ei_tvd.
+		#	target_rho set to the realized rho of each set so prior 2 is not the
+		#	discriminator (we only inspect prior3_ok / ei_tvd here).
+			gate_b = ndg._three_prior_gate(benign, centrality, comm, adj,
+											true_profile, true_occ, pin, 0.0;
+											ei_tvd_tol = ei_tvd_tol,
+											n_rank_bins = n_rank_bins, n_ei_bins = n_ei_bins,
+											min_count = min_count)
+			gate_m = ndg._three_prior_gate(malign, centrality, comm, adj,
+											true_profile, true_occ, pin, 0.0;
+											ei_tvd_tol = ei_tvd_tol,
+											n_rank_bins = n_rank_bins, n_ei_bins = n_ei_bins,
+											min_count = min_count)
+
+			ord_ok    = !isnan(gate_b.ei_tvd) && !isnan(gate_m.ei_tvd) &&
+						gate_b.ei_tvd < gate_m.ei_tvd
+			benign_ok = gate_b.prior3_ok == true
+			malign_ok = gate_m.prior3_ok == false
+
+		println("  benign ei_tvd:    $(round(gate_b.ei_tvd, digits=4))  prior3_ok=$(gate_b.prior3_ok)")
+		println("  malign ei_tvd:    $(round(gate_m.ei_tvd, digits=4))  prior3_ok=$(gate_m.prior3_ok)")
+		println("  benign < malign:  $(ord_ok ? "YES" : "NO")")
+
+		passed = ord_ok && benign_ok && malign_ok
+		println("  Result:           $(passed ? "PASS ✓" : "FAIL ✗")")
+
+		return (passed = passed,
+				details = "benign=$(round(gate_b.ei_tvd, digits=3)) malign=$(round(gate_m.ei_tvd, digits=3))")
+	end
+
+#	Run the Phase 1 sampler-validation harness
+	function run_phase1_sampler_tests(networks::Dict; verbose::Bool = true)
+		"""
+		Args:
+			networks::Dict: corpus dict with at least Scotland and Moreno
 			verbose::Bool: print per-test status (default true)
 		Returns:
 			NamedTuple (passed::Bool, n_passed::Int, n_total::Int, results::Vector)
 		Notes:
-			Runs all seven sampler-contract tests in order on the small-network
-			fixtures (Scotland + Moreno + constructed star + 4-regular ring).
-			Reports per-test pass/fail and the conjunction across all tests.
+			Runs the unified-pipeline sampler-contract tests on the small-network
+			fixtures plus the constructed star, regular ring, materializer,
+			weighted, and prior-3 fixtures. No mechanism axis; the weighted and
+			prior-3 tests are new with Spec v3.
 		"""
 		verbose && println("\n" * "═" ^ 70)
-		verbose && println("Phase 1 Sampler Validation Harness — small networks")
+		verbose && println("Phase 1 Sampler Validation Harness — unified pipeline")
 		verbose && println("═" ^ 70)
 
 		results = NamedTuple[]
-		push!(results, test_bisection_convergence_scotland(networks))
+		push!(results, test_rho_convergence_scotland(networks))
 		push!(results, test_rate_bounded_ceiling_scotland(networks))
-		push!(results, test_exact_rate_scotland_moreno(networks))
+		push!(results, test_exact_proportion_scotland_moreno(networks))
 		push!(results, test_achievable_rho_ceiling_star())
 		push!(results, test_seed_reproducibility(networks))
 		push!(results, test_mcar_baseline(networks))
 		push!(results, test_ties_handled_regular_ring())
 		push!(results, test_degeneracy_flagging_fires(networks))
-        push!(results, test_outgoing_only_materializer(networks))
+		push!(results, test_materialize_composition())
+		push!(results, test_weight_stage_contract())
+		push!(results, test_prior3_survivor_profile())
 
 		n_passed = count(r -> r.passed, results)
 		n_total  = length(results)
@@ -1042,379 +1053,99 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 
 		return (passed = all_ok, n_passed = n_passed, n_total = n_total, results = results)
 	end
-    run_phase1_sampler_tests(networks)
+	run_phase1_sampler_tests(networks)
 
-#   Marvel Stress Test (Diagnostic)
-	function run_marvel_stress_test(networks::Dict;
-									fixture_name::String = "marvel_universe_unweighted",
-									target_rho::Real = 0.25,
-									target_rate::Real = 0.10,
-									n_reps::Int = 20,
-									rate_sweep::AbstractVector{<:Real} = [0.10, 0.30, 0.50, 0.70])
+#	Smoke Test: orchestrator two-dial grid (no mechanism axis)
+	function smoke_test_orchestrator_two_dial(networks::Dict;
+												fixture_directed::String   = "moreno_highschool_unweighted",
+												fixture_undirected::String = "scotland_interlock_unweighted")
 		"""
 		Args:
-			networks::Dict: corpus dict; expects "marvel_universe_unweighted"
-				or whatever the Marvel key happens to be in the local corpus
-			fixture_name::String: which Marvel key to use; default
-				"marvel_universe_unweighted"
-			target_rho::Real: target rho for the main timing/convergence check
-				(default 0.25)
-			target_rate::Real: target rate for the main timing/convergence check
-				(default 0.10)
-			n_reps::Int: number of replicates for the main check (default 20;
-				smaller than the small-network 100 because each replicate
-				is much slower at Marvel scale)
-			rate_sweep::AbstractVector{<:Real}: rates to sweep for the
-				degeneracy-detector engagement check (default [0.10, 0.30,
-				0.50, 0.70])
-		Returns:
-			NamedTuple: diagnostic record with timing, convergence, realized-rho,
-				saturation, and degeneracy stats. No PASS/FAIL — this is
-				exploratory measurement, not contract verification.
-		Notes:
-			Six diagnostic panels, exercising the parts of the pipeline that
-			small-network tests can't stress:
-
-			Panel 1: Centrality computation timing.
-				One-time cost amortized across all replicates of a network.
-				Should be sub-second at Marvel scale.
-
-			Panel 2: Per-replicate wall-clock cost at (target_rho, target_rate).
-				This is the dominant cost in the production grid. Reports
-				mean and per-replicate range.
-
-			Panel 3: Bisection convergence diagnostics.
-				Distribution of bisection iteration counts; saturation-path
-				engagement rate; failure rate.
-
-			Panel 4: Realized rho statistics on Marvel.
-				Same property Test 1 checks, but on the largest fixture.
-				Mean and SE should be tighter than on Scotland (larger N).
-
-			Panel 5: Rate sweep for degeneracy detector engagement.
-				At each rate in rate_sweep, fire-rate of the degeneracy flags.
-				Marvel is large and well-connected, so we expect the gc_collapse
-				and too_small flags to fire at much higher rates than on Moreno.
-
-			Panel 6: Budget extrapolation.
-				Given the measured per-replicate cost, extrapolates total
-				wall-clock for one full network grid (30 cells x 100 reps)
-				and for the full corpus (16 networks x 30 cells x 100 reps).
-				Doubled-mechanism note: when the orchestrator supports the
-				doubled grid, this number doubles (but only the materializer
-				cost doubles, which is small relative to the sampler).
-		"""
-		println("\n" * "═" ^ 70)
-		println("Marvel Stress Test — diagnostic")
-		println("═" ^ 70)
-
-		haskey(networks, fixture_name) || begin
-			println("ERROR: $fixture_name not found in corpus")
-			return (passed = false, details = "fixture missing")
-		end
-
-		net = networks[fixture_name]
-		println("Fixture:  $fixture_name")
-		println("Nodes:    $(nrow(net.nodes))")
-		println("Edges:    $(nrow(net.edges))")
-		println("Directed: $(net.metadata.directed)")
-		println()
-
-		#	─── Panel 1: Centrality computation ────────────────────────────
-			println("─" ^ 70)
-			println("Panel 1: Centrality computation")
-			println("─" ^ 70)
-			t_centrality = @elapsed begin
-				centrality = Network_Credible_Intervals.network_degeneracy._centrality_for_sampler(
-					net.edges; nodes = net.nodes, directed = net.metadata.directed)
-			end
-			println("  Elapsed:       $(round(t_centrality, digits=3)) sec")
-			println("  Length:        $(length(centrality))")
-			println("  Min / max:     $(minimum(centrality)) / $(maximum(centrality))")
-			println("  Mean:          $(round(mean(centrality), digits=3))")
-			println("  Has isolates:  $(any(==(0.0), centrality))")
-
-		#	─── Panel 2: Per-replicate timing at (target_rho, target_rate) ──
-			println("─" ^ 70)
-			println("Panel 2: Per-replicate timing at rho=$target_rho, rate=$target_rate")
-			println("─" ^ 70)
-			times = Float64[]
-			records = NamedTuple[]
-			for rep in 1:n_reps
-				rep_seed = Int(hash((target_rho, target_rate, rep, 1)) % UInt32)
-				t = @elapsed begin
-					rec = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
-							net.edges; nodes = net.nodes, directed = net.metadata.directed,
-							target_rate = target_rate, target_rho = target_rho,
-							seed = rep_seed, centrality = centrality)
-					push!(records, rec)
-				end
-				push!(times, t)
-			end
-			mean_t = mean(times)
-			println("  Replicates:    $n_reps")
-			println("  Mean elapsed:  $(round(mean_t, digits=3)) sec")
-			println("  Min / max:     $(round(minimum(times), digits=3)) / $(round(maximum(times), digits=3)) sec")
-
-		#	─── Panel 3: Bisection convergence ──────────────────────────────
-			println("─" ^ 70)
-			println("Panel 3: Bisection convergence")
-			println("─" ^ 70)
-			n_converged    = count(r -> r.bisection_status == :converged, records)
-			n_ceiling_hit  = count(r -> r.bisection_status == :ceiling_hit, records)
-			n_failed_other = count(r -> r.bisection_status == :failed_other, records)
-			println("  :converged:      $n_converged / $n_reps")
-			println("  :ceiling_hit:    $n_ceiling_hit / $n_reps")
-			println("  :failed_other:   $n_failed_other / $n_reps")
-
-		#	─── Panel 4: Realized rho statistics ────────────────────────────
-			println("─" ^ 70)
-			println("Panel 4: Realized rho at target rho=$target_rho")
-			println("─" ^ 70)
-			ok_records   = filter(r -> r.bisection_status == :converged, records)
-			realized_rhos = [r.realized_rho for r in ok_records]
-			if isempty(realized_rhos)
-				println("  No converged replicates to analyze")
-			else
-				mean_rho   = mean(realized_rhos)
-				se_rho     = std(realized_rhos) / sqrt(length(realized_rhos))
-				delta      = abs(mean_rho - target_rho)
-				println("  Converged reps:  $(length(realized_rhos))")
-				println("  Mean rho:        $(round(mean_rho, digits=4))")
-				println("  SE of mean:      $(round(se_rho, digits=4))")
-				println("  |Δ vs target|:   $(round(delta, digits=4))")
-				println("  Per-rep SD:      $(round(std(realized_rhos), digits=4))")
-			end
-
-		#	─── Panel 5: Rate sweep for degeneracy detector ────────────────
-			println("─" ^ 70)
-			println("Panel 5: Degeneracy detector engagement across rates")
-			println("─" ^ 70)
-			println("  Rate    n_ok  any_topo  gc_collapse  too_small  no_edges")
-			for sweep_rate in rate_sweep
-				n_any  = 0
-				n_gc   = 0
-				n_tsm  = 0
-				n_ned  = 0
-				n_ok   = 0
-				n_sweep = 10   # small per cell — exploratory sweep
-				for rep in 1:n_sweep
-					rep_seed = Int(hash((target_rho, sweep_rate, rep, 1)) % UInt32)
-					rec = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
-							net.edges; nodes = net.nodes, directed = net.metadata.directed,
-							target_rate = sweep_rate, target_rho = target_rho,
-							seed = rep_seed, centrality = centrality)
-					if rec.bisection_status != :failed_other
-						n_ok += 1
-						rec.sampler_degeneracy.any_topo_degenerate && (n_any += 1)
-						rec.sampler_degeneracy.gc_collapse         && (n_gc  += 1)
-						rec.sampler_degeneracy.too_small           && (n_tsm += 1)
-						rec.sampler_degeneracy.no_edges            && (n_ned += 1)
-					end
-				end
-				println("  $(rpad(string(sweep_rate), 7))$(rpad(string(n_ok),5)) $(rpad(string(n_any),9)) $(rpad(string(n_gc),12)) $(rpad(string(n_tsm),10))$n_ned")
-			end
-
-		#	─── Panel 6: Budget extrapolation ──────────────────────────────
-			println("─" ^ 70)
-			println("Panel 6: Production grid budget extrapolation")
-			println("─" ^ 70)
-			cells_per_network = 5 * 6     # 5 rhos x 6 rates
-			reps_per_cell     = 100
-			networks_in_grid  = 16
-			single_net_secs   = cells_per_network * reps_per_cell * mean_t
-			full_grid_secs    = networks_in_grid * single_net_secs
-			println("  Mean per-replicate time:   $(round(mean_t, digits=3)) sec")
-			println("  Per-network grid time:     $(round(single_net_secs / 60, digits=1)) min  ($(round(single_net_secs, digits=0)) sec)")
-			println("  Full corpus grid time:     $(round(full_grid_secs / 60, digits=1)) min  ($(round(full_grid_secs / 3600, digits=2)) hr)")
-			println("  (Single mechanism; doubled-mechanism corpus is ~2x materializer overhead, which is small.)")
-			println()
-
-		return (passed = true,
-				details = "marvel stress complete: mean_t=$(round(mean_t, digits=3)) sec, mean_rho=$(isempty(realized_rhos) ? NaN : round(mean(realized_rhos), digits=4))")
-	end
-    run_marvel_stress_test(networks)
-
-#   Smoke Test: Orchestrator Dual-Mechanism            
-	function smoke_test_orchestrator_dual_mechanism(networks::Dict;
-														fixture_directed::String   = "moreno_highschool_unweighted",
-														fixture_undirected::String = "scotland_interlock_unweighted")
-		"""
-		Args:
-			networks::Dict: corpus dict; needs both Moreno (directed) and
-				Scotland (undirected) to exercise both code paths
-			fixture_directed::String: directed fixture name
-			fixture_undirected::String: undirected fixture name
+			networks::Dict: corpus dict; needs Moreno (directed) and Scotland (undirected)
+			fixture_directed, fixture_undirected::String: fixture keys
 		Returns:
 			NamedTuple (passed::Bool, details::String)
 		Notes:
-			Sanity-checks build_degeneration_corpus on a minimal grid before
-			the production run. Verifies:
-
-			(a) Output shape: total row count matches the per-network
-				mechanism applicability * cells * reps formula.
-			(b) Dual-mechanism rows: Moreno (directed) produces both
-				:full_removal and :outgoing_only rows; Scotland (undirected)
-				produces only :full_removal rows.
-			(c) Seed sharing across mechanism rows: the two mechanism rows
-				for the same (network, rho, rate, rep) cell share the same
-				seed, dropped_nodes, realized_rho, and bisection_status.
-				This verifies the sampler-cache design — both mechanisms
-				consume the same sampler output.
-			(d) Degeneracy field sharing: the two mechanism rows for the
-				same cell share their degeneracy values (mechanism-
-				agnostic by design).
-			(e) Mechanism column type: returned DataFrame has mechanism
-				as Symbol with valid values only.
-			(f) Row ordering: name → rho → rate → rep → mechanism, with
-				mechanism varying fastest.
-
-			Runs a minimal 2-network × 2-rho × 2-rate × 3-rep grid in serial
-			mode (parallel=false) to make output deterministic and quick.
+			Sanity-checks build_degeneration_corpus on a minimal two-dial grid.
+			Verifies, against the Spec v3 schema:
+			  (a) Shape: rows == sum over nets of |rhos|*|pi_nodes|*|pi_edges_net|*reps,
+			      with pi_edges forced to {0.0} on these unweighted fixtures (no
+			      mechanism doubling).
+			  (b) No mechanism column; n_full_removal and n_nominations present.
+			  (c) Undirected rows have n_nominations == 0 for every row (full removal
+			      only); directed rows may have nominations (reported).
+			  (d) Feasibility: an over-ceiling rho in the grid yields
+			      rho_was_substituted == true on some rows.
+			  (e) Determinism: two serial runs at the same master_seed are identical
+			      on missing_nodes, realized_rho, gate_status.
+			  (f) reverse_edges: a reverse run completes and is itself reproducible.
 		"""
 		println("─" ^ 70)
-		println("Smoke Test: orchestrator dual-mechanism on Moreno + Scotland")
+		println("Smoke Test: orchestrator two-dial grid")
 		println("─" ^ 70)
 
 		haskey(networks, fixture_directed) ||
-			return (passed = false, details = "$fixture_directed missing from corpus")
+			return (passed = false, details = "$fixture_directed missing")
 		haskey(networks, fixture_undirected) ||
-			return (passed = false, details = "$fixture_undirected missing from corpus")
+			return (passed = false, details = "$fixture_undirected missing")
 
-		small_corpus = Dict(
-			fixture_directed   => networks[fixture_directed],
-			fixture_undirected => networks[fixture_undirected],
-		)
+		ndg = Network_Credible_Intervals.network_degeneracy
+		small = Dict(fixture_directed   => networks[fixture_directed],
+					 fixture_undirected => networks[fixture_undirected])
 
-		println("  Running build_degeneration_corpus on 2-network smoke grid...")
-		result = Network_Credible_Intervals.network_degeneracy.build_degeneration_corpus(
-					small_corpus;
-					target_rhos    = [0.0, 0.25],
-					target_rates   = [0.10, 0.25],
-					n_replicates   = 3,
-					mechanisms     = [:full_removal, :outgoing_only],
-					parallel       = false,
-					show_progress  = false)
+		rhos = [0.0, 0.25, 0.9]; pins = [0.10, 0.25]; reps = 3
+		runargs = (; target_rhos = rhos, target_pi_nodes = pins,
+					 target_pi_edges = [0.0], n_replicates = reps,
+					 master_seed = 7, parallel = false, show_progress = false)
 
-		#	(a) Output shape
-			#	Scotland (undirected): 1 mechanism × 2 rho × 2 rate × 3 rep = 12 rows
-			#	Moreno (directed):    2 mechanisms × 2 rho × 2 rate × 3 rep = 24 rows
-			expected_total = 12 + 24
-			actual_total   = nrow(result)
-			check_a        = actual_total == expected_total
+		result = ndg.build_degeneration_corpus(small; runargs...)
 
-		#	(b) Dual-mechanism rows
-			scotland_rows = filter(r -> r.network_name == fixture_undirected, result)
-			moreno_rows   = filter(r -> r.network_name == fixture_directed, result)
-			scotland_mechs = unique(scotland_rows.mechanism)
-			moreno_mechs   = unique(moreno_rows.mechanism)
-			check_b = scotland_mechs == [:full_removal] &&
-					   Set(moreno_mechs) == Set([:full_removal, :outgoing_only])
+		#	(a) shape — both unweighted => pi_edges == {0.0}
+			expected = 2 * length(rhos) * length(pins) * 1 * reps
+			check_a  = nrow(result) == expected
 
-		#	(c) Seed sharing across mechanism rows for the same cell
-			#	Group Moreno rows by (rho, rate, rep) and confirm the two
-			#	mechanism rows share seed, dropped_nodes, realized_rho, status
-			cell_keys = unique([(r.nominal_rho, r.nominal_rate, r.replicate_idx) for r in eachrow(moreno_rows)])
-			seed_share_violations    = 0
-			dropped_share_violations = 0
-			rho_share_violations     = 0
-			status_share_violations  = 0
-			for ck in cell_keys
-				cell_rows = filter(r -> r.nominal_rho == ck[1] &&
-											r.nominal_rate == ck[2] &&
-											r.replicate_idx == ck[3], moreno_rows)
-				nrow(cell_rows) == 2 || continue
-				if cell_rows.seed[1]             != cell_rows.seed[2]
-					seed_share_violations += 1
-				end
-				if cell_rows.dropped_nodes[1]    != cell_rows.dropped_nodes[2]
-					dropped_share_violations += 1
-				end
-				if !(isnan(cell_rows.realized_rho[1]) && isnan(cell_rows.realized_rho[2])) &&
-				   cell_rows.realized_rho[1] != cell_rows.realized_rho[2]
-					rho_share_violations += 1
-				end
-				if cell_rows.bisection_status[1] != cell_rows.bisection_status[2]
-					status_share_violations += 1
-				end
-			end
-			check_c = seed_share_violations    == 0 &&
-					   dropped_share_violations == 0 &&
-					   rho_share_violations     == 0 &&
-					   status_share_violations  == 0
+		#	(b) no mechanism column; composition columns present
+			cols = names(result)
+			check_b = !("mechanism" in cols) &&
+					   ("n_full_removal" in cols) && ("n_nominations" in cols)
 
-		#	(d) Degeneracy field sharing across mechanism rows
-			gc_share_violations  = 0
-			nob_share_violations = 0
-			any_share_violations = 0
-			for ck in cell_keys
-				cell_rows = filter(r -> r.nominal_rho == ck[1] &&
-											r.nominal_rate == ck[2] &&
-											r.replicate_idx == ck[3], moreno_rows)
-				nrow(cell_rows) == 2 || continue
-				if !(isnan(cell_rows.gc_fraction_of_remaining[1]) &&
-					 isnan(cell_rows.gc_fraction_of_remaining[2])) &&
-				   cell_rows.gc_fraction_of_remaining[1] != cell_rows.gc_fraction_of_remaining[2]
-					gc_share_violations += 1
-				end
-				if cell_rows.n_observed[1] != cell_rows.n_observed[2]
-					nob_share_violations += 1
-				end
-				if cell_rows.any_topo_degenerate[1] != cell_rows.any_topo_degenerate[2]
-					any_share_violations += 1
-				end
-			end
-			check_d = gc_share_violations  == 0 &&
-					   nob_share_violations == 0 &&
-					   any_share_violations == 0
+		#	(c) undirected => all nominations zero
+			und_rows = filter(r -> r.network_name == fixture_undirected, result)
+			dir_rows = filter(r -> r.network_name == fixture_directed,   result)
+			check_c  = all(und_rows.n_nominations .== 0)
+			dir_nom_total = sum(dir_rows.n_nominations)
 
-		#	(e) Mechanism column type and valid values
-			check_e = eltype(result.mechanism) == Symbol &&
-					   all(m in (:full_removal, :outgoing_only) for m in result.mechanism)
+		#	(d) feasibility substitution fired for the over-ceiling rho
+			check_d = any(result.rho_was_substituted)
 
-		#	(f) Row ordering: within a network, expect name → rho → rate → rep → mechanism
-			#	Specifically: for any consecutive pair of rows with the same (rho, rate, rep),
-			#	their mechanisms should differ. Check this on Moreno rows.
-			ordering_violations = 0
-			for i in 1:(nrow(moreno_rows) - 1)
-				if moreno_rows.nominal_rho[i]   == moreno_rows.nominal_rho[i+1] &&
-				   moreno_rows.nominal_rate[i]  == moreno_rows.nominal_rate[i+1] &&
-				   moreno_rows.replicate_idx[i] == moreno_rows.replicate_idx[i+1] &&
-				   moreno_rows.mechanism[i]     == moreno_rows.mechanism[i+1]
-					ordering_violations += 1
-				end
-			end
-			check_f = ordering_violations == 0
+		#	(e) determinism across two serial runs
+			result2 = ndg.build_degeneration_corpus(small; runargs...)
+			check_e = result.missing_nodes == result2.missing_nodes &&
+					   result.realized_rho == result2.realized_rho &&
+					   result.gate_status  == result2.gate_status
 
-		#	Report
-			println("  Total rows:               $actual_total (expected $expected_total)")
-			println("  (a) Output shape:         $(check_a ? "YES" : "NO")")
-			println("  (b) Mechanism rows:       $(check_b ? "YES" : "NO")")
-			println("      Scotland mechs:       $scotland_mechs")
-			println("      Moreno mechs:         $moreno_mechs")
-			println("  (c) Sampler-cache share:  $(check_c ? "YES" : "NO")")
-			if !check_c
-				println("      seed violations:      $seed_share_violations")
-				println("      dropped violations:   $dropped_share_violations")
-				println("      rho violations:       $rho_share_violations")
-				println("      status violations:    $status_share_violations")
-			end
-			println("  (d) Degeneracy share:     $(check_d ? "YES" : "NO")")
-			if !check_d
-				println("      gc violations:        $gc_share_violations")
-				println("      n_observed violations:$nob_share_violations")
-				println("      any_topo violations:  $any_share_violations")
-			end
-			println("  (e) Mechanism dtype:      $(check_e ? "YES" : "NO")")
-			println("  (f) Row ordering:         $(check_f ? "YES" : "NO")")
+		#	(f) reverse_edges completes and is reproducible
+			rev1 = ndg.build_degeneration_corpus(small; runargs..., reverse_edges = true)
+			rev2 = ndg.build_degeneration_corpus(small; runargs..., reverse_edges = true)
+			check_f = nrow(rev1) == expected &&
+					   rev1.missing_nodes == rev2.missing_nodes &&
+					   rev1.gate_status  == rev2.gate_status
 
-			passed = check_a && check_b && check_c && check_d && check_e && check_f
-			println("  Result:                   $(passed ? "PASS ✓" : "FAIL ✗")")
+		println("  Rows:                     $(nrow(result)) (expected $expected)")
+		println("  (a) shape:                $(check_a ? "YES" : "NO")")
+		println("  (b) no mechanism col:     $(check_b ? "YES" : "NO")")
+		println("  (c) undirected nom == 0:  $(check_c ? "YES" : "NO")  (directed nom total $dir_nom_total)")
+		println("  (d) feasibility fired:    $(check_d ? "YES" : "NO")")
+		println("  (e) determinism:          $(check_e ? "YES" : "NO")")
+		println("  (f) reverse reproducible: $(check_f ? "YES" : "NO")")
 
-		return (passed  = passed,
+		passed = check_a && check_b && check_c && check_d && check_e && check_f
+		println("  Result:                   $(passed ? "PASS ✓" : "FAIL ✗")")
+
+		return (passed = passed,
 				details = "a=$check_a b=$check_b c=$check_c d=$check_d e=$check_e f=$check_f")
 	end
-    smoke_test_orchestrator_dual_mechanism(networks)
+    smoke_test_orchestrator_two_dial(networks)
 
 ############################
 #   Pre-Launch Smoke Run   #
