@@ -86,13 +86,18 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
                                                          _realized_rho_for_beta,
                                                          _solve_bin_distribution,
                                                          _compute_ei_conditional,
-														 _draw_bin_assignments,
-														 _build_augmented_nodes,
-														 _stage_0_5_directed,
-														 _stage_0_5_undirected,
-														 _stage_1_directed,
-														 _stage_1_undirected,
-														 _stage_2!
+                                                         _draw_bin_assignments,
+                                                         _build_augmented_nodes,
+                                                         _stage_0_5_directed,
+                                                         _stage_0_5_undirected,
+                                                         _stage_1_directed,
+                                                         _stage_1_undirected,
+                                                         _stage_2!,
+                                                         _passes_three_prior_gate,
+                                                         _aggregate_duplicate_dyads,
+                                                         _compute_weight_floor,
+                                                         _compute_bin_tendencies,
+                                                         _extract_reconstruction_delta
 
 #################
 #   FUNCTIONS   #
@@ -117,7 +122,7 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 
 			For Phase 2 _compute_observed_centrality testing, the directed
 			star produces hub centrality = (n-1) (from in-degree, since
-			out-degree is 0) and leaf centrality = 1 each (from out-degree).
+			out-degree is 0) and leaf centrality = 0 each (in-degree basis; out-degree excluded).
 			The undirected star produces hub centrality = (n-1) and leaf
 			centrality = 1 each via undirected degree.
 
@@ -149,15 +154,17 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			NamedTuple in corpus format with edges/nodes/metadata.
 		Notes:
 			Builds a small directed network where each node has a known,
-			asymmetric in-degree and out-degree. Hand-computed totals:
+			asymmetric in-degree and out-degree. The rho-basis centrality is
+			binarized IN-degree (out-degree is excluded), so the relevant
+			hand-computed column is in-degree:
 
-			Node  in-deg  out-deg  total (cent)
-			n1     0       3        3
-			n2     1       2        3
-			n3     2       1        3
-			n4     3       0        3
-			n5     2       2        4
-			n6     2       3        5
+			Node  in-deg  out-deg
+			n1     0       3
+			n2     2       2
+			n3     3       1
+			n4     4       0
+			n5     1       2
+			n6     1       3
 
 			Edge list (directed):
 				n1 -> n2,  n1 -> n3,  n1 -> n4
@@ -165,18 +172,15 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				n3 -> n4
 				n5 -> n3,  n5 -> n6
 				n6 -> n2,  n6 -> n4,  n6 -> n5
-				          (and n5 -> n6 already, so n6 also gets one inbound)
 
-			Total edges = 11. Total in-degree sum = total out-degree sum
-			= 11 (sanity check).
+			Total edges = 11. Sum of in-degrees = 11 (each edge contributes one
+			in-stub) — the in-degree sanity check.
 
 			This fixture exists specifically to verify that
-			_compute_observed_centrality on directed networks SUMS in-degree
-			and out-degree rather than returning just one. If the function
-			were returning only in-degree, n1 would show centrality 0;
-			if only out-degree, n4 would show 0. The sum-based design
-			gives n1 = 3, n4 = 3, both nonzero and identical, with
-			n5 = 4 and n6 = 5 as further discriminating values.
+			_compute_observed_centrality on directed networks counts IN-degree
+			ONLY (not in + out). n1 is a pure source (in-degree 0) and n4 a pure
+			sink (in-degree 4): under the in-degree basis n1 must read 0 and n4
+			must read nonzero, which distinguishes in-degree from total degree.
 		"""
 		src = ["n1", "n1", "n1", "n2", "n2", "n3", "n5", "n5", "n6", "n6", "n6"]
 		dst = ["n2", "n3", "n4", "n3", "n4", "n4", "n3", "n6", "n2", "n4", "n5"]
@@ -1119,22 +1123,24 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				#	Phase 1: generate dropped-node set
 					record = Network_Credible_Intervals.network_degeneracy.generate_missingness_mask(
 						net.edges;
-						nodes       = net.nodes,
-						directed    = net.metadata.directed,
-						target_rate = rate_input,
-						target_rho  = rho_input,
-						seed        = rep_seed,
-						centrality  = centrality_true)
+						nodes          = net.nodes,
+						directed       = net.metadata.directed,
+						weighted       = net.metadata.weighted,
+						target_pi_node = rate_input,
+						target_pi_edge = 0.0,
+						target_rho     = rho_input,
+						seed           = rep_seed,
+						centrality     = centrality_true)
 
-					if record.bisection_status == :failed_other
+					if record.gate_status == :failed_other
 						n_skipped += 1
 						continue
 					end
 
 				#	Materialize G_obs
-					dropped = collect(record.dropped_nodes)
-					materialized = Network_Credible_Intervals.network_degeneracy.apply_missingness(
-						net.edges, dropped; nodes = net.nodes)
+					dropped = collect(record.missing_nodes)
+					materialized = Network_Credible_Intervals.network_degeneracy._materialize_missing_nodes(
+						net.edges, dropped; nodes = net.nodes, directed = net.metadata.directed)
 
 				#	CHAMP on G_obs
 					champ_result = Network_Credible_Intervals.network_community_detection.champ_community_detection(
@@ -1149,7 +1155,7 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				#	as inputs (this is the user-specified priors, after
 				#	Phase 1 produces them)
 					rho_input_to_phase2  = record.realized_rho
-					rate_input_to_phase2 = record.realized_rate
+					rate_input_to_phase2 = record.realized_pi_node
 
 					setup = Network_Credible_Intervals.network_reconstruction.compute_setup(
 						materialized.edges, materialized.nodes,
@@ -1190,29 +1196,29 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 					ei_row_stochastic = all(isapprox.(row_sums, 1.0; atol = tol_prior_3))
 
 				#	Compute empirical conditional from setup.degree_bins and setup.ei_bins
-                    empirical_cond = zeros(Float64, K, size(ei_cond, 2))
-                    for i in 1:length(setup.degree_bins)
-                        b = setup.degree_bins[i]
-                        j = setup.ei_bins[i]
-                        empirical_cond[b, j] += 1.0
-                    end
-                    J_eff = size(ei_cond, 2)
-                    for b in 1:K
-                        rs = sum(empirical_cond[b, :])
-                        if rs > 0
-                            empirical_cond[b, :] ./= rs
-                        else
-                            #	Match framework's empty-bin fallback: uniform over J_eff
-                                empirical_cond[b, :] .= 1.0 / J_eff
-                        end
-                    end
+					empirical_cond = zeros(Float64, K, size(ei_cond, 2))
+					for i in 1:length(setup.degree_bins)
+						b = setup.degree_bins[i]
+						j = setup.ei_bins[i]
+						empirical_cond[b, j] += 1.0
+					end
+					J_eff = size(ei_cond, 2)
+					for b in 1:K
+						rs = sum(empirical_cond[b, :])
+						if rs > 0
+							empirical_cond[b, :] ./= rs
+						else
+							#	Match framework's empty-bin fallback: uniform over J_eff
+								empirical_cond[b, :] .= 1.0 / J_eff
+						end
+					end
 
 					ei_matches_emp = isapprox(ei_cond, empirical_cond; atol = tol_prior_3)
 					prior_3_ok = ei_row_stochastic && ei_matches_emp
 
 				#	Record
 					push!(rep_realized_rhos, record.realized_rho)
-					push!(rep_realized_rates, record.realized_rate)
+					push!(rep_realized_rates, record.realized_pi_node)
 					push!(rep_n_dropped, length(dropped))
 					push!(rep_n_add, N_add)
 					push!(rep_beta, setup.beta)
@@ -1570,6 +1576,29 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 		return nothing
 	end
 
+#	Shared small fixture for the new corpus/gate tests
+	function _build_corpus_fixture()
+		nodes = DataFrame(id = string.(1:12), label = string.(1:12))
+		edges = DataFrame(
+			src = string.([1,1,1,2,2,3,3,4,5,6,7,8,9,10,11,12]),
+			dst = string.([2,3,4,3,5,4,6,7,6,8,9,10,11,12,1,2]),
+			weight = [3,2,1,2,4,1,3,2,1,1,2,3,1,2,1,1],
+		)
+		community_labels = ones(Int, 12)
+		return (edges = edges, nodes = nodes, community_labels = community_labels)
+	end
+
+#	Canonical edge-weight map (type-agnostic), for round-trip comparison
+	function _edge_weight_map(edges::DataFrame, directed::Bool)
+		d = Dict{Tuple{String,String}, Float64}()
+		for r in 1:nrow(edges)
+			s = string(edges.src[r]); t = string(edges.dst[r])
+			k = directed ? (s, t) : (s <= t ? (s, t) : (t, s))
+			d[k] = get(d, k, 0.0) + Float64(edges.weight[r])
+		end
+		return d
+	end
+
 ###################
 #   SETUP TESTS   #
 ###################
@@ -1584,17 +1613,22 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			Verifies _compute_observed_centrality on the directed Star fixture
 			(n=11: 1 hub + 10 leaves, all arcs leaf -> hub).
 
-			Expected on directed star (in-degree + out-degree per design Step 1):
-			- Hub (node 1): in-degree = 10, out-degree = 0, total = 10
-			- Each leaf (nodes 2-11): in-degree = 0, out-degree = 1, total = 1
+			The rho basis is binarized IN-degree for directed networks (the
+			alignment-fix definition: the field tilts on in-degree, so binning
+			must agree) and binarized degree for undirected. Out-degree is not
+			part of the basis.
+
+			Expected:
+			- Directed: hub (node 1) in-degree = 10; each leaf in-degree = 0
+			  (leaves only send).
+			- Undirected: hub degree = 10; each leaf degree = 1.
 
 			Verifies the function:
 			(a) returns a vector of correct length
-			(b) returns Float64 (matching the design spec)
-			(c) sums in-degree and out-degree for directed networks
-			(d) is indexed in nodes-DataFrame order (hub at position 1)
-			(e) on undirected star, returns the same per-node degree
-				values (sum of incidences regardless of direction)
+			(b) returns Float64
+			(c) counts in-degree only for directed (rho basis)
+			(d) is indexed in nodes-DataFrame row order (hub at position 1)
+			(e) counts both endpoints for undirected
 		"""
 		println("─" ^ 70)
 		println("Test 1: _compute_observed_centrality on Star fixture (n=11)")
@@ -1610,21 +1644,22 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				true   # directed
 			)
 
-		#	Expected values
-			expected_hub = 10.0   # 10 leaves each pointing in
-			expected_leaf = 1.0   # 1 outgoing arc each, 0 incoming
+		#	Expected values (in-degree basis)
+			expected_hub      = 10.0   # 10 leaves each pointing in
+			expected_leaf_dir = 0.0    # leaves have in-degree 0 (out-degree excluded)
+			expected_leaf_und = 1.0    # undirected: each leaf has degree 1
 
 		#	Validate directed result
 			length_ok = length(cent_directed) == 11
 			hub_ok    = cent_directed[1] == expected_hub
-			leaves_ok = all(cent_directed[2:end] .== expected_leaf)
+			leaves_ok = all(cent_directed[2:end] .== expected_leaf_dir)
 			type_ok   = eltype(cent_directed) == Float64
 
 			println("  Directed star (n=11):")
 			println("    Length:       $(length(cent_directed)) (expected 11)             $(length_ok ? "OK" : "FAIL")")
 			println("    Element type: $(eltype(cent_directed)) (expected Float64)       $(type_ok ? "OK" : "FAIL")")
 			println("    Hub cent:     $(cent_directed[1]) (expected $expected_hub)       $(hub_ok ? "OK" : "FAIL")")
-			println("    Leaf cent:    all $(expected_leaf)?                              $(leaves_ok ? "OK" : "FAIL")")
+			println("    Leaf cent:    all $(expected_leaf_dir)? (in-degree 0)            $(leaves_ok ? "OK" : "FAIL")")
 			println("    Full vector:  ", cent_directed)
 
 		#	Now do undirected star
@@ -1635,17 +1670,17 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				false   # undirected
 			)
 
-		#	On undirected: each edge contributes to BOTH endpoints regardless
-		#	of direction, so the totals are identical to the directed case
+		#	On undirected: each edge contributes to BOTH endpoints, so leaves
+		#	have degree 1 and the hub has degree 10.
 			und_length_ok = length(cent_undirected) == 11
 			und_hub_ok    = cent_undirected[1] == expected_hub
-			und_leaves_ok = all(cent_undirected[2:end] .== expected_leaf)
+			und_leaves_ok = all(cent_undirected[2:end] .== expected_leaf_und)
 
 			println()
 			println("  Undirected star (n=11):")
 			println("    Length:       $(length(cent_undirected)) (expected 11)            $(und_length_ok ? "OK" : "FAIL")")
 			println("    Hub cent:     $(cent_undirected[1]) (expected $expected_hub)      $(und_hub_ok ? "OK" : "FAIL")")
-			println("    Leaf cent:    all $(expected_leaf)?                               $(und_leaves_ok ? "OK" : "FAIL")")
+			println("    Leaf cent:    all $(expected_leaf_und)? (degree 1)               $(und_leaves_ok ? "OK" : "FAIL")")
 
 		#	Final aggregate result
 			all_pass = length_ok && hub_ok && leaves_ok && type_ok &&
@@ -1683,57 +1718,31 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 		Returns:
 			Bool: true if test passes
 		Notes:
-			Verifies _compute_observed_centrality on a directed network
-			where in-degree and out-degree are genuinely asymmetric per
-			node. Critical for distinguishing the design's "in + out"
-			behavior from "in-degree only" or "out-degree only" failure
-			modes that would pass the Star test (where one of them is
-			zero for every node).
+			Verifies _compute_observed_centrality on a directed network with
+			asymmetric in/out degree per node. The rho basis is binarized
+			IN-degree for directed networks (out-degree is excluded), so this
+			fixture's diagnostic nodes are read the OPPOSITE way from the old
+			total-degree version.
 
-			Expected per-node centrality (in-degree + out-degree):
-				n1: 0 + 3 = 3
-				n2: 1 + 2 = 3
-				n3: 2 + 1 = 3
-				n4: 3 + 0 = 3
-				n5: 2 + 2 = 4
-				n6: 2 + 3 = 5
+			Edge list (11 edges):
+				n1 -> n2, n1 -> n3, n1 -> n4
+				n2 -> n3, n2 -> n4
+				n3 -> n4
+				n5 -> n3, n5 -> n6
+				n6 -> n2, n6 -> n4, n6 -> n5
 
-			n1 and n4 are the diagnostic nodes: if the function returned
-			only in-degree, n1 would be 0; if only out-degree, n4 would
-			be 0. Both being 3 confirms the sum is happening.
+			In-degree per node:
+				n1: 0   (pure source)
+				n2: 2   (from n1, n6)
+				n3: 3   (from n1, n2, n5)
+				n4: 4   (from n1, n2, n3, n6)
+				n5: 1   (from n6)
+				n6: 1   (from n5)
+			Sum of in-degrees = 11 = n_edges (each edge contributes one in-stub).
 
-			Sum-of-centralities sanity check: total in + total out =
-			2 * n_edges = 22. The sum of the expected vector is
-			3+3+3+3+4+5 = 21... let me re-check.
-				Sum in:  0+1+2+3+2+2 = 10
-				Sum out: 3+2+1+0+2+3 = 11
-				Discrepancy: total in (10) != total out (11)
-			This is the expected behavior: my edge list has 11 entries,
-			so total out = 11 and total in = 11 must both equal 11.
-			Re-counting in-degrees from the edge list:
-				n1: 0 incoming
-				n2: from n1, n6                  -> 2
-				n3: from n1, n2, n5              -> 3
-				n4: from n1, n2, n3, n6          -> 4
-				n5: from n6                       -> 1
-				n6: from n5                       -> 1
-				Total in: 0+2+3+4+1+1 = 11      OK matches total out=11
-			And out-degrees:
-				n1: 3 (-> n2, n3, n4)
-				n2: 2 (-> n3, n4)
-				n3: 1 (-> n4)
-				n5: 2 (-> n3, n6)
-				n6: 3 (-> n2, n4, n5)
-				n4: 0
-				Total out: 3+2+1+0+2+3 = 11      OK
-			So the corrected expected centralities (in + out):
-				n1: 0 + 3 = 3
-				n2: 2 + 2 = 4
-				n3: 3 + 1 = 4
-				n4: 4 + 0 = 4
-				n5: 1 + 2 = 3
-				n6: 1 + 3 = 4
-			Sum: 3+4+4+4+3+4 = 22 = 2 * 11 edges. Sanity check passes.
+			n1 (pure source) and n4 (pure sink) are the diagnostics: under the
+			in-degree basis n1 must be 0 (out-degree NOT counted) and n4 must be
+			nonzero (in-degree counted) — the inverse of the old in+out check.
 		"""
 		println("─" ^ 70)
 		println("Test 2: _compute_observed_centrality on asymmetric directed block")
@@ -1749,17 +1758,18 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				true   # directed
 			)
 
-		#	Expected per-node values: in-degree + out-degree
-			expected = [3.0, 4.0, 4.0, 4.0, 3.0, 4.0]
+		#	Expected per-node values: in-degree (rho basis)
+			expected = [0.0, 2.0, 3.0, 4.0, 1.0, 1.0]
 
 		#	Pointwise comparison
 			length_ok = length(cent) == 6
 			values_ok = cent == expected
 
-		#	Sanity check: sum of centralities should equal 2 * n_edges
+		#	Sanity check: each edge contributes exactly one in-stub, so the
+		#	sum of in-degrees equals n_edges.
 			sum_cent = sum(cent)
 			n_edges = nrow(fixture.edges)
-			sum_ok = sum_cent == 2 * n_edges
+			sum_ok = sum_cent == n_edges
 
 		#	Per-node diagnostic output
 			println("  Per-node centrality:")
@@ -1769,19 +1779,17 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				println(@sprintf("    %-5s %-8.1f %-8.1f   %s", id, cent[i], expected[i], ok_str))
 			end
 			println()
-			println("    Sum of centralities: $sum_cent (expected $(2 * n_edges) = 2 * $n_edges edges)  $(sum_ok ? "OK" : "FAIL")")
+			println("    Sum of centralities: $sum_cent (expected $n_edges = n_edges in-stubs)  $(sum_ok ? "OK" : "FAIL")")
 
-		#	Diagnostic check on n1 and n4 specifically
-			#	n1 has only outgoing edges; n4 has only incoming. If the
-			#	function were one-directional only, one of them would be
-			#	zero. Both being 3 confirms the sum.
-				n1_diagnostic = cent[1] > 0   # n1 has no in-degree; only nonzero if out included
-				n4_diagnostic = cent[4] > 0   # n4 has no out-degree; only nonzero if in included
+		#	Diagnostic on n1 and n4: confirms in-degree basis (out-degree excluded)
+			#	n1 is a pure source -> in-degree 0; n4 is a pure sink -> in-degree > 0.
+				n1_diagnostic = cent[1] == 0.0   # out-degree NOT counted
+				n4_diagnostic = cent[4] > 0      # in-degree counted
 
 				println()
-				println("  Diagnostic (verifies in + out, not just one):")
-				println("    n1 nonzero (verifies out-degree counted): $(n1_diagnostic ? "OK" : "FAIL")")
-				println("    n4 nonzero (verifies in-degree counted):  $(n4_diagnostic ? "OK" : "FAIL")")
+				println("  Diagnostic (verifies in-degree basis, out-degree excluded):")
+				println("    n1 == 0 (pure source; out-degree not counted): $(n1_diagnostic ? "OK" : "FAIL")")
+				println("    n4 > 0  (pure sink; in-degree counted):        $(n4_diagnostic ? "OK" : "FAIL")")
 
 		#	Final result
 			all_pass = length_ok && values_ok && sum_ok && n1_diagnostic && n4_diagnostic
@@ -3369,8 +3377,12 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			Verifies _determine_n_add against hand-computed values across
 			several edge cases.
 
-			Design formula:
-				N_add = round(pi_node * (N + N_nom) / (1 - pi_node)) - N_nom
+			Design formula (solves realized missingness exactly):
+				N_add = round((pi_node * (N + N_nom) - N_nom) / (1 - pi_node))
+				clamped to >= 0, so that
+				(N_nom + N_add) / (N + N_nom + N_add) == pi_node.
+				The nominations are part of the missing set, so they are
+				netted out INSIDE the solve, not subtracted after rounding.
 
 			Test cases:
 			(a) pi_node = 0:
@@ -3383,7 +3395,9 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 
 			(c) Standard case with nominees:
 				pi_node = 0.1, N = 100, N_nom = 5
-				N_add = round(0.1 * 105 / 0.9) - 5 = round(11.667) - 5 = 12 - 5 = 7
+				N_add = round((0.1*105 - 5) / 0.9) = round(5.5/0.9)
+					  = round(6.111) = 6
+				Realized: (5 + 6) / (100 + 5 + 6) = 11/111 = 0.099 ✓
 
 			(d) High pi_node:
 				pi_node = 0.5, N = 100, N_nom = 0
@@ -3391,8 +3405,9 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 
 			(e) Clamping to zero:
 				pi_node = 0.05, N = 100, N_nom = 100
-				implied_missing = round(0.05 * 200 / 0.95) = round(10.526) = 11
-				N_add = 11 - 100 = -89 -> clamped to 0
+				N_add = round((0.05*200 - 100) / 0.95)
+					  = round(-90 / 0.95) = round(-94.7) -> negative
+					  -> clamped to 0.
 				This is the "N_nom exceeds implied total missing" edge case.
 
 			(f) Round-half-to-even:
@@ -3422,11 +3437,11 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				(0.0,  100, 0,   0),     # pi_node = 0
 				(0.0,  100, 10,  0),     # pi_node = 0 with nominees
 				(0.1,  100, 0,   11),    # standard no nominees
-				(0.1,  100, 5,   7),     # standard with nominees
+				(0.1,  100, 5,   6),     # with nominees: round((0.1*105 - 5)/0.9) = 6
 				(0.5,  100, 0,   100),   # high pi_node
 				(0.05, 100, 100, 0),     # clamp to zero (N_nom exceeds)
 				(0.25, 20,  0,   7),     # round(0.25*20/0.75) = round(6.667) = 7
-				(0.4,  50,  10,  30),    # round(0.4*60/0.6) - 10 = 40 - 10 = 30
+				(0.4,  50,  10,  23),    # with nominees: round((0.4*60 - 10)/0.6) = round(23.33) = 23
 			]
 
 		#	Run each test case
@@ -3695,7 +3710,9 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			(b) Converges to an interior target within tolerance
 			(c) Returns :ceiling_hit when target exceeds the achievable
 				range (signals via status, returns the closest beta)
-			(d) Handles N_add=0 gracefully (no missingness variation)
+			(d) Handles N_add=0 gracefully: rho=0 converges trivially, while
+				a nonzero target is a ceiling hit (no missing set -> the
+				achievable |rho| ceiling collapses to 0)
 
 			Tests use K=10, N=100, N_add=20, which has analytic achievable
 			ceiling near +/- 0.52 (per Test 16 diagnostic). Interior targets
@@ -3781,10 +3798,11 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 				result_e0 = _solve_bin_distribution(0.0, K, N, 0)
 				e0_ok = result_e0.status == :converged && result_e0.beta == 0.0
 				println("    rho_target = 0, N_add = 0: status = $(result_e0.status), beta = $(result_e0.beta)   $(e0_ok ? "OK" : "FAIL")")
-			#	With rho_target != 0, N_add = 0: failed_other
+			#	With rho_target != 0, N_add = 0: no missing set, so the achievable
+			#	|rho| ceiling collapses to 0 -> any nonzero target is a ceiling hit.
 				result_e1 = _solve_bin_distribution(0.25, K, N, 0)
-				e1_ok = result_e1.status == :failed_other
-				println("    rho_target = 0.25, N_add = 0: status = $(result_e1.status) (expected :failed_other) $(e1_ok ? "OK" : "FAIL")")
+				e1_ok = result_e1.status == :ceiling_hit
+				println("    rho_target = 0.25, N_add = 0: status = $(result_e1.status) (expected :ceiling_hit) $(e1_ok ? "OK" : "FAIL")")
 			all_pass = all_pass && e0_ok && e1_ok
 
 		#	Final result
@@ -3922,12 +3940,12 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			results = Dict{Symbol, Bool}()
 
 		#	Inputs preserved
-			results[:edges_preserved] = setup.edges === fixture.edges
+			results[:edges_preserved] = nrow(setup.edges) == nrow(fixture.edges)  # aggregation -> new frame; === no longer holds
 			results[:nodes_preserved] = setup.nodes === fixture.nodes
 			results[:directed_field]  = setup.directed == false
 			results[:weighted_field]  = setup.weighted == false
-			results[:pi_node_field]   = setup.pi_node == 0.1
-			results[:pi_edge_field]   = setup.pi_edge == 0.0
+			results[:pi_node_field]   = isapprox(setup.pi_node, setup.diagnostics[:realized_pi_node])  # stores realized, not requested
+			results[:pi_edge_field]   = isapprox(setup.pi_edge, setup.diagnostics[:pi_edge_floor])  # raised to implied-weight floor
 			results[:rho_field]       = setup.rho == 0.25
 
 		#	Per-node centrality
@@ -5017,20 +5035,24 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 		Returns:
 			Bool: true if all sub-checks pass
 		Notes:
-			Verifies four contracts of _stage_2!:
-			(a) Throws ArgumentError when pi_edge == 0.
+			Verifies four contracts of the revised _stage_2!:
+			(a) Handles pi_edge == 0 gracefully: does NOT throw (the pre-revision
+			    _stage_2! did). Because the weight floor keeps additional_weight
+			    >= 0 (additional_weight == 0 is unreachable via compute_setup),
+			    it adds exactly that floored budget and conserves total weight.
 			(b) Throws ArgumentError when weighted == false.
-			(c) For known W_aug and pi_edge, returned W_add equals
-			    round(pi_edge * W_aug / (1 - pi_edge)).
-			(d) After the call, sum(augmented_edges.weight) equals
-			    W_aug + W_add exactly (weight conservation).
+			(c) Returned W_add equals round(Int, setup.additional_weight)
+			    (the budget comes from the weight floor, NOT recomputed
+			    from pi_edge).
+			(d) After the call, sum(augmented_edges.weight) == W_aug + W_add
+			    (weight conservation; the function adds exactly its return).
 		"""
 		println("─" ^ 70)
 		println("Test 28: _stage_2! unit checks")
 		println("─" ^ 70)
 
 		#	Construct Weighted Fixture and Setup with pi_edge > 0
-			nodes = DataFrame(id = string.(1:12))
+			nodes = DataFrame(id = string.(1:12), label = string.(1:12))
 			edges = DataFrame(
 				src = string.([1,1,1,2,2,3,3,4,5,6,7,8,9,10,11,12]),
 				dst = string.([2,3,4,3,5,4,6,7,6,8,9,10,11,12,1,2]),
@@ -5042,19 +5064,34 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 								   pi_node = 0.10, pi_edge = 0.20,
 								   rho = 0.10, K = 4)
 
-		#	Sub-check (a): Throws on pi_edge == 0
+		#	Helper: build a valid augmented roster for a given setup
+			make_aug_nodes(s) = begin
+				ba = _draw_bin_assignments(s.q, s.ei_conditional, s.N_add, s.binning_mode, Xoshiro(7))
+				_build_augmented_nodes(s, ba.degree_bins, ba.ei_bins)
+			end
+
+		#	Sub-check (a): Graceful on pi_edge = 0.0 (no throw; adds floored budget)
+			#	The weight floor keeps additional_weight >= 0 (NOT necessarily 0)
+			#	even when pi_edge is requested at 0, so additional_weight == 0 is not
+			#	reachable via compute_setup. The revised _stage_2! must handle the
+			#	floored-budget case without throwing (the pre-revision version threw
+			#	on pi_edge == 0), adding exactly its budget and conserving weight.
 			setup_no_pi_edge = compute_setup(edges, nodes, community_labels;
 											  directed = true, weighted = true,
 											  pi_node = 0.10, pi_edge = 0.0,
 											  rho = 0.10, K = 4)
+			aug_nodes_a = make_aug_nodes(setup_no_pi_edge)
 			augmented_edges_a = copy(edges)
+			W_aug_a = sum(augmented_edges_a.weight)
 			check_a = false
 			try
-				_stage_2!(setup_no_pi_edge, augmented_edges_a, Xoshiro(42))
-			catch e
-				check_a = isa(e, ArgumentError)
+				w_a = _stage_2!(setup_no_pi_edge, augmented_edges_a, aug_nodes_a, Xoshiro(42))
+				check_a = (w_a == round(Int, setup_no_pi_edge.additional_weight)) &&
+						  (sum(augmented_edges_a.weight) == W_aug_a + w_a)
+			catch
+				check_a = false
 			end
-			println("  (a) Throws ArgumentError on pi_edge == 0: $(check_a ? "PASS" : "FAIL")")
+			println("  (a) Graceful on pi_edge=0.0 (no throw, adds floored budget, conserves): $(check_a ? "PASS" : "FAIL")")
 
 		#	Sub-check (b): Throws on Unweighted Setup
 			edges_unw = DataFrame(src = edges.src, dst = edges.dst,
@@ -5063,22 +5100,24 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 									   directed = true, weighted = false,
 									   pi_node = 0.10, pi_edge = 0.20,
 									   rho = 0.10, K = 4)
+			aug_nodes_b = make_aug_nodes(setup_unw)
 			augmented_edges_b = copy(edges_unw)
 			check_b = false
 			try
-				_stage_2!(setup_unw, augmented_edges_b, Xoshiro(42))
+				_stage_2!(setup_unw, augmented_edges_b, aug_nodes_b, Xoshiro(42))
 			catch e
 				check_b = isa(e, ArgumentError)
 			end
 			println("  (b) Throws ArgumentError on weighted == false: $(check_b ? "PASS" : "FAIL")")
 
-		#	Sub-check (c): W_add Matches Arithmetic
+		#	Sub-check (c): W_add Matches the Floor Budget
+			aug_nodes = make_aug_nodes(setup)
 			augmented_edges = copy(edges)
 			W_aug = sum(augmented_edges.weight)
-			expected_W_add = round(Int, setup.pi_edge * W_aug / (1 - setup.pi_edge))
-			W_add = _stage_2!(setup, augmented_edges, Xoshiro(42))
+			expected_W_add = round(Int, setup.additional_weight)
+			W_add = _stage_2!(setup, augmented_edges, aug_nodes, Xoshiro(42))
 			check_c = W_add == expected_W_add
-			println("  (c) W_add == round(pi_edge * W_aug / (1 - pi_edge)) ($W_add == $expected_W_add): $(check_c ? "PASS" : "FAIL")")
+			println("  (c) W_add == round(setup.additional_weight) ($W_add == $expected_W_add): $(check_c ? "PASS" : "FAIL")")
 
 		#	Sub-check (d): Weight Conservation
 			W_final = sum(augmented_edges.weight)
@@ -5114,7 +5153,7 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			(c) Seed reproducibility: two calls with seed=42 produce bit-
 			    identical augmented_edges and augmented_nodes.
 			(d) Mean realized_rho across 100 seeds matches setup.rho within
-			    tolerance 0.04. R=100 is used (rather than the R=20 Phase-2
+			    tolerance 0.05. R=100 is used (rather than the R=20 Phase-2
 			    Setup convention) because the small fixture has higher
 			    per-replicate variance than the corpus networks.
 			(e) Pure-pass case (pi_node=0, pi_edge=0, no nominated): the
@@ -5177,7 +5216,7 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			rhos = [r.diag[:realized_rho] for r in reps]
 			mean_rho = mean(rhos)
 			dev_d = abs(mean_rho - setup.rho)
-			tolerance_d = 0.04
+			tolerance_d = 0.05  # realized_rho is now raw-centrality tau-b; aligned to gate rho_tol (provisional, confirm on first run)
 			check_d = dev_d < tolerance_d
 			println("  (d) Mean realized_rho matches setup.rho (mean = $(round(mean_rho, digits=4)), target = $(round(setup.rho, digits=4)), dev = $(round(dev_d, digits=4)), tol = $tolerance_d): $(check_d ? "PASS" : "FAIL")")
 
@@ -5222,7 +5261,7 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			variation (e.g., n_out = 2 + (v % 4) → centrality range 6-8
 			only) the framework's bins end up degenerate (bins 1 and 3
 			empty), and the realized_rho diagnostic — which uses bin
-			INDEX rather than centrality directly — becomes uninformative
+			raw-centrality tau-b on the augmented network (the empty-middle-bin failure mode below no longer applies) — becomes uninformative
 			because added nodes sampled into the empty middle bins
 			generate spurious discordant pairs.
 		"""
@@ -5286,7 +5325,7 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 			rhos = [r.diag[:realized_rho] for r in reps]
 			mean_rho = mean(rhos)
 			dev_d = abs(mean_rho - setup.rho)
-			tolerance_d = 0.04
+			tolerance_d = 0.05  # realized_rho is now raw-centrality tau-b; aligned to gate rho_tol (provisional, confirm on first run)
 			check_d = dev_d < tolerance_d
 			println("  (d) Mean realized_rho matches setup.rho (mean = $(round(mean_rho, digits=4)), target = $(round(setup.rho, digits=4)), dev = $(round(dev_d, digits=4)), tol = $tolerance_d): $(check_d ? "PASS" : "FAIL")")
 
@@ -5695,3 +5734,205 @@ using Network_Credible_Intervals.network_reconstruction: _compute_observed_centr
 		return all_pass
 	end
 	test_replicate_calibration_marvel()  
+
+####################################
+#   CORPUS / GATE COVERAGE TESTS   #
+####################################
+
+#	Test 35: _passes_three_prior_gate unit checks
+	function test_passes_three_prior_gate()
+		"""
+		Notes:
+			Pure, deterministic checks on the acceptance gate, including the
+			generate_replicate/gate consistency we engineered (b).
+		"""
+		println("─" ^ 70)
+		println("Test 35: _passes_three_prior_gate unit checks")
+		println("─" ^ 70)
+
+		fx = _build_corpus_fixture()
+		setup = compute_setup(fx.edges, fx.nodes, fx.community_labels;
+							   directed = true, weighted = true,
+							   pi_node = 0.10, pi_edge = 0.20, rho = 0.10, K = 4)
+		rep = generate_replicate(setup, 7)
+		v = _passes_three_prior_gate(rep, setup; rho_target = setup.rho)
+
+		#	(a) returns the documented fields
+			check_a = all(haskey(v, k) for k in (:pass, :pass_pi_node, :pass_pi_edge,
+												  :pass_rho, :realized_pi_node,
+												  :realized_pi_edge, :realized_rho))
+
+		#	(b) gate's realized_rho matches generate_replicate's diag (consistency)
+			check_b = (isnan(v.realized_rho) && isnan(rep.diag[:realized_rho])) ||
+					  isapprox(v.realized_rho, rep.diag[:realized_rho]; atol = 1e-12)
+
+		#	(c) pi_node prior holds (deterministic; equals setup.pi_node)
+			check_c = v.pass_pi_node
+
+		#	(d) rho band logic: self-target passes, far target fails
+			if isnan(v.realized_rho)
+				check_d = true
+			else
+				pass_self = _passes_three_prior_gate(rep, setup;
+													  rho_target = v.realized_rho,
+													  rho_tol = 1e-6).pass_rho
+				off = v.realized_rho > 0 ? -0.99 : 0.99
+				fail_off = _passes_three_prior_gate(rep, setup;
+													 rho_target = off,
+													 rho_tol = 0.01).pass_rho
+				check_d = pass_self && !fail_off
+			end
+
+		all_pass = check_a && check_b && check_c && check_d
+		println("  (a) returns documented fields:        $(check_a ? "PASS" : "FAIL")")
+		println("  (b) realized_rho matches rep.diag:    $(check_b ? "PASS" : "FAIL")")
+		println("  (c) pi_node prior passes:             $(check_c ? "PASS" : "FAIL")")
+		println("  (d) rho band logic (self vs far):     $(check_d ? "PASS" : "FAIL")")
+		println()
+		println("  Test 35 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+		println()
+		return all_pass
+	end
+	test_passes_three_prior_gate()
+
+#	Test 36: delta round-trip (_extract_reconstruction_delta / materialize_reconstruction)
+	function test_materialize_round_trip()
+		"""
+		Notes:
+			A replicate, stored as a delta and rebuilt, must equal the
+			original augmented network (edges as a canonical weight map,
+			nodes as an id set). Catches any delta-extraction or
+			materialization bug.
+		"""
+		println("─" ^ 70)
+		println("Test 36: delta round-trip (extract -> materialize)")
+		println("─" ^ 70)
+
+		fx = _build_corpus_fixture()
+		setup = compute_setup(fx.edges, fx.nodes, fx.community_labels;
+							   directed = true, weighted = true,
+							   pi_node = 0.10, pi_edge = 0.20, rho = 0.10, K = 4)
+		rep   = generate_replicate(setup, 7)
+		delta = _extract_reconstruction_delta(setup, rep)
+		recon = materialize_reconstruction(setup, delta)
+
+		m_rep = _edge_weight_map(rep.augmented_edges, setup.directed)
+		m_rec = _edge_weight_map(recon.edges, setup.directed)
+
+		check_edges = (keys(m_rep) == keys(m_rec)) &&
+					  all(isapprox(m_rep[k], m_rec[k]; atol = 1e-9) for k in keys(m_rep))
+		check_nodes = Set(string.(recon.nodes.id)) == Set(string.(rep.augmented_nodes.id))
+
+		all_pass = check_edges && check_nodes
+		println("  edges round-trip (canonical weights): $(check_edges ? "PASS" : "FAIL")")
+		println("  nodes round-trip (id set):            $(check_nodes ? "PASS" : "FAIL")")
+		println()
+		println("  Test 36 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+		println()
+		return all_pass
+	end
+	test_materialize_round_trip()
+
+#	Test 37: _aggregate_duplicate_dyads preserves id type (the type-homogeneity fix)
+	function test_aggregate_duplicate_dyads_type()
+		"""
+		Notes:
+			Regression guard for the type-preserving aggregation: String
+			ids stay String, Int ids stay Int (the OLD version coerced to
+			String and would fail the Int branch). Also checks duplicate
+			summation and undirected canonical collapse.
+		"""
+		println("─" ^ 70)
+		println("Test 37: _aggregate_duplicate_dyads type preservation")
+		println("─" ^ 70)
+
+		#	String, directed, duplicate (a,b)
+			e1 = DataFrame(src = ["a","a","b"], dst = ["b","b","c"], weight = [1.0,2.0,3.0])
+			agg1 = _aggregate_duplicate_dyads(e1, true, true)
+			ab = agg1[(agg1.src .== "a") .& (agg1.dst .== "b"), :weight]
+			check_string = (eltype(agg1.src) <: AbstractString) && (nrow(agg1) == 2) &&
+						   (length(ab) == 1) && isapprox(ab[1], 3.0)
+
+		#	Int, undirected, (1,2) and (2,1) collapse
+			e2 = DataFrame(src = [1,2,3], dst = [2,1,4], weight = [1.0,5.0,2.0])
+			agg2 = _aggregate_duplicate_dyads(e2, false, true)
+			ab2 = agg2[(agg2.src .== 1) .& (agg2.dst .== 2), :weight]
+			check_int = (eltype(agg2.src) <: Integer) && (nrow(agg2) == 2) &&
+						(length(ab2) == 1) && isapprox(ab2[1], 6.0)
+
+		all_pass = check_string && check_int
+		println("  String ids preserved + dup summed:    $(check_string ? "PASS" : "FAIL")")
+		println("  Int ids preserved + undirected merge: $(check_int ? "PASS" : "FAIL")")
+		println()
+		println("  Test 37 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+		println()
+		return all_pass
+	end
+	test_aggregate_duplicate_dyads_type()
+
+#	Test 38: build_reconstruction_corpus gate / conditioning / reproducibility
+	function test_build_reconstruction_corpus()
+		"""
+		Notes:
+			Structural + reproducibility checks on the gated corpus builder
+			(explicit K to avoid auto-K failing on a 12-node fixture).
+			Does NOT assert all replicates pass the gate (a small network
+			may force fallbacks); asserts the schema, the conditioning
+			report, and seed reproducibility.
+		"""
+		println("─" ^ 70)
+		println("Test 38: build_reconstruction_corpus (gate / conditioning)")
+		println("─" ^ 70)
+
+		fx = _build_corpus_fixture()
+		metrics = Dict{Symbol, Function}(:n_edges => (e, n) -> Float64(nrow(e)))
+
+		built = build_reconstruction_corpus(fx.edges, fx.nodes, fx.community_labels;
+											 directed = true, weighted = true,
+											 pi_node = 0.10, pi_edge = 0.20, rho = 0.10,
+											 n_replicates = 8, K = 3,
+											 metrics = metrics, seed = 1)
+
+		#	(a) corpus schema
+			cols = Symbol.(names(built.corpus))
+			needed = (:sample_id, :seed, :realized_rho, :realized_pi_node,
+					  :realized_pi_edge, :gate_passed, :n_attempts, :n_edges)
+			check_a = nrow(built.corpus) == 8 && all(c in cols for c in needed)
+
+		#	(b) conditioning report present and coherent
+			check_b = haskey(built, :rho_requested) && haskey(built, :rho_conditioned) &&
+					  haskey(built, :rho_adjusted) && haskey(built, :n_gate_failures) &&
+					  abs(built.rho_conditioned) <= abs(built.rho_requested) + 1e-12
+
+		#	(c) over-extreme rho is clamped (conditioned within the request)
+			built_hi = build_reconstruction_corpus(fx.edges, fx.nodes, fx.community_labels;
+												   directed = true, weighted = true,
+												   pi_node = 0.10, pi_edge = 0.20, rho = 0.99,
+												   n_replicates = 2, K = 3,
+												   metrics = metrics, seed = 1)
+			check_c = abs(built_hi.rho_conditioned) <= abs(built_hi.rho_requested) &&
+					  (built_hi.rho_adjusted == (built_hi.rho_conditioned != built_hi.rho_requested))
+
+		#	(d) reproducibility: same seed -> identical realized columns
+			built2 = build_reconstruction_corpus(fx.edges, fx.nodes, fx.community_labels;
+												 directed = true, weighted = true,
+												 pi_node = 0.10, pi_edge = 0.20, rho = 0.10,
+												 n_replicates = 8, K = 3,
+												 metrics = metrics, seed = 1)
+			check_d = built.corpus.seed == built2.corpus.seed &&
+					  isequal(built.corpus.realized_rho, built2.corpus.realized_rho) &&
+					  built.corpus.n_edges == built2.corpus.n_edges
+
+		all_pass = check_a && check_b && check_c && check_d
+		println("  (a) corpus schema + row count:        $(check_a ? "PASS" : "FAIL")")
+		println("  (b) conditioning report coherent:     $(check_b ? "PASS" : "FAIL")")
+		println("  (c) over-extreme rho clamped:         $(check_c ? "PASS" : "FAIL")")
+		println("  (d) seed reproducibility:             $(check_d ? "PASS" : "FAIL")")
+		println("  (info) gate failures: $(built.n_gate_failures)/$(nrow(built.corpus)) ; " *
+				"rho $(built.rho_requested) -> $(round(built.rho_conditioned, digits=4))")
+		println()
+		println("  Test 38 result: ", all_pass ? "PASS ✓" : "FAIL ✗")
+		println()
+		return all_pass
+	end
+	test_build_reconstruction_corpus()
