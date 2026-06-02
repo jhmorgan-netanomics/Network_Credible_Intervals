@@ -2393,35 +2393,47 @@ module network_reconstruction
 			directed::Bool: whether dyad orientation is meaningful.
 			weighted::Bool: whether to preserve and sum edge weights.
 		Returns:
-			DataFrame: edge list with one row per canonical dyad.
+			DataFrame: edge list with one row per canonical dyad. The :src/:dst
+				endpoint type is PRESERVED from the input (not coerced to String).
 		Notes:
-			Canonicalizes endpoints as strings to match the reconstruction pipeline's
-			internal ID convention. Directed dyads keep orientation. Undirected dyads
-			are sorted so A--B and B--A collapse to the same dyad.
+			Endpoint id type is preserved rather than stringified, so the aggregated
+			edge list stays homogeneous with the node roster's id type. This keeps
+			setup.edges, the augmented roster, the synthetic-node ids, and the
+			Stage-1 edge endpoints all ONE type — the homogeneity the replicate
+			(_stage_*), _extract_reconstruction_delta, and materialize_reconstruction
+			stages depend on (they key parent vs imputed edges by raw endpoint
+			tuples, not stringified ones). Assumes edges.src/.dst and nodes.id share
+			one id type, which holds when both originate from load_graphml (String)
+			per the package convention.
+
+			Directed dyads keep orientation. Undirected dyads are canonicalized so
+			A--B and B--A collapse to one row, putting the smaller id first under the
+			id type's natural order — matching the (s <= d ? (s,d) : (d,s)) canonical
+			key used by _extract_reconstruction_delta and materialize_reconstruction.
 		"""
 
 		#	Guards
 			hasproperty(edges, :src) && hasproperty(edges, :dst) ||
 				throw(ArgumentError("edges must have :src and :dst columns"))
 
-		#	Build working edge table
+		#	Build working edge table (preserve endpoint id type; weights -> Float64)
 			work = DataFrame(
-				src = String.(edges.src),
-				dst = String.(edges.dst),
+				src = copy(edges.src),
+				dst = copy(edges.dst),
 				weight = (weighted && hasproperty(edges, :weight)) ?
 					Float64.(edges.weight) : ones(Float64, nrow(edges))
 			)
 
-		#	Canonicalize undirected endpoints
+		#	Canonicalize undirected endpoints (smaller id first, id type's order)
 			if !directed
-				for i in 1:nrow(work)
+				@inbounds for i in 1:nrow(work)
 					if work.src[i] > work.dst[i]
 						work.src[i], work.dst[i] = work.dst[i], work.src[i]
 					end
 				end
 			end
 
-		#	Aggregate duplicate dyads
+		#	Aggregate duplicate dyads (sum weights within each canonical dyad)
 			agg = combine(groupby(work, [:src, :dst]), :weight => sum => :weight)
 
 		#	Return aggregated edges
@@ -2469,6 +2481,13 @@ module network_reconstruction
 		Notes:
 			Assembly point for the setup phase.
 
+			Edge endpoints (:src, :dst) and the node roster (:id) must share one id
+			type, which is validated up front. Per the package convention (ids flow
+			through load_graphml as String) this is String, but any single id type
+			works: it is preserved through canonicalization, so setup.edges, the
+			augmented roster, the synthetic-node ids, and the imputed edge endpoints
+			all stay one type — the homogeneity the replicate and delta stages rely on.
+
 			Duplicate dyads are canonicalized before setup construction. Directed
 			dyads keep orientation; undirected dyads are endpoint-sorted and
 			aggregated. All downstream quantities are computed from this one-row-per-
@@ -2476,8 +2495,24 @@ module network_reconstruction
 		"""
 
 		#	Guards
+			hasproperty(edges, :src) && hasproperty(edges, :dst) ||
+				throw(ArgumentError("edges must have :src and :dst columns"))
 			hasproperty(nodes, :id) ||
 				throw(ArgumentError("nodes must have :id column"))
+
+			#	Id-Type Homogeneity (edge endpoints must match the roster id type)
+				eltype(edges.src) == eltype(edges.dst) ||
+					throw(ArgumentError(
+						"edges :src and :dst must share an id type, got " *
+						"$(eltype(edges.src)) and $(eltype(edges.dst))"))
+				(eltype(edges.src) <: AbstractString && eltype(nodes.id) <: AbstractString) ||
+				(eltype(edges.src) <: Integer && eltype(nodes.id) <: Integer) ||
+				eltype(edges.src) == eltype(nodes.id) ||
+					throw(ArgumentError(
+						"edge endpoint id type $(eltype(edges.src)) must match node roster " *
+						"id type $(eltype(nodes.id)); both should be String per the package " *
+						"convention (ids arrive via load_graphml)"))
+
 			length(community_labels) == nrow(nodes) ||
 				throw(ArgumentError("community_labels length must equal nrow(nodes)"))
 			0.0 <= pi_node < 1.0 ||
@@ -2691,6 +2726,8 @@ module network_reconstruction
 	**Arguments**
 
 	* `edges`, `nodes`, `community_labels`: observed network and precomputed labels.
+	  Edge endpoints (`:src`, `:dst`) and node ids (`:id`) must share one id type
+	  (see Details).
 	* `directed`, `weighted`: network type.
 	* `pi_node`: target fraction of true nodes believed missing. This is the free
 	  node dial supplied by the user; the realized value may be higher when the
@@ -2706,6 +2743,13 @@ module network_reconstruction
 	  `pi_node = 0`; see Details).
 
 	**Details**
+	Edge endpoints and node ids must share a single id type, validated before
+	canonicalization. By the package convention this is `String` (ids arrive via
+	`load_graphml`), but any one id type is accepted; it is preserved through
+	canonicalization, so the edge list, augmented roster, synthetic-node ids, and
+	imputed edges remain homogeneous — the property the replicate and delta stages
+	depend on.
+
 	Duplicate dyads are canonicalized before any setup quantities are computed.
 	For directed networks, duplicate `(src,dst)` rows are aggregated. For undirected
 	networks, `(A,B)` and `(B,A)` are first collapsed to the same canonical dyad.
@@ -2714,6 +2758,10 @@ module network_reconstruction
 	skips the `find_optimal_K` feasibility search (which is undefined at
 	`target_rate = 0`) and applies the same automatic bin-selection rule directly.
 	Nominations, if present, still impute missing outgoing ties through Stage 0.5.
+	With `pi_node = 0` and no nominations there is no missing set, so a nonzero
+	`rho` cannot be realized: it is recorded as `beta_status = :ceiling_hit` rather
+	than raised, because the feasibility check that would otherwise reject it is
+	skipped on this path.
 
 	Nominated non-respondents imply a minimum achievable missing-node fraction of
 
@@ -3476,9 +3524,20 @@ module network_reconstruction
 		Notes:
 			Steps in order: draw bin assignments; build augmented_nodes; copy edges;
 			run Stage 0.5 (if N_nom > 0); run Stage 1; run Stage 2 (if weighted and
-			additional_weight > 0); record realized Kendall tau_b and per-stage
-			diagnostics. Realized rho is measured over the full augmented roster with
-			the missing set = nominated + added (the locked rho convention).
+			additional_weight > 0); record realized rho and per-stage diagnostics.
+
+			Realized rho is the AUTHORITATIVE metric, identical to the one
+			_passes_three_prior_gate scores: binarized in-degree (directed) or degree
+			(undirected) recomputed on the augmented edges via
+			_compute_observed_centrality, correlated (Kendall tau-b) with the missing
+			indicator (present = respondents; missing = nominated + added) over the
+			full augmented roster. It is measured on the post-reconstruction field —
+			the field the act of reconstruction has shifted — NOT the solver's
+			bin-index target. Because the basis is binarized, Stage 2's weight
+			redistribution does not affect it. NaN when the missing set is
+			empty/complete or the augmented centrality is constant. Computing it the
+			same way the gate does keeps rep.diag[:realized_rho] consistent with the
+			gate's verdict for this replicate.
 		"""
 
 		#	Initialize RNG
@@ -3523,15 +3582,24 @@ module network_reconstruction
 				stage_2_weight_added = _stage_2!(setup, augmented_edges, augmented_nodes, rng)
 			end
 
-		#	Step 9: Realized Kendall tau_b — missing (nominated + added) vs degree bin
-			#	Full augmented roster (= true network): present = respondents,
-			#	missing = nominated + added, matching the locked rho convention.
+		#	Step 9: Realized Kendall tau_b — missing (nominated + added) vs RAW augmented centrality
+			#	Authoritative metric, matching _passes_three_prior_gate: binarized
+			#	in-degree (directed) or degree (undirected) recomputed on the
+			#	augmented edges, correlated with the missing indicator over the full
+			#	augmented roster. Binarized, so Stage 2 weights do not affect it.
 				node_type = augmented_nodes.node_type
 				is_missing = (node_type .== :nominated) .| (node_type .== :added)
 				n_missing = count(is_missing)
-				realized_rho = (n_missing == 0 || n_missing == length(is_missing)) ?
-					NaN :
-					corkendall(Float64.(is_missing), Float64.(augmented_nodes.degree_bin))
+				n_total = length(is_missing)
+				realized_rho = NaN
+				if 0 < n_missing < n_total
+					aug_centrality = _compute_observed_centrality(augmented_edges,
+																   augmented_nodes,
+																   setup.directed)
+					if !all(==(aug_centrality[1]), aug_centrality)
+						realized_rho = corkendall(Float64.(is_missing), aug_centrality)
+					end
+				end
 
 		#	Assemble Diagnostics
 			diag = Dict{Symbol, Any}(
@@ -3899,7 +3967,95 @@ module network_reconstruction
 	`build_reconstruction_corpus`, `_extract_reconstruction_delta`, `reconstruct_network`
 	""" materialize_reconstruction
 
-#	build_reconstruction_corpus: draw a replicable sample of reconstructed networks (stored as deltas)
+#	Helper Function for build_reconstruction_corpus: 3-prior acceptance gate
+	function _passes_three_prior_gate(rep::Replicate,
+									   setup::SamplerSetup;
+									   rho_target::Float64,
+									   rho_tol::Float64 = 0.05,
+									   pi_edge_tol::Float64 = 0.02,
+									   pi_node_tol::Float64 = 1e-9)
+		"""
+		Args:
+			rep::Replicate: a materialized replicate from generate_replicate, after
+				all operations (Stage 0.5, Stage 1, Stage 2). augmented_edges /
+				augmented_nodes are the full network.
+			setup::SamplerSetup: supplies the conditioning targets (setup.pi_node,
+				setup.pi_edge — both realized/floored), W_observed, and directedness.
+			rho_target::Float64: the rho the sample is conditioned on (requested rho
+				after adjustment to the achievable envelope). The gate only checks
+				against it; build_reconstruction_corpus owns the adjustment.
+			rho_tol, pi_edge_tol, pi_node_tol::Float64: acceptance half-widths — the
+				realization-granularity bands that define "consistent with the prior"
+				on a finite network, NOT free tuning knobs.
+		Returns:
+			NamedTuple (pass, pass_pi_node, pass_pi_edge, pass_rho,
+						realized_pi_node, realized_pi_edge, realized_rho). realized_rho
+				is raw-centrality tau-b, NaN when the missing set is empty/complete or
+				centrality is constant.
+		Notes:
+			The end-of-pipeline acceptance gate, scored on the materialized network.
+			PURE (no RNG, no regeneration) so it is unit-testable in isolation and
+			reusable by the corpus builder's reject-and-regenerate loop.
+
+			rho is the authoritative metric: binarized in-degree (directed) or degree
+			(undirected) recomputed on the augmented edges via
+			_compute_observed_centrality, then corkendall against the missing
+			indicator (present = :observed; missing = :nominated | :added) over the
+			full augmented roster. This is the realized rho on the post-reconstruction
+			field — the field the act of reconstruction shifted — not the solver's
+			bin-index target.
+
+			pi_node is deterministic (N_add fixed at setup) so it equals setup.pi_node
+			every replicate; a failure signals a setup-level inconsistency, not
+			something regeneration can fix. pi_edge varies per replicate with the
+			realized imputed-tie counts, hence a band rather than equality.
+		"""
+
+		#	Full Augmented Network
+			aug_edges = rep.augmented_edges
+			aug_nodes = rep.augmented_nodes
+			n = nrow(aug_nodes)
+
+		#	Prior 1: Realized Node-Missingness Fraction
+			node_type = aug_nodes.node_type
+			is_missing = (node_type .== :nominated) .| (node_type .== :added)
+			n_missing = count(is_missing)
+			realized_pi_node = n > 0 ? n_missing / n : 0.0
+			pass_pi_node = abs(realized_pi_node - setup.pi_node) <= pi_node_tol
+
+		#	Prior 2: Realized Weight-Missingness Fraction
+			total_weight = hasproperty(aug_edges, :weight) ?
+				sum(Float64.(aug_edges.weight)) : Float64(nrow(aug_edges))
+			realized_pi_edge = total_weight > 0 ?
+				(total_weight - setup.W_observed) / total_weight : 0.0
+			pass_pi_edge = abs(realized_pi_edge - setup.pi_edge) <= pi_edge_tol
+
+		#	Prior 3: Realized Centrality-Missingness Correlation (raw, augmented)
+			realized_rho = NaN
+			if 0 < n_missing < n
+				centrality = _compute_observed_centrality(aug_edges, aug_nodes, setup.directed)
+				if !all(==(centrality[1]), centrality)
+					realized_rho = corkendall(Float64.(is_missing), centrality)
+				end
+			end
+			pass_rho = isnan(realized_rho) ?
+				(abs(rho_target) <= rho_tol) :
+				(abs(realized_rho - rho_target) <= rho_tol)
+
+		#	Overall Verdict
+			pass = pass_pi_node && pass_pi_edge && pass_rho
+
+		#	Return
+			return (pass = pass,
+					pass_pi_node = pass_pi_node,
+					pass_pi_edge = pass_pi_edge,
+					pass_rho = pass_rho,
+					realized_pi_node = realized_pi_node,
+					realized_pi_edge = realized_pi_edge,
+					realized_rho = realized_rho)
+	end
+
+#	build_reconstruction_corpus: draw a gated, replicable sample of reconstructed networks
 	function build_reconstruction_corpus(edges::DataFrame,
 										  nodes::DataFrame,
 										  community_labels::Vector{Int};
@@ -3913,57 +4069,94 @@ module network_reconstruction
 										  partially_observed_nodes::Vector{Int} = Int[],
 										  seed::Integer = 1,
 										  metrics::Dict{Symbol, <:Function} = Dict{Symbol, Function}(),
+										  rho_tol::Float64 = 0.05,
+										  pi_edge_tol::Float64 = 0.02,
+										  max_attempts::Int = 50,
+										  feasibility_n_mc::Int = 20,
 										  verbose::Bool = false)
 		"""
 		Args:
 			edges, nodes, community_labels: observed-network inputs.
-			directed, weighted, pi_node, pi_edge, rho: priors (pi_edge floored by
-				compute_setup).
-			n_replicates::Int: number of reconstructed samples to draw.
+			directed, weighted, pi_node, pi_edge, rho: priors. rho is adjusted to the
+				achievable envelope; the adjusted value is the conditioning prior.
+			n_replicates::Int: number of accepted samples to draw.
 			K, partially_observed_nodes, seed: as in reconstruct_network.
-			metrics::Dict{Symbol,Function}: OPTIONAL measures, each
-				metric(augmented_edges, augmented_nodes) -> Real, evaluated on each
-				sample and stored as a column. Empty => store deltas only.
+			metrics::Dict{Symbol,Function}: OPTIONAL measures on each accepted sample.
+			rho_tol, pi_edge_tol::Float64: 3-prior gate acceptance half-widths.
+			max_attempts::Int: regeneration cap per replicate before fallback.
+			feasibility_n_mc::Int: MC draws for the rho feasibility screen.
 			verbose::Bool: progress printing.
 		Returns:
-			NamedTuple: corpus::DataFrame (one row per sample), setup::SamplerSetup
-				(carries the parent needed to materialize any sample),
-				weight_accounting::NamedTuple, n_replicates, seed.
+			NamedTuple: corpus::DataFrame (one accepted sample per row), setup,
+				weight_accounting, rho_requested, rho_conditioned, rho_adjusted::Bool,
+				n_gate_failures::Int, n_replicates, seed.
 		Notes:
-			Draws the sample of reconstructed networks and stores each as a DELTA
-			against the shared parent (setup.edges/nodes), mirroring how the
-			degeneration corpus stores missing_nodes rather than whole networks. A
-			sample is replicated exactly as:
-				parent edges (observed weights)
-				UNION structural edges (imputed ego edges, at the weight-1 floor)
-				then += the weight-delta increments (Stage 2, parent and ego alike).
-			setup + a corpus row reproduces the identical reconstructed network; the
-			per-replicate seed is recorded for provenance.
+			Draws a sample of reconstructed networks, each accepted only if it passes
+			the end-of-pipeline 3-prior gate (_passes_three_prior_gate) on the
+			materialized network. Because the credible interval is conditional on the
+			priors actually enforced, an over-extreme rho is first clamped into the
+			feasible envelope (feasible_rho_range) and the conditioned value recorded;
+			the clamp also keeps compute_setup from throwing :rho_infeasible.
 
-			compute_setup runs once; replicate r is drawn by generate_replicate at
-			seed hash((seed, r)). Supplied metrics are evaluated on the full augmented
-			network in the same pass and appended as columns (reconstruct, measure,
-			store), but the deltas are always stored so the sample can be re-measured
-			later without re-drawing.
+			Per replicate, generate_replicate is retried with attempt-indexed seeds
+			until the gate passes or max_attempts is hit; on exhaustion the closest
+			draw (by rho deviation) is accepted with gate_passed = false. Each accepted
+			sample is stored as a DELTA against the shared parent (as before), so any
+			row reconstructs exactly via materialize_reconstruction.
 
 			Corpus columns: sample_id, seed, added_node_ids, struct_src, struct_dst,
-			wd_src, wd_dst, wd_add, realized_rho, n_stage_0_5_edges, n_stage_1_edges,
-			stage_2_weight_added, n_added, plus one column per metric.
+			wd_src, wd_dst, wd_add, realized_rho (raw, augmented), realized_pi_node,
+			realized_pi_edge, gate_passed, n_attempts, n_stage_0_5_edges,
+			n_stage_1_edges, stage_2_weight_added, n_added, plus one column per metric.
 		"""
 
 		#	Guards
 			n_replicates >= 1 ||
 				throw(ArgumentError("n_replicates must be >= 1, got $n_replicates"))
+			max_attempts >= 1 ||
+				throw(ArgumentError("max_attempts must be >= 1, got $max_attempts"))
 
-		#	Setup Phase: Once
-			setup = compute_setup(edges, nodes, community_labels;
+		#	Canonicalize Edges Once (shared by the feasibility screen and setup)
+			agg_edges = _aggregate_duplicate_dyads(edges, directed, weighted)
+
+		#	Realized Node-Missingness Rate (the rate the feasibility screen uses)
+			N_obs = nrow(nodes) - length(partially_observed_nodes)
+			N_nom = length(partially_observed_nodes)
+			N_add = _determine_n_add(pi_node, N_obs, N_nom)
+			realized_total = N_obs + N_nom + N_add
+			realized_pi_node = realized_total > 0 ? (N_nom + N_add) / realized_total : 0.0
+
+		#	Adjust rho to the Achievable Envelope (the conditioning prior)
+			#	The interval is conditional on the prior actually enforced, so an
+			#	over-extreme rho is clamped into the feasible range and recorded.
+			#	(Envelope is the observed-only screen; residual gap vs the augmented
+			#	metric is absorbed by the gate fallback. Swap this block for a
+			#	pilot-batch ceiling for exact augmented-space conditioning.)
+				rho_conditioned = rho
+				if realized_pi_node > 0.0
+					feas = feasible_rho_range(agg_edges, nodes;
+											  directed = directed, weighted = weighted,
+											  target_rate = realized_pi_node,
+											  n_mc_replicates = feasibility_n_mc,
+											  seed = seed)
+					rho_conditioned = clamp(rho, feas.rho_min, feas.rho_max)
+				end
+				rho_adjusted = rho_conditioned != rho
+				if verbose && rho_adjusted
+					println("build_reconstruction_corpus: requested rho = $rho is outside " *
+							"the achievable envelope; conditioning on rho = " *
+							"$(round(rho_conditioned, digits=4)).")
+				end
+
+		#	Setup Phase: Once (rho pre-clamped, so compute_setup won't throw)
+			setup = compute_setup(agg_edges, nodes, community_labels;
 								   directed = directed, weighted = weighted,
-								   pi_node = pi_node, rho = rho, pi_edge = pi_edge,
+								   pi_node = pi_node, rho = rho_conditioned, pi_edge = pi_edge,
 								   partially_observed_nodes = partially_observed_nodes,
 								   K = K, verbose = verbose)
 
 		#	Pre-Allocate Per-Sample Columns
-			id_t = eltype(edges.src)
+			id_t = eltype(agg_edges.src)
 			metric_names = collect(keys(metrics))
 			sample_id        = collect(1:n_replicates)
 			seed_col         = Vector{Int}(undef, n_replicates)
@@ -3974,6 +4167,10 @@ module network_reconstruction
 			wd_dst_col       = Vector{Vector{id_t}}(undef, n_replicates)
 			wd_add_col       = Vector{Vector{Float64}}(undef, n_replicates)
 			realized_rho_col = Vector{Float64}(undef, n_replicates)
+			realized_pin_col = Vector{Float64}(undef, n_replicates)
+			realized_pie_col = Vector{Float64}(undef, n_replicates)
+			gate_pass_col    = Vector{Bool}(undef, n_replicates)
+			n_attempts_col   = Vector{Int}(undef, n_replicates)
 			n05_col          = Vector{Int}(undef, n_replicates)
 			n1_col           = Vector{Int}(undef, n_replicates)
 			s2w_col          = Vector{Int}(undef, n_replicates)
@@ -3981,28 +4178,74 @@ module network_reconstruction
 			metric_cols      = Dict{Symbol, Vector{Float64}}(
 				name => Vector{Float64}(undef, n_replicates) for name in metric_names)
 
-		#	Draw, Measure, and Store Each Sample
+		#	Draw, Gate, and Store Each Sample
 			for r in 1:n_replicates
-				rep_seed = Int(hash((seed, r)) % UInt32)
-				rep = generate_replicate(setup, rep_seed)
-				delta = _extract_reconstruction_delta(setup, rep)
+				#	Reject-and-Regenerate Against the 3-Prior Gate
+					accepted_rep = nothing
+					accepted_seed = 0
+					accepted_verdict = nothing
+					best_rep = nothing
+					best_seed = 0
+					best_verdict = nothing
+					best_dev = Inf
+					attempt = 0
+					while attempt < max_attempts
+						attempt += 1
+						rep_seed = Int(hash((seed, r, attempt)) % UInt32)
+						rep = generate_replicate(setup, rep_seed)
+						verdict = _passes_three_prior_gate(rep, setup;
+														   rho_target = rho_conditioned,
+														   rho_tol = rho_tol,
+														   pi_edge_tol = pi_edge_tol)
+						#	Track the closest draw for the fallback (by rho deviation)
+							dev = isnan(verdict.realized_rho) ?
+								abs(rho_conditioned) : abs(verdict.realized_rho - rho_conditioned)
+							if dev < best_dev
+								best_dev = dev
+								best_rep = rep
+								best_seed = rep_seed
+								best_verdict = verdict
+							end
+						if verdict.pass
+							accepted_rep = rep
+							accepted_seed = rep_seed
+							accepted_verdict = verdict
+							break
+						end
+					end
 
-				seed_col[r]         = rep_seed
-				added_ids_col[r]    = delta.added_node_ids
-				struct_src_col[r]   = delta.struct_src
-				struct_dst_col[r]   = delta.struct_dst
-				wd_src_col[r]       = delta.wd_src
-				wd_dst_col[r]       = delta.wd_dst
-				wd_add_col[r]       = delta.wd_add
-				realized_rho_col[r] = rep.diag[:realized_rho]
-				n05_col[r]          = rep.diag[:n_stage_0_5_edges]
-				n1_col[r]           = rep.diag[:n_stage_1_edges]
-				s2w_col[r]          = rep.diag[:stage_2_weight_added]
-				nadd_col[r]         = length(delta.added_node_ids)
+				#	Accept the Passing Draw, or Fall Back to the Closest
+					if accepted_rep === nothing
+						rep = best_rep; rep_seed = best_seed
+						verdict = best_verdict; gate_passed = false
+					else
+						rep = accepted_rep; rep_seed = accepted_seed
+						verdict = accepted_verdict; gate_passed = true
+					end
 
-				for name in metric_names
-					metric_cols[name][r] = Float64(metrics[name](rep.augmented_edges, rep.augmented_nodes))
-				end
+				#	Store the Delta, Realized Priors, and Acceptance Diagnostics
+					delta = _extract_reconstruction_delta(setup, rep)
+					seed_col[r]         = rep_seed
+					added_ids_col[r]    = delta.added_node_ids
+					struct_src_col[r]   = delta.struct_src
+					struct_dst_col[r]   = delta.struct_dst
+					wd_src_col[r]       = delta.wd_src
+					wd_dst_col[r]       = delta.wd_dst
+					wd_add_col[r]       = delta.wd_add
+					realized_rho_col[r] = verdict.realized_rho
+					realized_pin_col[r] = verdict.realized_pi_node
+					realized_pie_col[r] = verdict.realized_pi_edge
+					gate_pass_col[r]    = gate_passed
+					n_attempts_col[r]   = attempt
+					n05_col[r]          = rep.diag[:n_stage_0_5_edges]
+					n1_col[r]           = rep.diag[:n_stage_1_edges]
+					s2w_col[r]          = rep.diag[:stage_2_weight_added]
+					nadd_col[r]         = length(delta.added_node_ids)
+
+				#	Evaluate Metrics on the Accepted Network
+					for name in metric_names
+						metric_cols[name][r] = Float64(metrics[name](rep.augmented_edges, rep.augmented_nodes))
+					end
 
 				if verbose && (r % max(1, n_replicates ÷ 10) == 0)
 					println("  ... $r / $n_replicates samples")
@@ -4020,6 +4263,10 @@ module network_reconstruction
 				wd_dst               = wd_dst_col,
 				wd_add               = wd_add_col,
 				realized_rho         = realized_rho_col,
+				realized_pi_node     = realized_pin_col,
+				realized_pi_edge     = realized_pie_col,
+				gate_passed          = gate_pass_col,
+				n_attempts           = n_attempts_col,
 				n_stage_0_5_edges    = n05_col,
 				n_stage_1_edges      = n1_col,
 				stage_2_weight_added = s2w_col,
@@ -4044,34 +4291,87 @@ module network_reconstruction
 			return (corpus            = corpus,
 					setup             = setup,
 					weight_accounting = weight_accounting,
+					rho_requested     = rho,
+					rho_conditioned   = rho_conditioned,
+					rho_adjusted      = rho_adjusted,
+					n_gate_failures   = count(!, gate_pass_col),
 					n_replicates      = n_replicates,
 					seed              = seed)
 	end
 	@doc raw"""
-	**Description**
-	Draw a replicable sample of reconstructed networks for one observed network and
-	prior, stored as per-sample DELTAS against the shared parent. Each row holds the
-	structural delta (synthetic nodes + imputed ego edges at the weight-1 floor) and
-	the weight delta (Stage 2 per-edge increments), so any sample reconstructs
-	exactly as `parent ∪ structural-edges` then `+= increments`. Optionally evaluates
-	measures on each sample in the same pass.
+		**Description**
+		Draw a replicable, gated sample of reconstructed networks for one observed
+		network and prior. Each sample is materialized by `generate_replicate` and
+		accepted only if it passes the end-of-pipeline 3-prior gate
+		(`_passes_three_prior_gate`) on the full augmented network — realized
+		$\pi_{\text{node}}$, $\pi_{\text{edge}}$, and $\rho$ within tolerance of the
+		conditioning targets. Accepted samples are stored as per-sample DELTAS against
+		the shared parent, so any row reconstructs exactly via
+		`materialize_reconstruction`. Measures may be evaluated on each accepted sample
+		in the same pass.
 
-	**Usage**
-	`build_reconstruction_corpus(edges, nodes, community_labels; directed, weighted, pi_node, pi_edge, rho, n_replicates=1000, metrics=Dict(), ...)`
+		**Usage**
+		`build_reconstruction_corpus(edges, nodes, community_labels; directed, weighted, pi_node, pi_edge, rho, n_replicates=1000, K=:auto, metrics=Dict(), rho_tol=0.05, pi_edge_tol=0.02, max_attempts=50, ...)`
 
-	**Value**
-	NamedTuple: `corpus` (one row per sample, columns above), the shared `setup`
-	(carrying the parent), `weight_accounting`, `n_replicates`, `seed`.
+		**Arguments**
+		- `edges`, `nodes`, `community_labels`: observed network and precomputed labels.
+		- `directed`, `weighted`: network type.
+		- `pi_node`, `pi_edge`, `rho`: the priors. `pi_edge` is floored by `compute_setup`;
+		`rho` is clamped to the achievable envelope before setup (see Details), and the
+		clamped value is the prior the corpus is conditioned on.
+		- `n_replicates::Int`: number of ACCEPTED samples to draw.
+		- `K`, `partially_observed_nodes`, `seed`: as in `reconstruct_network`.
+		- `metrics::Dict{Symbol,Function}`: optional measures, each
+		`metric(augmented_edges, augmented_nodes) -> Real`, evaluated on each accepted
+		sample and stored as a column. Empty stores deltas only.
+		- `rho_tol`, `pi_edge_tol::Float64`: 3-prior gate acceptance half-widths — the
+		realization-granularity bands that define "consistent with the prior" on a
+		finite network. `pi_node` is deterministic and checked at machine tolerance.
+		- `max_attempts::Int`: per-replicate regeneration cap before the fallback fires.
+		- `feasibility_n_mc::Int`: MC draws for the up-front $\rho$ feasibility screen.
+		- `verbose::Bool`: progress and adjustment printing.
 
-	**Details**
-	`compute_setup` runs once; sample `r` is `generate_replicate(setup, hash((seed, r)))`.
-	The delta storage mirrors the degeneration corpus (which stores `missing_nodes`,
-	not whole networks). Deltas are always stored even when metrics are supplied, so
-	the held sample can be re-measured without re-drawing.
+		**Details**
+		Because a credible interval is conditional on the prior actually enforced, an
+		over-extreme `rho` is first clamped into the feasible envelope returned by
+		`feasible_rho_range` at the realized node-missingness rate, and the conditioned
+		value is recorded. The clamp also keeps `compute_setup` from throwing
+		`:rho_infeasible`. `compute_setup` then runs once on the conditioned `rho`.
 
-	**See Also**
-	`generate_replicate`, `reconstruct_network`, `compute_setup`, `_extract_reconstruction_delta`
-	""" build_reconstruction_corpus
+		Sample `r` is drawn by retrying `generate_replicate` with attempt-indexed seeds
+		`hash((seed, r, attempt))` until the gate passes or `max_attempts` is reached.
+		On exhaustion the closest draw (by $\rho$ deviation) is accepted with
+		`gate_passed = false`. The gate scores $\rho$ as raw-centrality $\tau_b$
+		(binarized in-degree directed / degree undirected, recomputed on the augmented
+		edges) against the missing indicator over the full augmented roster; $\pi_{\text{edge}}$
+		as $(\sum w_{\text{aug}} - W_{\text{observed}}) / \sum w_{\text{aug}}$ against
+		`setup.pi_edge`; and $\pi_{\text{node}}$ as the missing fraction against
+		`setup.pi_node`.
+
+		Deltas are always stored even when metrics are supplied, so the held sample can
+		be re-measured without re-drawing. The run is reproducible in `seed`, and any
+		single sample regenerates in isolation via `materialize_reconstruction`.
+
+		**Value**
+		NamedTuple:
+		- `corpus::DataFrame`: one accepted sample per row. Columns: `sample_id`, `seed`
+		(accepted attempt's seed), `added_node_ids`, `struct_src`, `struct_dst`,
+		`wd_src`, `wd_dst`, `wd_add`, `realized_rho` (raw-centrality $\tau_b$ on the
+		augmented network), `realized_pi_node`, `realized_pi_edge`, `gate_passed`,
+		`n_attempts`, `n_stage_0_5_edges`, `n_stage_1_edges`, `stage_2_weight_added`,
+		`n_added`, plus one column per metric.
+		- `setup::SamplerSetup`: the shared setup (carries the parent for materialization).
+		- `weight_accounting::NamedTuple`: the floored-$\pi_{\text{edge}}$ decomposition.
+		- `rho_requested::Float64`, `rho_conditioned::Float64`, `rho_adjusted::Bool`: the
+		requested $\rho$, the value conditioned on after clamping, and whether clamping
+		occurred.
+		- `n_gate_failures::Int`: accepted-by-fallback count (`gate_passed == false`).
+		- `n_replicates::Int`, `seed::Integer`: echoed.
+
+		**See Also**
+		`_passes_three_prior_gate`, `generate_replicate`, `reconstruct_network`,
+		`compute_setup`, `feasible_rho_range`, `materialize_reconstruction`
+		""" build_reconstruction_corpus
 
 #	Exports (public API)
 	export SamplerSetup,

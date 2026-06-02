@@ -80,13 +80,15 @@ module Network_Credible_Intervals
            tau_statistic,
            structural_equivalence_blockmodel,
            generate_missingness_mask,
-           apply_missingness,
+           apply_weight_removal,
            build_degeneration_corpus,
            SamplerSetup,
-		   build_community_corpus,
+		   Replicate,
 		   compute_setup,
-           feasible_rho_range,
-           Replicate,
-           generate_replicate
+		   feasible_rho_range,
+		   generate_replicate,
+		   reconstruct_network,
+		   materialize_reconstruction,
+		   build_reconstruction_corpus
 
 end # module Network_Credible_Intervals

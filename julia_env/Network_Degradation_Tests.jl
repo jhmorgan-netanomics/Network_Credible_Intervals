@@ -26,9 +26,9 @@ using Statistics
 using StatsBase
 using Network_Credible_Intervals
 using Network_Credible_Intervals.network_community_detection: _edgelist_to_sparse_matrix,
-                                                                  _graph_to_sparse_matrix,
-                                                                  _aggregate_multi_edges,
-                                                                  _is_symmetric
+                                                              _graph_to_sparse_matrix,
+                                                              _aggregate_multi_edges,
+                                                              _is_symmetric
 
 #################
 #   FUNCTIONS   #
