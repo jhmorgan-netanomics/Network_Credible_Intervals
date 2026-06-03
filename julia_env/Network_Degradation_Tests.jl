@@ -1777,3 +1777,77 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 				details = "ei=$(round(gate_t.ei_tvd,digits=3)) gated_t=$gated recorded_e=$recorded same=$same_score")
 	end
     test_emergent_broker_recorded()
+
+#	Net-agnostic emergent contract check (run on any corpus network)
+	function run_emergent_checks(net::NamedTuple; comm = nothing, label::AbstractString = "",
+								  n_reps::Int = 30, master_seed::Integer = 71,
+								  pi_edge_grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+		"""
+		Returns:
+			NamedTuple (passed::Bool, details::String)
+		Notes:
+			Validates the :emergent contract on a real corpus network (no hand-built
+			brokers): (a) pi_node is a tilt knob, not a target — at pi_edge=0 :emergent
+			induces no loss while :targeted tops up; (b) across a pi_edge sweep the
+			missing set IS the organic edge-induced loss set, the proportion/survivor
+			counts follow, and the gate is record-only (contract_passed, retry_count==0).
+			Prints the emergent node-loss curve. comm defaults to
+			_true_communities(binary adjacency) when not supplied. On unweighted corpus
+			nets the curve is all zeros — binary edge removal is the deferred step 2.
+		"""
+		ndg  = Network_Credible_Intervals.network_degeneracy
+		adjb = _graph_to_sparse_matrix(net.edges; nodes = net.nodes, weighted = false)[1]
+		N    = size(adjb, 1)
+		isnothing(comm) && (comm = ndg._true_communities(adjb))
+		name = isempty(label) ? string(get(net.metadata, :name, "network")) : label
+
+		println("─" ^ 70)
+		println("Emergent contract on $name  (N=$N)")
+		println("─" ^ 70)
+
+		#	(a) pi_node is a tilt knob, not a target
+			em0 = _draw_replicates(net; target_pi_node = 0.30, target_rho = 0.0, target_pi_edge = 0.0,
+									   n_reps = n_reps, master_seed = master_seed,
+									   node_loss = :emergent, true_community = comm)
+			tg0 = _draw_replicates(net; target_pi_node = 0.30, target_rho = 0.0, target_pi_edge = 0.0,
+									   n_reps = n_reps, master_seed = master_seed,
+									   node_loss = :targeted, true_community = comm)
+			tilt_knob = all(length(r.missing_nodes) == 0 for r in em0) &&
+						all(r.realized_pi_node > 0 for r in tg0)
+
+		#	(b) identity + invariants across a pi_edge sweep
+			identity = true; consist = true; record = true
+			loss_curve = Tuple{Float64,Int,Int}[]
+			for pe in pi_edge_grid
+				recs = _draw_replicates(net; target_pi_node = 0.10, target_rho = 0.0, target_pi_edge = pe,
+										   n_reps = n_reps, master_seed = master_seed + round(Int, 100pe),
+										   node_loss = :emergent, true_community = comm)
+				identity &= all(length(r.missing_nodes) == r.n_organic_losses for r in recs)
+				consist  &= all(r.realized_pi_node == r.n_organic_losses / N for r in recs) &&
+							all(r.sampler_degeneracy.n_observed == N - r.n_organic_losses for r in recs)
+				record   &= all(r.contract_passed for r in recs) && all(r.retry_count == 0 for r in recs)
+				losses = [r.n_organic_losses for r in recs]
+				push!(loss_curve, (pe, minimum(losses), maximum(losses)))
+			end
+
+		println("  (a) pi_node tilt-not-target:  $(tilt_knob ? "YES" : "NO")")
+		println("  (b) missing == organic:       $(identity ? "YES" : "NO")")
+		println("      proportion/survivors ok:  $(consist ? "YES" : "NO")")
+		println("      record-only (pass, 0):    $(record ? "YES" : "NO")")
+		println("  Emergent node-loss curve (pi_edge: min–max losses over $n_reps reps):")
+		for (pe, lo, hi) in loss_curve
+			println("      pi_edge=$pe :  $lo – $hi")
+		end
+
+		passed = tilt_knob && identity && consist && record
+		println("  Result:                       $(passed ? "PASS ✓" : "FAIL ✗")")
+		return (passed = passed,
+				details = "tilt=$tilt_knob ident=$identity consist=$consist rec=$record")
+	end
+	run_emergent_checks(networks["synthetic_1_sbm_undirected_weighted"]; label = "sbm_undirected_weighted")
+	run_emergent_checks(networks["synthetic_1_sbm_directed_weighted"];   label = "sbm_directed_weighted")
+
+	run_emergent_checks(networks["scotland_interlock_weighted"]; label = "scotland_interlock_weighted")
+	run_emergent_checks(networks["scotland_interlock_unweighted"];   label = "scotland_interlock_weighted")
+
+#	Come Back Here!!!
