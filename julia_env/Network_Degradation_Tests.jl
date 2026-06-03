@@ -134,6 +134,7 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 								n_reps::Int,
 								master_seed::Integer = 1,
 								weighted::Bool = get(net.metadata, :weighted, false),
+								node_loss::Symbol = :targeted,
 								true_community::Union{Nothing,AbstractVector{<:Integer}} = nothing)
 		"""
 		Args:
@@ -147,6 +148,13 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 			weighted::Bool: whether the edge-degradation stage runs; defaults to
 				the network's :weighted metadata (false for the constructed
 				star/ring fixtures, which omit that field)
+			node_loss::Symbol: node-accounting mode threaded to the mask. Defaults
+				to :targeted because this harness drives the LEGACY top-up tests:
+				the missing set is padded up to target_pi_node and priors 1
+				(realized_pi_node) and 2 (realized_rho) GATE — the original
+				behavior, reproduced bit-for-bit. Pass :emergent for the new tests,
+				where the missing set is only the edge-induced organic losses, no
+				top-up runs, and priors 1 and 2 become record-only.
 			true_community::Union{Nothing,AbstractVector{<:Integer}}: optional
 				ground-truth community labels. When supplied, the mask's prior-3
 				survivor-profile check is active; when nothing (the default), the
@@ -162,12 +170,16 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 			the n_reps calls, mirroring the build_degeneration_corpus orchestrator.
 			Per-replicate seeds are derived via hash((target_rho, target_pi_node,
 			target_pi_edge, rep, master_seed)) so identical inputs reproduce
-			identical records (the determinism contract).
+			identical records (the determinism contract). node_loss is deliberately
+			NOT in the seed hash: :targeted and :emergent share the same edge-seed
+			stream for a given cell, so the edge degradation is identical and only
+			the node accounting differs between modes.
 
 			This is the unified-pipeline harness: it drives the two-dial mask
 			(pi_node + pi_edge under one rho). It does NOT pass a mechanism — full
 			removal vs nomination is composed per node inside the mask.
 		"""
+		(node_loss in (:emergent, :targeted)) || throw(ArgumentError("node_loss must be :emergent or :targeted, got $node_loss"))
 		directed = net.metadata.directed
 
 		#	Cache per-network artifacts once
@@ -186,6 +198,7 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 					nodes          = net.nodes,
 					directed       = directed,
 					weighted       = weighted,
+					node_loss      = node_loss,
 					target_pi_node = target_pi_node,
 					target_pi_edge = target_pi_edge,
 					target_rho     = target_rho,
@@ -196,6 +209,86 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 					adj_weighted   = adj_weighted)
 			end
 		return records
+	end
+
+#	Synthetic weighted two-community fixture: two weighted 8-cliques + 2 cross-community brokers
+	function _synth_two_clique_weighted()
+		"""
+		Returns:
+			NamedTuple (net, comm, node_ids) where net = (edges, nodes, metadata)
+			in corpus format (weighted, undirected) and comm is the per-node TRUE
+			community label vector (canonical node order).
+		Notes:
+			Two K8 cliques (comm 1 = a1..a8, comm 2 = b1..b8) wired internally with
+			weight-2 ties; two BROKERS (k1, k2, nominally comm 1) each tie to all 16
+			clique nodes with weight-1 cross-community edges. Every node carries
+			incident weight 16 (clique: 7*2 + 2*1; broker: 16*1), so a moderate
+			diffuse edge budget cannot orphan anyone — the no-loss corner. Brokers
+			are the highest-degree nodes and externally-tied, so the true profile's
+			top degree-rank bin is broker-dominated: stripping them bends the E/I
+			curve (used by the later broker-distortion test). Shared by all four
+			emergent tests.
+		"""
+		c1 = ["a$i" for i in 1:8]
+		c2 = ["b$i" for i in 1:8]
+		brokers = ["k1", "k2"]
+		src = String[]; dst = String[]; w = Int[]
+		for grp in (c1, c2)                         # internal clique ties, weight 2
+			for i in 1:length(grp), j in (i+1):length(grp)
+				push!(src, grp[i]); push!(dst, grp[j]); push!(w, 2)
+			end
+		end
+		for k in brokers                            # broker bridges, weight 1
+			for v in vcat(c1, c2)
+				push!(src, k); push!(dst, v); push!(w, 1)
+			end
+		end
+		node_ids = vcat(c1, c2, brokers)
+		nodes    = DataFrame(id = node_ids, label = node_ids)
+		edges    = DataFrame(src = src, dst = dst, weight = w)
+		metadata = (directed = false, name = "synth_2clique_weighted", weighted = true)
+		comm     = vcat(fill(1, 8), fill(2, 8), fill(1, 2))   # brokers nominally comm 1
+		return (net = (edges = edges, nodes = nodes, metadata = metadata),
+				comm = comm, node_ids = node_ids)
+	end
+
+#	Synthetic weighted two-community fixture: two weighted 8-cliques + 2 cross-community brokers
+	function _synth_two_clique_weighted(; clique_weight::Int = 2, broker_weight::Int = 1)
+		"""
+		Returns:
+			NamedTuple (net, comm, node_ids); net = (edges, nodes, metadata), weighted
+			undirected, comm = per-node TRUE community labels (canonical order).
+		Notes:
+			Two K8 cliques (comm 1 = a1..a8, comm 2 = b1..b8) wired internally at
+			clique_weight; two BROKERS (k1, k2, nominally comm 1) tie to all 16 clique
+			nodes at broker_weight (cross-community). clique_weight / broker_weight set
+			the orphaning order: heavy cliques + light brokers (e.g. 10 / 1) make the
+			brokers the least-incident-weight AND highest-degree nodes, so they orphan
+			first under a positive-rho tilt — relied on by emergent 4. Defaults (2 / 1)
+			give every node equal incident weight (no easy orphan; W_true = 144), used
+			by emergent 1–3.
+		"""
+		c1 = ["a$i" for i in 1:8]
+		c2 = ["b$i" for i in 1:8]
+		brokers = ["k1", "k2"]
+		src = String[]; dst = String[]; w = Int[]
+		for grp in (c1, c2)
+			for i in 1:length(grp), j in (i+1):length(grp)
+				push!(src, grp[i]); push!(dst, grp[j]); push!(w, clique_weight)
+			end
+		end
+		for k in brokers
+			for v in vcat(c1, c2)
+				push!(src, k); push!(dst, v); push!(w, broker_weight)
+			end
+		end
+		node_ids = vcat(c1, c2, brokers)
+		nodes    = DataFrame(id = node_ids, label = node_ids)
+		edges    = DataFrame(src = src, dst = dst, weight = w)
+		metadata = (directed = false, name = "synth_2clique_weighted", weighted = true)
+		comm     = vcat(fill(1, 8), fill(2, 8), fill(1, 2))
+		return (net = (edges = edges, nodes = nodes, metadata = metadata),
+				comm = comm, node_ids = node_ids)
 	end
 
 #######################
@@ -915,7 +1008,7 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	end
 
 #	Test Prior 3: survivor E/I-by-rank profile distortion (benign low, broker-stripping high)
-	function test_prior3_survivor_profile(; ei_tvd_tol::Real = 0.25)
+	function test_prior3_survivor_profile(; node_loss = :targeted, ei_tvd_tol::Real = 0.25)
 		"""
 		Args:
 			ei_tvd_tol::Real: the gate's prior-3 tolerance (default 0.25)
@@ -986,11 +1079,13 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		#	discriminator (we only inspect prior3_ok / ei_tvd here).
 			gate_b = ndg._three_prior_gate(benign, centrality, comm, adj,
 											true_profile, true_occ, pin, 0.0;
+											node_loss = node_loss,
 											ei_tvd_tol = ei_tvd_tol,
 											n_rank_bins = n_rank_bins, n_ei_bins = n_ei_bins,
 											min_count = min_count)
 			gate_m = ndg._three_prior_gate(malign, centrality, comm, adj,
 											true_profile, true_occ, pin, 0.0;
+											node_loss = node_loss,
 											ei_tvd_tol = ei_tvd_tol,
 											n_rank_bins = n_rank_bins, n_ei_bins = n_ei_bins,
 											min_count = min_count)
@@ -1421,3 +1516,264 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		:rho_abs_error => maximum => :max_abs_error,
 		nrow => :n
 	)
+
+#######################################
+#   EMERGENT NODE MISSINGNESS TESTS   #
+#######################################
+
+#	Emergent Test 1: weighted weight-drop with NO emergent node loss
+	function test_emergent_weight_drop_no_loss(; target_pi_edge::Real = 0.2,
+											     n_reps::Int = 20, master_seed::Integer = 11)
+		"""
+		Returns:
+			NamedTuple (passed::Bool, details::String)
+		Notes:
+			:emergent on the dense weighted fixture with rho = 0 (flat propensity
+			field -> diffuse weight removal). A real edge-weight budget comes off,
+			but every node keeps incident weight, so NO node orphans. Validates the
+			emergent no-loss corner and the record-only invariants:
+			  - weight removed (W_removed > 0),
+			  - n_organic_losses == 0 and missing_nodes empty (loss is emergent, and
+			    none was induced here),
+			  - realized_pi_node == 0 (pi_node is only a tilt knob in :emergent, not
+			    a target -> no top-up),
+			  - contract_passed == true and retry_count == 0 for every draw (the gate
+			    records, never rejects, in :emergent).
+			Budget precision and n_observed are reported (diagnostic) rather than
+			gated, since they depend on weight granularity / degeneracy semantics.
+		"""
+		println("─" ^ 70)
+		println("Test (emergent 1): weighted weight-drop, no emergent node loss")
+		println("─" ^ 70)
+
+		fx  = _synth_two_clique_weighted()
+		net = fx.net
+		n   = nrow(net.nodes)
+
+		recs = _draw_replicates(net;
+								target_pi_node = 0.10,            # tilt knob only in :emergent
+								target_rho     = 0.0,             # flat field -> diffuse removal
+								target_pi_edge = target_pi_edge,
+								n_reps         = n_reps,
+								master_seed    = master_seed,
+								weighted       = true,
+								node_loss      = :emergent,
+								true_community = fx.comm)
+
+		W_true     = recs[1].W_true
+		budget     = round(Int, target_pi_edge * W_true)
+		w_removed  = [r.W_removed                  for r in recs]
+		n_org      = [r.n_organic_losses           for r in recs]
+		n_miss     = [length(r.missing_nodes)      for r in recs]
+		n_obs      = [r.sampler_degeneracy.n_observed for r in recs]
+		pin_real   = [r.realized_pi_node           for r in recs]
+		passed_col = [r.contract_passed            for r in recs]
+		retries    = [r.retry_count                for r in recs]
+
+		#	Gating (high-confidence) assertions
+			wrem_ok   = all(w_removed .> 0)
+			no_loss   = all(n_org .== 0) && all(n_miss .== 0)
+			pin_zero  = all(pin_real .== 0.0)
+			record_ok = all(passed_col) && all(retries .== 0)
+
+		#	Diagnostics (reported, not gated on this first pass)
+			budget_ok = all(abs.(w_removed .- budget) .<= maximum(net.edges.weight))
+			obs_ok    = all(n_obs .== n)
+
+		println("  Replicates:               $n_reps")
+		println("  W_true / budget:          $W_true / $budget  (pi_edge=$target_pi_edge)")
+		println("  W_removed range:          $(minimum(w_removed)) – $(maximum(w_removed))  (near budget: $(budget_ok ? "YES" : "NO"))")
+		println("  Weight removed (>0):      $(wrem_ok ? "YES" : "NO")")
+		println("  Max organic losses:       $(maximum(n_org))  (no node loss: $(no_loss ? "YES" : "NO"))")
+		println("  realized_pi_node all 0:   $(pin_zero ? "YES" : "NO")")
+		println("  n_observed == n:          $(obs_ok ? "YES" : "NO")  ($n)")
+		println("  Recorded (pass, 0 retry): $(record_ok ? "YES" : "NO")")
+
+		passed = wrem_ok && no_loss && pin_zero && record_ok
+		println("  Result:                   $(passed ? "PASS ✓" : "FAIL ✗")")
+
+		return (passed = passed,
+				details = "Wrem=$(minimum(w_removed))-$(maximum(w_removed)) org=$(maximum(n_org)) rec=$record_ok")
+	end
+	test_emergent_weight_drop_no_loss()
+
+#	Emergent Test 2: pi_node is a tilt knob, NOT a target (no top-up in :emergent)
+	function test_emergent_no_topup(; target_pi_node::Real = 0.30,
+									  n_reps::Int = 20, master_seed::Integer = 21)
+		"""
+		Returns:
+			NamedTuple (passed::Bool, details::String)
+		Notes:
+			pi_edge = 0 (no edge stage), non-trivial target_pi_node. :emergent induces
+			NO missingness (organic set empty -> missing empty, realized_pi_node == 0):
+			pi_node is only a propensity-tilt calibration knob there, not a node target.
+			:targeted on the same cell/seeds tops up to ~target_pi_node
+			(realized_pi_node > 0). Also checks the :emergent record-only invariants.
+		"""
+		println("─" ^ 70)
+		println("Test (emergent 2): pi_node is a tilt knob, not a target")
+		println("─" ^ 70)
+
+		fx = _synth_two_clique_weighted()
+
+		em = _draw_replicates(fx.net; target_pi_node = target_pi_node, target_rho = 0.0,
+								  target_pi_edge = 0.0, n_reps = n_reps,
+								  master_seed = master_seed, weighted = true,
+								  node_loss = :emergent, true_community = fx.comm)
+		tg = _draw_replicates(fx.net; target_pi_node = target_pi_node, target_rho = 0.0,
+								  target_pi_edge = 0.0, n_reps = n_reps,
+								  master_seed = master_seed, weighted = true,
+								  node_loss = :targeted, true_community = fx.comm)
+
+		em_pin  = [r.realized_pi_node for r in em]
+		tg_pin  = [r.realized_pi_node for r in tg]
+
+		emergent_zero  = all(em_pin .== 0.0) && all(length(r.missing_nodes) == 0 for r in em)
+		targeted_topup = all(tg_pin .> 0.0)
+		em_recorded    = all(r.contract_passed for r in em) && all(r.retry_count == 0 for r in em)
+
+		println("  target_pi_node:               $target_pi_node")
+		println("  :emergent realized_pi_node 0: $(emergent_zero ? "YES" : "NO")")
+		println("  :targeted realized_pi_node:   $(round(minimum(tg_pin),digits=3)) – $(round(maximum(tg_pin),digits=3))  (>0: $(targeted_topup ? "YES" : "NO"))")
+		println("  :emergent recorded (pass,0):  $(em_recorded ? "YES" : "NO")")
+
+		passed = emergent_zero && targeted_topup && em_recorded
+		println("  Result:                       $(passed ? "PASS ✓" : "FAIL ✗")")
+		return (passed = passed,
+				details = "em0=$emergent_zero tg_topup=$targeted_topup rec=$em_recorded")
+	end
+	test_emergent_no_topup()
+
+#	Emergent Test 3: emergent/targeted share the edge stream (topup is the only difference)
+	function test_emergent_missing_is_organic(; target_pi_edge::Real = 0.4,
+											    target_rho::Real = 0.3,
+											    n_reps::Int = 30, master_seed::Integer = 31)
+		"""
+		Returns:
+			NamedTuple (passed::Bool, details::String)
+		Notes:
+			The defining identity of :emergent — the missing set is exactly the
+			edge-induced organic losses, nothing added, nothing topped up. On the
+			heavy-clique / light-broker fixture a positive-rho tilt at a high edge
+			budget orphans some brokers, so the identity is exercised with real losses
+			(not just the empty corner from emergent 1). Asserts, per replicate:
+			  - length(missing_nodes) == n_organic_losses    (the identity),
+			  - realized_pi_node == n_organic_losses / N      (proportion follows),
+			  - n_observed == N - n_organic_losses            (survivors follow),
+			  - contract_passed == true and retry_count == 0  (record-only gate).
+			Whether the with-loss regime was reached (max n_organic_losses > 0) is
+			REPORTED, not gated: the identity holds at zero losses too, but tune
+			pi_edge / rho up to exercise it with losses. (The old shared-edge-stream
+			cross-mode check was dropped: node_loss is absent from the per-replicate
+			seed hash by construction, but :targeted retries on this small fixture
+			re-draw the edge stage, so the recorded targeted draw can't be aligned with
+			emergent's attempt-1 draw to observe it directly.)
+		"""
+		println("─" ^ 70)
+		println("Test (emergent 3): missing set == organic edge-induced losses")
+		println("─" ^ 70)
+
+		fx = _synth_two_clique_weighted(; clique_weight = 1, broker_weight = 1)
+		net = fx.net
+		N   = nrow(net.nodes)
+
+		recs = _draw_replicates(net;
+								target_pi_node = 0.10,
+								target_rho     = target_rho,
+								target_pi_edge = target_pi_edge,
+								n_reps         = n_reps,
+								master_seed    = master_seed,
+								weighted       = true,
+								node_loss      = :emergent,
+								true_community = fx.comm)
+
+		losses     = [r.n_organic_losses for r in recs]
+		identity   = all(length(r.missing_nodes) == r.n_organic_losses for r in recs)
+		proportion = all(r.realized_pi_node == r.n_organic_losses / N for r in recs)
+		survivors  = all(r.sampler_degeneracy.n_observed == N - r.n_organic_losses for r in recs)
+		record_ok  = all(r.contract_passed for r in recs) && all(r.retry_count == 0 for r in recs)
+		loss_seen  = maximum(losses) > 0
+
+		println("  Replicates:                   $n_reps")
+		println("  Organic losses range:         $(minimum(losses)) – $(maximum(losses))")
+		println("  missing == organic:           $(identity ? "YES" : "NO")")
+		println("  realized_pi_node == org/N:    $(proportion ? "YES" : "NO")")
+		println("  n_observed == N - org:        $(survivors ? "YES" : "NO")")
+		println("  Recorded (pass, 0 retry):     $(record_ok ? "YES" : "NO")")
+		println("  With-loss regime reached:     $(loss_seen ? "YES" : "NO (tune pi_edge/rho up)")")
+
+		passed = identity && proportion && survivors && record_ok
+		println("  Result:                       $(passed ? "PASS ✓" : "FAIL ✗")")
+		return (passed = passed,
+				details = "ident=$identity prop=$proportion surv=$survivors loss=$(maximum(losses)) rec=$record_ok")
+	end
+	test_emergent_missing_is_organic()
+
+#	Emergent Test 4: the SAME distorting removal is gated in :targeted, recorded in :emergent
+	function test_emergent_broker_recorded(; ei_tvd_tol::Real = 0.25)
+		"""
+		Returns:
+			NamedTuple (passed::Bool, details::String)
+		Notes:
+			The capstone, at the gate level. Emergent EDGE loss is peripheral (emergent
+			3: it strips the odd low-degree node, never the degree-16 brokers), so the
+			distorting broker-removal prior 3 guards against does not arise organically
+			— that is itself the result. This test therefore takes the distorting set
+			DIRECTLY (the same {k1,k2,a1,a2} the prior-3 test measures at ei_tvd ~ 0.4)
+			and gates it under BOTH modes on one survivor profile:
+			  :targeted -> ei_tvd > tol -> prior3_ok == false   (rejected),
+			  :emergent -> identical ei_tvd -> prior3_ok == true and passed == true
+			               (recorded — every prior is record-only in :emergent).
+			Same removal, same measured distortion; gated when you target a clean
+			sample, recorded when loss is emergent. ei_tvd is computed on the binary
+			survivor profile, so it is independent of edge weights. prior 3 is isolated
+			by reading prior3_ok directly (prior 2 also fires in :targeted because the
+			brokers are high-centrality, but that is not the discriminator here).
+		"""
+		println("─" ^ 70)
+		println("Test (emergent 4): same distortion gated in :targeted, recorded in :emergent")
+		println("─" ^ 70)
+
+		ndg = Network_Credible_Intervals.network_degeneracy
+		fx  = _synth_two_clique_weighted(; clique_weight = 1, broker_weight = 1)
+		adj = _graph_to_sparse_matrix(fx.net.edges; nodes = fx.net.nodes, weighted = false)[1]
+		n   = size(adj, 1)
+		centrality = ndg._centrality_for_sampler(fx.net.edges; nodes = fx.net.nodes, directed = false)
+
+		n_rank_bins = 4; n_ei_bins = 3; min_count = 2
+		true_profile, true_occ = ndg._ei_rank_profile(adj, fx.comm, trues(n),
+													   n_rank_bins, n_ei_bins)
+
+		#	The distorting removal: both brokers + two of their clique partners
+			malign = sort([findfirst(==(name), fx.node_ids) for name in ("k1", "k2", "a1", "a2")])
+			pin    = length(malign) / n
+
+		#	Gate the SAME set under both modes
+			gate_t = ndg._three_prior_gate(malign, centrality, fx.comm, adj,
+											true_profile, true_occ, pin, 0.0;
+											node_loss = :targeted, ei_tvd_tol = ei_tvd_tol,
+											n_rank_bins = n_rank_bins, n_ei_bins = n_ei_bins,
+											min_count = min_count)
+			gate_e = ndg._three_prior_gate(malign, centrality, fx.comm, adj,
+											true_profile, true_occ, pin, 0.0;
+											node_loss = :emergent, ei_tvd_tol = ei_tvd_tol,
+											n_rank_bins = n_rank_bins, n_ei_bins = n_ei_bins,
+											min_count = min_count)
+
+		distorts   = !isnan(gate_t.ei_tvd) && gate_t.ei_tvd > ei_tvd_tol
+		same_score = gate_e.ei_tvd == gate_t.ei_tvd
+		gated      = gate_t.prior3_ok == false
+		recorded   = (gate_e.prior3_ok == true) && (gate_e.passed == true)
+
+		println("  Distorting set:              $(length(malign)) nodes (k1,k2,a1,a2)")
+		println("  ei_tvd (both modes):         $(round(gate_t.ei_tvd, digits=4))  (> tol $ei_tvd_tol: $(distorts ? "YES" : "NO"))")
+		println("  identical across modes:      $(same_score ? "YES" : "NO")")
+		println("  :targeted prior3_ok / passed:$(gate_t.prior3_ok) / $(gate_t.passed)  (gated: $(gated ? "YES" : "NO"))")
+		println("  :emergent prior3_ok / passed:$(gate_e.prior3_ok) / $(gate_e.passed)  (recorded: $(recorded ? "YES" : "NO"))")
+
+		passed = distorts && same_score && gated && recorded
+		println("  Result:                      $(passed ? "PASS ✓" : "FAIL ✗")")
+		return (passed = passed,
+				details = "ei=$(round(gate_t.ei_tvd,digits=3)) gated_t=$gated recorded_e=$recorded same=$same_score")
+	end
+    test_emergent_broker_recorded()

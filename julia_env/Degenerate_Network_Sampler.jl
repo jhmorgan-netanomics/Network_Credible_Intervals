@@ -2,6 +2,46 @@
 #Jonathan H. Morgan
 #29 May 2026
 
+```
+This stimulus generates the Phase-1 validation corpus for the reconstruction method — the controlled degradation against which its credible intervals are scored. 
+It follows the evaluation philosophy of Smith et al. (2022): take a known true network, induce missing data systematically, recompute the measures of interest, 
+and characterize the bias (and here, interval coverage) as a function of the amount and type of missingness. Smith et al. induce missingness as node non-response — 
+a roster of identifiable actors, some of whom report no out-ties — and impute edges to and from those known non-respondents. The node-non-response case is covered 
+by the framework in Phase 1.5; it is not a factor varied in this Phase-1 stimulus. Phase 1 instead samples fixed-roster true network and induces missingness by 
+zeroing edge weight, and the nodes that fully zero out are recovered along with the edges. The two phases exercise complementary mechanisms 
+— node non-response in 1.5, edge missingness here.
+
+Missingness is applied through a single operation: zeroing edge weight. A missing node is not a separate object that is deleted; it is the limiting case of a 
+node whose entire edge set has gone to zero. Node loss is therefore emergent rather than dialed — there is no node-missingness target. The single varied quantity 
+is edge missingness, the fraction of total edge weight removed, swept over {0.0, 0.1, 0.2, 0.3, 0.4, 0.5}; the 0.0 level is the undegraded baseline, at which 
+bias is zero and every interval contains the truth by construction.
+
+The mechanism that realizes edge missingness depends on network type, but the axis is shared. On weighted networks, weight is removed, producing both 
+underweighted ties and fully zeroed ones. On binary networks, where no partial weight exists, the same operation reduces to tie removal — the unit-weight limit, 
+exemplified by the binary Toledo Crime network. Both feed the same edge-missingness axis and both produce emergent node loss, so weighted and binary networks remain 
+comparable along a single x-axis. Centrality-biased missingness is controlled by rho, the rank correlation (Kendall tau) between a node's centrality and the 
+missingness it experiences. rho tilts which edges zero, and therefore which nodes are most likely to be orphaned. It is varied as the true generating condition 
+across a small achievable band — approximately {−0.15, 0, +0.15} — rather than the ±0.75 of Smith et al., because rho here is measured on the materialized network 
+and is structurally bounded; the wider range was attainable in that paper only because it imposed a selection-probability correlation without sampling a realized 
+network. rho interacts with the level: negative rho concentrates removal on low-degree peripheral nodes, which orphan quickly and yield more node loss at a given 
+level, while positive rho lands removal on high-degree nodes with ties to spare and yields less. Induced node loss is thus a joint function of network, level, 
+and rho — not of the level alone.
+
+Degradation runs from edges to nodes: zero edges, and observe which nodes drop. Reconstruction runs the other way: assume some number of nodes are missing, then 
+distribute weight to recover them and their ties. The bridge is the recorded emergent node-loss count (n_organic_losses, equivalently the recorded missing-node set), 
+which is precisely the input the reconstruction consumes. Because node loss can in principle be zero — a low level on a heavy or dense network may leave every node 
+with a surviving tie, retaining the full roster, though this is uncommon among the empirical networks — the count is recorded per cell rather than derived from the 
+level, and a count of zero is a valid record, handled by reconstructing edge weight alone.
+
+For this validation the analyst is granted ground-truth knowledge of two quantities: the edge-loss fraction and the induced node-loss count. rho is withheld; it is 
+the unknown whose misspecification the reconstruction probes. Downstream of this stimulus, each recorded sample is reconstructed under each rho value, so that the 
+gap between the matched line (assumed rho equal to the true generating rho) and the two mismatched lines quantifies the cost of getting the centrality mechanism wrong. The stimulus itself varies only the true conditions — network, edge-missingness level, and true rho — and records the realized quantities the reconstruction will need.
+
+One extension is noted but not implemented here. In practice, analysts typically estimate the proportion of nodes lost more reliably than the proportion of ties. 
+A natural variant would invert which quantity is treated as known: grant an accurate node proportion while misspecifying or omitting the tie percentage, and measure 
+the resulting degradation. The current design fixes both as known and probes only rho.
+```
+
 #	Generates the degeneration corpus across all sixteen networks,
 #	five centrality–missingness correlation levels, six missingness
 #	rates, 100 replicates per cell, and both materialization mechanisms.
