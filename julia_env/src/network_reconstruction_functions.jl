@@ -3505,7 +3505,12 @@ module network_reconstruction
 
 	- `diag::Dict{Symbol, Any}`: Per-replicate diagnostics. Standard keys:
 	`:seed`, `:realized_rho` (Kendall $\tau_b$ between the missing indicator —
-	nominated + added — and degree bin across the full augmented roster),
+	nominated + added — and the raw augmented centrality from
+	`_compute_observed_centrality`: binarized in-degree for directed, degree for
+	undirected, over the full augmented roster. This is the realized rho on the
+	post-reconstruction field, identical to the metric `_passes_three_prior_gate`
+	scores — NOT the degree bin and not the solver's bin-index target; NaN when the
+	missing set is empty/complete or that centrality is constant),
 	`:added_degree_bins`, `:added_ei_bins`, `:n_stage_0_5_edges`,
 	`:n_stage_1_edges`, `:stage_2_weight_added`.
 
