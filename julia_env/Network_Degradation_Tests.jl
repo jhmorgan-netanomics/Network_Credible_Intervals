@@ -1285,3 +1285,139 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	Arrow.write(smoke_output_file, corpus_df; compress = :zstd)
 	println("Wrote: ", smoke_output_file, " (", round(filesize(smoke_output_file) / 1024^2, digits = 1), " MB)")
 	println()
+
+###############################
+#   Inspect Smoke Corpus Rows #
+###############################
+
+#	Load & Inspect Smoke Corpus
+	smoke_file = "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data/Degenerate_Networks/smoke_degeneration_corpus.arrow"
+	smoke_df = DataFrame(Arrow.Table(smoke_file))
+
+	println("Rows: ", nrow(smoke_df))
+	println("Networks: ", unique(smoke_df.network_name))
+	combine(groupby(smoke_df, [:network_name, :gate_status]), nrow => :n)
+
+#	Rho Substitution Summary
+	combine(groupby(smoke_df, [:network_name, :nominal_pi_node]), 
+		:rho_was_substituted => sum => :n_rho_substituted,
+		nrow => :n_rows
+	)
+
+#	Inspect Failed Rows
+	failed_rows = smoke_df[smoke_df.gate_status .== :failed_other, :]
+
+	select(failed_rows,
+		:network_name,
+		:nominal_pi_node,
+		:nominal_pi_edge,
+		:nominal_rho,
+		:substituted_rho,
+		:realized_rho,
+		:realized_pi_node,
+		:realized_pi_edge,
+		:field_status,
+		:gate_status,
+		:retry_count,
+		:any_topo_degenerate
+	) |> first
+
+#	Check Realized Node Missingness
+	smoke_df.pi_node_error = abs.(smoke_df.realized_pi_node .- smoke_df.nominal_pi_node)
+
+	combine(groupby(smoke_df, [:network_name, :nominal_pi_node]),
+		:pi_node_error => maximum => :max_pi_node_error,
+		:pi_node_error => mean => :mean_pi_node_error
+	)
+
+#	Check Realized Edge Missingness
+	smoke_df.pi_edge_error = abs.(smoke_df.realized_pi_edge .- smoke_df.nominal_pi_edge)
+
+	combine(groupby(smoke_df, [:network_name, :nominal_pi_edge]),
+		:pi_edge_error => maximum => :max_pi_edge_error,
+		:pi_edge_error => mean => :mean_pi_edge_error
+	)
+
+#	Check Realized Rho Against Substituted Rho
+	smoke_df.rho_error = abs.(smoke_df.realized_rho .- smoke_df.substituted_rho)
+
+	combine(groupby(smoke_df, [:network_name, :nominal_pi_node, :nominal_rho]),
+		:rho_error => mean => :mean_rho_error,
+		:rho_error => maximum => :max_rho_error,
+		:gate_status => (x -> count(==(:converged), x)) => :n_converged,
+		nrow => :n_rows
+	)
+
+#	Topological Degeneracy Rows
+	degenerate_rows = smoke_df[smoke_df.any_topo_degenerate .== true, :]
+
+	degenerate_cols = [
+		:network_name,
+		:nominal_pi_node,
+		:nominal_rho,
+		:substituted_rho,
+		:realized_rho,
+		:n_observed,
+		:n_edges_observed,
+		:any_topo_degenerate,
+	]
+	degenerate_cols = intersect(degenerate_cols, Symbol.(names(degenerate_rows)))
+
+	if nrow(degenerate_rows) > 0
+		first(select(degenerate_rows, degenerate_cols), 10)
+	else
+		println("No topologically degenerate rows.")
+	end
+
+	filter(name -> occursin("gc", lowercase(name)) ||
+			   occursin("observed", lowercase(name)) ||
+			   occursin("topo", lowercase(name)) ||
+			   occursin("degenerate", lowercase(name)),
+	names(smoke_df))
+
+#####################################
+#   Materialize and Inspect Samples #
+#####################################
+
+#	Choose Rows to Inspect
+	rows_to_check = [
+	first(findall(smoke_df.network_name .== "moreno_highschool_unweighted")),
+	first(findall(smoke_df.network_name .== "scotland_interlock_unweighted")),
+	first(findall(smoke_df.network_name .== "marvel_universe_unweighted")),
+]
+
+#	Inspect Stored Degraded Records
+	for row_idx in rows_to_check
+		row = smoke_df[row_idx, :]
+		println("─" ^ 70)
+		println("Row: ", row_idx)
+		println("Network: ", row.network_name)
+		println("pi_node: ", row.nominal_pi_node, " realized=", row.realized_pi_node)
+		println("pi_edge: ", row.nominal_pi_edge, " realized=", row.realized_pi_edge)
+		println("rho:     ", row.nominal_rho, " substituted=", row.substituted_rho, " realized=", row.realized_rho)
+		println("status:  field=", row.field_status, " gate=", row.gate_status)
+		println("missing nodes: ", length(row.missing_nodes))
+		println("full removals: ", row.n_full_removal)
+		println("nominations:   ", row.n_nominations)
+		println("topo degenerate: ", row.any_topo_degenerate)
+	end
+
+	combine(groupby(smoke_df, [:network_name, :nominal_pi_node, :nominal_rho]),
+		:gate_status => (x -> count(==(:converged), x)) => :n_converged,
+		:gate_status => (x -> count(==(:ceiling_hit), x)) => :n_ceiling,
+		:gate_status => (x -> count(==(:failed_other), x)) => :n_failed,
+		:rho_was_substituted => sum => :n_rho_substituted,
+		:realized_rho => mean => :mean_realized_rho,
+		:substituted_rho => first => :substituted_rho,
+		nrow => :n
+	)
+
+	smoke_df.rho_abs_error = abs.(smoke_df.realized_rho .- smoke_df.substituted_rho)
+	combine(
+		groupby(smoke_df, [:network_name, :nominal_pi_node, :nominal_rho, :gate_status]),
+		:substituted_rho => first => :substituted_rho,
+		:realized_rho => mean => :mean_realized_rho,
+		:rho_abs_error => mean => :mean_abs_error,
+		:rho_abs_error => maximum => :max_abs_error,
+		nrow => :n
+	)
