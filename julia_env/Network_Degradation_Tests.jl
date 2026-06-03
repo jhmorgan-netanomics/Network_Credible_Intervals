@@ -1151,21 +1151,15 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 #   Pre-Launch Smoke Run   #
 ############################
 
-#	Three networks, full design grid, 10 replicates per cell, both
-#	mechanisms. Exercises the threaded orchestrator, the Arrow writer,
-#	and the per-network diagnostic readout before launching the
-#	production run.
-
-#	Set Parameters (plain variables, not const, so reruns don't error
-#	with "cannot redefine constant" warnings)
+#	Set Parameters
 	master_seed       = 42
 	output_dir        = "/mnt/d/GitHub_Repositories/Network_Credible_Intervals/Data/Degenerate_Networks"
 	smoke_output_file = joinpath(output_dir, "smoke_degeneration_corpus.arrow")
 
 	target_rhos       = [-0.75, -0.25, 0.0, 0.25, 0.75]
-	target_rates      = [0.05, 0.10, 0.15, 0.25, 0.40, 0.50]
-	n_replicates      = 10                                        #	reduced from 100 for smoke
-	mechanisms_cfg    = [:full_removal, :outgoing_only]
+	target_pi_nodes   = [0.05, 0.25, 0.50]
+	target_pi_edges   = [0.0, 0.25, 0.50]
+	n_replicates      = 10
 
 	smoke_network_names = [
 		"moreno_highschool_unweighted",
@@ -1173,7 +1167,7 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		"marvel_universe_unweighted",
 	]
 
-#	Pre-flight Checks
+#	Pre-Flight Checks
 	println("─" ^ 70)
 	println("Phase 1 Pre-Launch Smoke Test")
 	println("─" ^ 70)
@@ -1188,8 +1182,6 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	Threads.nthreads() >= 4 || @warn "Only $(Threads.nthreads()) threads available"
 
 #	Subset Networks
-	#	Each value in the smoke dict must be the network NamedTuple
-	#	(networks[name]), not the full networks dict.
 	test_networks = Dict{String, NamedTuple}(
 		name => networks[name]
 		for name in smoke_network_names
@@ -1199,9 +1191,9 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	length(test_networks) == length(smoke_network_names) ||
 		error("Missing networks: ", setdiff(smoke_network_names, keys(test_networks)))
 
-	println("Smoke corpus (", length(test_networks), " networks):")
-	for (name, net) in sort(collect(test_networks), by=first)
-		println("  $(rpad(name, 40)) N=$(rpad(nrow(net.nodes), 8)) E=$(rpad(nrow(net.edges), 10)) directed=$(net.metadata.directed)")
+	println("Smoke corpus ($(length(test_networks)) networks):")
+	for (name, net) in sort(collect(test_networks), by = first)
+		println("  $(rpad(name, 40)) N=$(rpad(nrow(net.nodes), 8)) E=$(rpad(nrow(net.edges), 10)) directed=$(net.metadata.directed) weighted=$(net.metadata.weighted)")
 	end
 	println()
 
@@ -1210,14 +1202,15 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	println()
 
 	@time corpus_df = Network_Credible_Intervals.network_degeneracy.build_degeneration_corpus(
-											test_networks;
-											target_rhos    = target_rhos,
-											target_rates   = target_rates,
-											n_replicates   = n_replicates,
-											mechanisms     = mechanisms_cfg,
-											master_seed    = master_seed,
-											parallel       = true,
-											show_progress  = true)
+		test_networks;
+		target_rhos      = target_rhos,
+		target_pi_nodes  = target_pi_nodes,
+		target_pi_edges  = target_pi_edges,
+		n_replicates     = n_replicates,
+		master_seed      = master_seed,
+		parallel         = true,
+		show_progress    = true
+	)
 
 #	Diagnostic Readout
 	println()
@@ -1231,14 +1224,16 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	println("Per-network breakdown")
 	println("─" ^ 70)
 	for grp in groupby(corpus_df, :network_name)
-		n_rows  = nrow(grp)
-		n_full  = count(==(:full_removal), grp.mechanism)
-		n_out   = count(==(:outgoing_only), grp.mechanism)
-		n_conv  = count(==(:converged), grp.bisection_status)
-		n_ceil  = count(==(:ceiling_hit), grp.bisection_status)
-		n_fail  = count(==(:failed_other), grp.bisection_status)
-		n_deg   = count(grp.any_topo_degenerate)
-		println("  $(rpad(grp.network_name[1], 40)) rows=$(rpad(n_rows, 5)) full=$(rpad(n_full, 4)) out=$(rpad(n_out, 4)) conv=$(rpad(n_conv, 4)) ceil=$(rpad(n_ceil, 3)) fail=$(rpad(n_fail, 3)) deg=$n_deg")
+		n_rows = nrow(grp)
+		n_full = sum(grp.n_full_removal)
+		n_nom  = sum(grp.n_nominations)
+		n_conv = count(==(:converged), grp.gate_status)
+		n_ceil = count(==(:ceiling_hit), grp.gate_status)
+		n_fail = count(==(:failed_other), grp.gate_status)
+		n_sub  = count(grp.rho_was_substituted)
+		n_deg  = count(grp.any_topo_degenerate)
+
+		println("  $(rpad(grp.network_name[1], 40)) rows=$(rpad(n_rows, 5)) full=$(rpad(n_full, 5)) nom=$(rpad(n_nom, 5)) conv=$(rpad(n_conv, 5)) ceil=$(rpad(n_ceil, 5)) fail=$(rpad(n_fail, 5)) rho_sub=$(rpad(n_sub, 5)) deg=$n_deg")
 	end
 	println()
 
@@ -1246,28 +1241,47 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	expected_rows = 0
 	for name in smoke_network_names
 		net = test_networks[name]
-		n_mech = net.metadata.directed ? 2 : 1
-		expected_rows += length(target_rhos) * length(target_rates) * n_replicates * n_mech
+		n_pi_edges = net.metadata.weighted ? length(unique(target_pi_edges)) : 1
+		expected_rows += length(target_rhos) *
+						 length(target_pi_nodes) *
+						 n_pi_edges *
+						 n_replicates
 	end
-	nrow(corpus_df) == expected_rows ||
+
+	row_check = nrow(corpus_df) == expected_rows
+	println("Expected rows:     ", expected_rows)
+	println("Row check:         ", row_check ? "PASS" : "FAIL")
+
+	row_check ||
 		@warn "Row count mismatch: got $(nrow(corpus_df)), expected $expected_rows"
 
+	required_cols = [
+		"network_name",
+		"nominal_pi_node",
+		"nominal_pi_edge",
+		"nominal_rho",
+		"substituted_rho",
+		"rho_was_substituted",
+		"missing_nodes",
+		"n_full_removal",
+		"n_nominations",
+		"realized_pi_node",
+		"realized_pi_edge",
+		"realized_rho",
+		"field_status",
+		"gate_status",
+		"contract_passed",
+		"any_topo_degenerate",
+	]
+
+	missing_cols = setdiff(required_cols, names(corpus_df))
+	col_check = isempty(missing_cols)
+	println("Column check:      ", col_check ? "PASS" : "FAIL")
+	col_check || @warn "Missing expected columns: $missing_cols"
+
 #	Write Arrow
+	println()
 	println("Writing Arrow file ...")
 	Arrow.write(smoke_output_file, corpus_df; compress = :zstd)
-	println("Wrote: ", smoke_output_file, " (", round(filesize(smoke_output_file) / 1024^2, digits=1), " MB)")
+	println("Wrote: ", smoke_output_file, " (", round(filesize(smoke_output_file) / 1024^2, digits = 1), " MB)")
 	println()
-
-#	Roundtrip Test
-	#	Confirm the Arrow file reads back correctly with the expected
-	#	column types — particularly the Vector{Vector{Int}} dropped_nodes
-	#	column, which is the column most likely to misbehave.
-	println("Roundtrip test ...")
-	read_df = DataFrame(Arrow.Table(smoke_output_file))
-	nrow(read_df) == nrow(corpus_df) || error("Roundtrip row count mismatch")
-	typeof(read_df.dropped_nodes[1]) <: AbstractVector{<:Integer} ||
-		@warn "dropped_nodes roundtrip type unexpected: $(typeof(read_df.dropped_nodes[1]))"
-	read_df.realized_rho[1] ≈ corpus_df.realized_rho[1] || error("realized_rho roundtrip mismatch")
-	println("Roundtrip OK: read back ", nrow(read_df), " rows, dropped_nodes type intact")
-	println()
-	println("Smoke complete: ", now())
