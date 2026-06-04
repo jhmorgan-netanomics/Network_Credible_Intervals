@@ -1336,7 +1336,9 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	expected_rows = 0
 	for name in smoke_network_names
 		net = test_networks[name]
-		n_pi_edges = net.metadata.weighted ? length(unique(target_pi_edges)) : 1
+		#	pi_edge applies to both types now (binary -> tie removal), so the
+		#	edge grid is the same length regardless of net.metadata.weighted
+		n_pi_edges = length(unique(target_pi_edges))
 		expected_rows += length(target_rhos) *
 						 length(target_pi_nodes) *
 						 n_pi_edges *
@@ -1520,6 +1522,8 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 #######################################
 #   EMERGENT NODE MISSINGNESS TESTS   #
 #######################################
+
+#	WEIGHTED NETWORKS
 
 #	Emergent Test 1: weighted weight-drop with NO emergent node loss
 	function test_emergent_weight_drop_no_loss(; target_pi_edge::Real = 0.2,
@@ -1855,5 +1859,48 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		get(nt.metadata, :weighted, false) || continue
 		println("Running $nm ..."); flush(stdout)
 		run_emergent_checks(nt; label = nm, sweep_rho = -0.15)
+		flush(stdout)
+	end
+
+#	BINARY NETWORKS
+
+	binary_nets = sort([nm for nm in keys(networks) if !get(networks[nm].metadata, :weighted, false)])
+
+	binary_checks = Dict{String,NamedTuple}()
+	for nm in binary_nets
+		println("\nRunning $nm ...")
+		binary_checks[nm] = run_emergent_checks(networks[nm]; label = nm, n_reps = 30, sweep_rho = -0.15)
+		flush(stdout)
+	end
+
+	function check_binary_mechanism(net; label = "", n_reps = 30, master_seed = 71,
+									sweep_rho = -0.15,
+									pi_edge_grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
+		get(net.metadata, :weighted, false) &&
+			@warn "$label is weighted; the W_removed == n_edges_zeroed equality only characterizes binary nets"
+		all_ok = true
+		println("─" ^ 70)
+		println("Binary mechanism (zero-only tie removal) on $label")
+		println("─" ^ 70)
+		for pie in pi_edge_grid
+			reps = _draw_replicates(net;
+						target_pi_node = 0.10,
+						target_rho     = sweep_rho,
+						target_pi_edge = pie,
+						n_reps         = n_reps,
+						master_seed    = master_seed,
+						node_loss      = :emergent)
+			tie_ok = all(r.W_removed == r.n_edges_zeroed for r in reps)
+			all_ok &= tie_ok
+			fr = [r.realized_pi_edge for r in reps]
+			println("  pi_edge=$(rpad(pie, 4))  W_removed==n_edges_zeroed: $(tie_ok ? "YES" : "NO ")  ",
+					"realized_pi_edge∈[$(round(minimum(fr); digits = 3)), $(round(maximum(fr); digits = 3))]")
+		end
+		println("  Result: ", all_ok ? "PASS ✓" : "FAIL ✗")
+		return all_ok
+	end
+	
+	for nm in binary_nets
+		check_binary_mechanism(networks[nm]; label = nm)
 		flush(stdout)
 	end

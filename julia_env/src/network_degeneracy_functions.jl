@@ -1570,14 +1570,16 @@ module network_degeneracy
 			edges::DataFrame: original edge list with :src, :dst (+ :weight if weighted).
 			nodes::Union{Nothing,DataFrame,Vector}: optional node universe.
 			directed::Bool: directedness (selects centrality driver and nominations).
-			weighted::Bool: whether the edge-degradation stage runs (needs :weight).
+			weighted::Bool: selects the edge-removal mechanism (weight removal
+				vs whole-tie removal); the edge stage runs for both types.
 			target_pi_node::Real: in (0, 1). In :targeted mode the node-missingness
 				target; in :emergent mode a propensity-tilt calibration only.
 			node_loss::Symbol: :emergent -> missing set = edge-induced organic losses
 				(edge-primary, this paper); :targeted -> top up to target_pi_node
 				(node non-response, Phase 1.5). Default :emergent.
-			target_pi_edge::Real: diffuse weight-degradation budget (fraction of
-				true weight); in [0, 1). Forced to 0 on unweighted input.
+			target_pi_edge::Real: diffuse edge-degradation budget (fraction of
+				total edge weight); in [0, 1). Applies to both types (weight
+				removal when weighted, whole-tie removal when binary).
 			target_rho::Real: target Kendall tau-b of the missing set vs centrality.
 			seed::Integer: master seed; deterministically split, retries advance
 				a deterministic sub-seed sequence.
@@ -1591,7 +1593,8 @@ module network_degeneracy
 			NamedTuple: the per-replicate record (see Notes for fields).
 		Notes:
 			The public per-replicate sampler, rewired for the unified pipeline
-			(Spec v3): edge degradation (weighted only) -> record organic losses +
+			(Spec v3): edge degradation (weighted -> weight removal; binary ->
+			tie removal, the unit-weight limit) -> record organic losses +
 			edge-stage diagnostic -> node accounting (node_loss: :emergent = organic only, :targeted = top-up to pi_node) ->
 			materialize (auto nomination/full-removal) -> single three-prior end
 			gate -> retry-on-stochastic-miss / accept-and-flag on :ceiling_hit.
@@ -1631,8 +1634,10 @@ module network_degeneracy
 			(node_loss in (:emergent, :targeted)) ||
 				throw(ArgumentError("node_loss must be :emergent or :targeted, got $node_loss"))
 
-		#	Weighted guard: no edge stage without weights
-			pi_edge = weighted ? Float64(target_pi_edge) : 0.0
+		#	Edge stage runs for both types. Binary is the unit-weight limit of
+		#	weighted removal: with avail==1 per edge, _sample_weight_removal can
+		#	only zero whole ties (zero-only tie removal), never underweight.
+			pi_edge = Float64(target_pi_edge)
 
 		#	Per-network artifacts: compute or accept cached
 			c = isnothing(centrality) ?
@@ -1656,7 +1661,8 @@ module network_degeneracy
 
 			adjw = nothing
 			if pi_edge > 0.0
-				adjw = isnothing(adj_weighted) ? _weighted_adjacency(edges; nodes=nodes)[1] : adj_weighted
+				adjw = !isnothing(adj_weighted) ? adj_weighted :
+					   (weighted ? _weighted_adjacency(edges; nodes=nodes)[1] : adjb)
 			end
 
 		#	Propensity field (shared tilt); status recorded
@@ -1671,7 +1677,7 @@ module network_degeneracy
 				edge_seed  = Int(rand(master_rng, UInt32))
 				topup_seed = Int(rand(master_rng, UInt32))	#	used by the :targeted top-up; in :emergent mode unused, but the draw is kept so the edge-seed stream matches across modes
 
-				#	Stage 1: edge degradation (weighted only) -> organic losses + diagnostic
+				#	Stage 1: edge degradation (both types) -> organic losses + diagnostic
 					organic = Int[]
 					W_true = 0; W_removed = 0; n_edges_zeroed = 0
 					degraded_edges = edges
@@ -1773,8 +1779,9 @@ module network_degeneracy
 	@doc raw"""
 	**Description**
 	Generates one per-replicate missingness record for the unified Phase~1
-	degeneration pipeline (Spec~v3). Runs edge degradation (weighted networks
-	only), records the organic node losses, and sets the missing set per
+	degeneration pipeline (Spec~v3). Runs edge degradation (weight removal on
+	weighted networks, whole-tie removal on binary networks -- the unit-weight
+	limit), records the organic node losses, and sets the missing set per
 	`node_loss`: the organic losses alone when `:emergent` (this paper), or
 	topped up to the target node fraction via the shared logistic-$\beta$
 	propensity field when `:targeted`. It then materializes the degraded network
@@ -1786,14 +1793,16 @@ module network_degeneracy
 
 	**Arguments**
 	- `edges::DataFrame`: edge list with `:src`, `:dst` (and `:weight` if `weighted`).
-	- `directed::Bool`, `weighted::Bool`: network type; gate which stages run.
+	- `directed::Bool`, `weighted::Bool`: network type. `weighted` selects the
+	  edge-removal mechanism (weight removal vs whole-tie removal), not whether
+	  the edge stage runs.
 	- `node_loss::Symbol`: `:emergent` -> missing set is the edge-induced organic
 	  losses (this paper); `:targeted` -> top up to `target_pi_node` (node
 	  non-response, Phase 1.5). Default `:emergent`.
 	- `target_pi_node`, `target_pi_edge`, `target_rho`: node target (only in
 	  `:targeted`; a propensity-tilt calibration in `:emergent`), edge-degradation
-	  budget, and the shared correlation. `target_pi_edge` is forced to 0 on
-	  unweighted input.
+	  budget, and the shared correlation. `target_pi_edge` applies to both types
+	  (weight removal when weighted, whole-tie removal when binary).
 	- `seed::Integer`: master seed; retries advance a deterministic sub-seed stream.
 	- `centrality`, `true_community`, `adj_binary`, `adj_weighted`: optional cached
 	  per-network artifacts (the orchestrator supplies these).
@@ -1843,8 +1852,9 @@ module network_degeneracy
 			target_rhos::AbstractVector{<:Real}: nominal rho grid.
 			target_pi_nodes::AbstractVector{<:Real}: nominal node-missingness grid.
 			target_pi_edges::AbstractVector{<:Real}: nominal edge-degradation grid
-				(fraction of weight). 0.0 means node-only; entries > 0 apply only to
-				weighted networks (forced to 0 on unweighted, deduplicated).
+				(fraction of total edge weight). 0.0 means node-only. Applies to
+				both types: weighted nets remove weight, binary nets remove whole
+				ties (the unit-weight limit); grid is deduplicated.
 			node_loss::Symbol: :emergent -> missing set is the edge-induced organic
 				losses (this paper); :targeted -> top up to target_pi_node (node
 				non-response, Phase 1.5); threaded to generate_missingness_mask.
@@ -1866,8 +1876,9 @@ module network_degeneracy
 			composed per node and reported via n_full_removal / n_nominations.
 		Notes:
 			The unified orchestrator (Spec v3). For each network it follows the
-			shared front-matter: detect type → gate the dials by type
-			(pi_edge forced to {0} on unweighted) → up-front feasibility via
+			shared front-matter: detect type → resolve the edge-removal weight
+			matrix by type (true weights when weighted, unit-weight binary
+			adjacency otherwise) → up-front feasibility via
 			feasible_rho_range (warn + substitute the clamped rho, recording which
 			value was used) → run generate_missingness_mask per cell.
 
@@ -1921,14 +1932,17 @@ module network_degeneracy
 						_graph_to_sparse_matrix(ed; weighted=false)[1] :
 						_graph_to_sparse_matrix(ed; nodes=net.nodes, weighted=false)[1]
 
-				#	Weighted adjacency only when needed
-					adjw_cache[name] = weighted ? _weighted_adjacency(ed; nodes=net.nodes)[1] : nothing
+				#	Edge-removal weight matrix: true weights when weighted, the unit-
+				#	weight (binary) adjacency otherwise. The binary case is the unit-
+				#	weight limit of weight removal -> tie removal (zero-only).
+					adjw_cache[name] = weighted ? _weighted_adjacency(ed; nodes=net.nodes)[1] : adjb_cache[name]
 
 				#	TRUE-network community labels for the E/I gate (precomputed once)
 					comm_cache[name] = _true_communities(adjb_cache[name])
 
-				#	Gate the pi_edge dial by type (unweighted -> {0.0})
-					pe = weighted ? sort!(unique(Float64.(target_pi_edges))) : [0.0]
+				#	pi_edge dial applies to both types: weighted -> weight removal,
+				#	binary -> tie removal (the unit-weight limit of the same mechanism)
+					pe = sort!(unique(Float64.(target_pi_edges)))
 					pi_edges_for_net[name] = pe
 			end
 
@@ -2006,21 +2020,21 @@ module network_degeneracy
 					rho_used = get(substituted, (name, rho, pin, pie), rho)
 				rep_seed = Int(hash((name, rho, pin, pie, rep, master_seed)) % UInt32)
 				rec = generate_missingness_mask(edges_cache[name];
-							nodes          = net.nodes,
-							directed       = net.metadata.directed,
-							weighted       = net.metadata.weighted,
-							node_loss      = node_loss,
-							target_pi_node = pin,
-							target_pi_edge = pie,
-							target_rho     = rho_used,
-							seed           = rep_seed,
-							centrality     = centrality_cache[name],
-							true_community = comm_cache[name],
-							adj_binary     = adjb_cache[name],
-							adj_weighted   = adjw_cache[name],
-							K = K, gc_threshold = gc_threshold, min_n = min_n,
-							min_edges = min_edges, rho_tol = rho_tol,
-							ei_tvd_tol = ei_tvd_tol, max_retries = max_retries)
+						nodes          = net.nodes,
+						directed       = net.metadata.directed,
+						weighted       = net.metadata.weighted,
+						node_loss      = node_loss,
+						target_pi_node = pin,
+						target_pi_edge = pie,
+						target_rho     = rho_used,
+						seed           = rep_seed,
+						centrality     = centrality_cache[name],
+						true_community = comm_cache[name],
+						adj_binary     = adjb_cache[name],
+						adj_weighted   = adjw_cache[name],
+						K = K, gc_threshold = gc_threshold, min_n = min_n,
+						min_edges = min_edges, rho_tol = rho_tol,
+						ei_tvd_tol = ei_tvd_tol, max_retries = max_retries)
 				results[k] = (name = name, rho = rho, pin = pin, pie = pie, rep = rep,
 							   rho_used = rho_used, seed = rep_seed, record = rec)
 			end
@@ -2138,7 +2152,8 @@ module network_degeneracy
 	- `networks::Dict`: keyed by name $\to$ `(:edges, :nodes, :metadata)` with
 	  `:metadata.directed` and `:metadata.weighted`.
 	- `target_rhos`, `target_pi_nodes`, `target_pi_edges`: the grid; `pi_edge`
-	  entries apply only to weighted networks.
+	  entries apply to both types (weight removal when weighted, whole-tie
+	  removal when binary).
 	- `node_loss::Symbol`: `:emergent` (edge-induced organic losses, this paper)
 	  or `:targeted` (top up to `target_pi_node`, Phase 1.5); threaded to the
 	  mask. Default `:emergent`.
