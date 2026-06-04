@@ -1864,6 +1864,7 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 
 #	BINARY NETWORKS
 
+#	-15, 0, 15
 	binary_nets = sort([nm for nm in keys(networks) if !get(networks[nm].metadata, :weighted, false)])
 
 	binary_checks = Dict{String,NamedTuple}()
@@ -1903,4 +1904,20 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	for nm in binary_nets
 		check_binary_mechanism(networks[nm]; label = nm)
 		flush(stdout)
+	end
+
+#	-25, 0, 25
+	probe_nets = ["toledo_crime_weighted", "marvel_universe_weighted",
+					"balikatan_2022_weighted", "synthetic_1_sbm_undirected_weighted"]
+
+	for nm in probe_nets
+		net = networks[nm]
+		println("\n", nm)
+		for tr in (0.15, 0.25), pie in (0.1, 0.3, 0.5)
+			reps = _draw_replicates(net; target_pi_node = 0.10, target_rho = -tr,
+									target_pi_edge = pie, n_reps = 30, master_seed = 71,
+									node_loss = :emergent)
+			rr = [r.realized_rho for r in reps]
+			println("  target=-$tr  pi_edge=$pie  realized_rho mean=$(round(mean(rr); digits=3)) ∈[$(round(minimum(rr); digits=3)), $(round(maximum(rr); digits=3))]")
+		end
 	end

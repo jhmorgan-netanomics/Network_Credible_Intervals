@@ -1564,7 +1564,8 @@ module network_degeneracy
 										n_rank_bins::Int   = 4,
 										n_ei_bins::Int     = 3,
 										ei_min_count::Int  = 5,
-										max_retries::Int   = 10)
+										max_retries::Int   = 10,
+										return_removed::Bool = false)
 		"""
 		Args:
 			edges::DataFrame: original edge list with :src, :dst (+ :weight if weighted).
@@ -1726,6 +1727,9 @@ module network_degeneracy
 								  n_edges_zeroed = n_edges_zeroed,
 								  n_organic_losses = length(organic),
 								  beta = field.beta,
+								  degraded_edges = degraded_edges,
+								  observed_edges = mat.edges,
+								  observed_nodes = mat.nodes,
 								  gate = gate)
 
 				#	Accept on pass; otherwise keep the best-so-far for the
@@ -1754,7 +1758,7 @@ module network_degeneracy
 											min_edges    = min_edges)
 
 		#	Assemble per-replicate record
-			return (missing_nodes      = best.missing_nodes,
+			base_record = (missing_nodes      = best.missing_nodes,
 					n_full_removal      = best.n_full_removal,
 					n_nominations       = best.n_nominations,
 					nominal             = (pi_node = Float64(target_pi_node),
@@ -1775,6 +1779,12 @@ module network_degeneracy
 					retry_count         = retry_count,
 					sampler_degeneracy  = degen,
 					seed                = Int(seed))
+
+			return_removed || return base_record
+			return merge(base_record,
+					 (degraded_edges = best.degraded_edges,
+					  observed_edges = best.observed_edges,
+					  observed_nodes = best.observed_nodes))
 	end
 	@doc raw"""
 	**Description**
@@ -1808,11 +1818,19 @@ module network_degeneracy
 	  per-network artifacts (the orchestrator supplies these).
 	- `K`, `gc_threshold`, `min_n`, `min_edges`, `rho_tol`, `ei_tvd_tol`,
 	  `max_retries`: tuning knobs.
+	- `return_removed::Bool`: when `true`, the record additionally carries
+	  `degraded_edges` (edge list after weight removal -- zeros retained,
+	  row count invariant; removed ties are the rows whose weight reached
+	  zero) and the materialized observed network `observed_edges` /
+	  `observed_nodes` (full-removal nodes and their edges dropped,
+	  nominations retained). Default `false` (orchestrator path).
 
 	**Value**
 	`NamedTuple` carrying the combined missing set, materialization counts, final
 	realized priors, the non-gating edge-stage diagnostic, the gate/field status,
-	the retry count, sampler degeneracy, and the master seed.
+	the retry count, sampler degeneracy, and the master seed. With
+	`return_removed=true` it also carries the degraded edge list and the
+	materialized observed network (see Arguments).
 
 	**Notes**
 	Deterministic in the master seed: identical inputs produce identical records
