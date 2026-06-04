@@ -1781,20 +1781,8 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 #	Net-agnostic emergent contract check (run on any corpus network)
 	function run_emergent_checks(net::NamedTuple; comm = nothing, label::AbstractString = "",
 								  n_reps::Int = 30, master_seed::Integer = 71,
+								  sweep_rho::Real = 0.0,
 								  pi_edge_grid = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
-		"""
-		Returns:
-			NamedTuple (passed::Bool, details::String)
-		Notes:
-			Validates the :emergent contract on a real corpus network (no hand-built
-			brokers): (a) pi_node is a tilt knob, not a target — at pi_edge=0 :emergent
-			induces no loss while :targeted tops up; (b) across a pi_edge sweep the
-			missing set IS the organic edge-induced loss set, the proportion/survivor
-			counts follow, and the gate is record-only (contract_passed, retry_count==0).
-			Prints the emergent node-loss curve. comm defaults to
-			_true_communities(binary adjacency) when not supplied. On unweighted corpus
-			nets the curve is all zeros — binary edge removal is the deferred step 2.
-		"""
 		ndg  = Network_Credible_Intervals.network_degeneracy
 		adjb = _graph_to_sparse_matrix(net.edges; nodes = net.nodes, weighted = false)[1]
 		N    = size(adjb, 1)
@@ -1805,30 +1793,28 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 		println("Emergent contract on $name  (N=$N)")
 		println("─" ^ 70)
 
-		#	(a) pi_node is a tilt knob, not a target
-			em0 = _draw_replicates(net; target_pi_node = 0.30, target_rho = 0.0, target_pi_edge = 0.0,
-									   n_reps = n_reps, master_seed = master_seed,
-									   node_loss = :emergent, true_community = comm)
-			tg0 = _draw_replicates(net; target_pi_node = 0.30, target_rho = 0.0, target_pi_edge = 0.0,
-									   n_reps = n_reps, master_seed = master_seed,
-									   node_loss = :targeted, true_community = comm)
-			tilt_knob = all(length(r.missing_nodes) == 0 for r in em0) &&
-						all(r.realized_pi_node > 0 for r in tg0)
+		em0 = _draw_replicates(net; target_pi_node = 0.30, target_rho = 0.0, target_pi_edge = 0.0,
+								   n_reps = n_reps, master_seed = master_seed,
+								   node_loss = :emergent, true_community = comm)
+		tg0 = _draw_replicates(net; target_pi_node = 0.30, target_rho = 0.0, target_pi_edge = 0.0,
+								   n_reps = n_reps, master_seed = master_seed,
+								   node_loss = :targeted, true_community = comm)
+		tilt_knob = all(length(r.missing_nodes) == 0 for r in em0) &&
+					all(r.realized_pi_node > 0 for r in tg0)
 
-		#	(b) identity + invariants across a pi_edge sweep
-			identity = true; consist = true; record = true
-			loss_curve = Tuple{Float64,Int,Int}[]
-			for pe in pi_edge_grid
-				recs = _draw_replicates(net; target_pi_node = 0.10, target_rho = 0.0, target_pi_edge = pe,
-										   n_reps = n_reps, master_seed = master_seed + round(Int, 100pe),
-										   node_loss = :emergent, true_community = comm)
-				identity &= all(length(r.missing_nodes) == r.n_organic_losses for r in recs)
-				consist  &= all(r.realized_pi_node == r.n_organic_losses / N for r in recs) &&
-							all(r.sampler_degeneracy.n_observed == N - r.n_organic_losses for r in recs)
-				record   &= all(r.contract_passed for r in recs) && all(r.retry_count == 0 for r in recs)
-				losses = [r.n_organic_losses for r in recs]
-				push!(loss_curve, (pe, minimum(losses), maximum(losses)))
-			end
+		identity = true; consist = true; record = true
+		loss_curve = Tuple{Float64,Int,Int}[]
+		for pe in pi_edge_grid
+			recs = _draw_replicates(net; target_pi_node = 0.10, target_rho = sweep_rho, target_pi_edge = pe,
+									   n_reps = n_reps, master_seed = master_seed + round(Int, 100pe),
+									   node_loss = :emergent, true_community = comm)
+			identity &= all(length(r.missing_nodes) == r.n_organic_losses for r in recs)
+			consist  &= all(r.realized_pi_node == r.n_organic_losses / N for r in recs) &&
+						all(r.sampler_degeneracy.n_observed == N - r.n_organic_losses for r in recs)
+			record   &= all(r.contract_passed for r in recs) && all(r.retry_count == 0 for r in recs)
+			losses = [r.n_organic_losses for r in recs]
+			push!(loss_curve, (pe, minimum(losses), maximum(losses)))
+		end
 
 		println("  (a) pi_node tilt-not-target:  $(tilt_knob ? "YES" : "NO")")
 		println("  (b) missing == organic:       $(identity ? "YES" : "NO")")
@@ -1850,4 +1836,24 @@ using Network_Credible_Intervals.network_community_detection: _edgelist_to_spars
 	run_emergent_checks(networks["scotland_interlock_weighted"]; label = "scotland_interlock_weighted")
 	run_emergent_checks(networks["scotland_interlock_unweighted"];   label = "scotland_interlock_weighted")
 
-#	Come Back Here!!!
+	for (nm, nt) in sort(collect(networks); by = first)
+		get(nt.metadata, :weighted, false) || continue
+
+		println("─" ^ 70)
+		println("Network:  $nm")
+		println("Nodes:    ", nrow(nt.nodes))
+		println("Edges:    ", nrow(nt.edges))
+		println("Directed: ", get(nt.metadata, :directed, missing))
+		println("Weighted: ", get(nt.metadata, :weighted, missing))
+		println("Metadata: ", nt.metadata)
+		println("─" ^ 70)
+
+		run_emergent_checks(nt; label = nm)
+	end
+
+	for (nm, nt) in sort(collect(networks); by = first)
+		get(nt.metadata, :weighted, false) || continue
+		println("Running $nm ..."); flush(stdout)
+		run_emergent_checks(nt; label = nm, sweep_rho = -0.15)
+		flush(stdout)
+	end
