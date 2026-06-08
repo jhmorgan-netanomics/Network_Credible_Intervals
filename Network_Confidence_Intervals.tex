@@ -77,7 +77,7 @@
 \maketitle
 
 \begin{abstract}
-This document specifies a bootstrap-based framework for constructing approximate Bayesian credible intervals on network metrics computed from incomplete network observations. The framework extends and addresses limitations of the bootstrap methods described in Chapters~3 and~4 of Bellutta's dissertation (\emph{Forensic Analysis of Observed Social Networks}) by introducing three key innovations: (1)~explicit modeling of node-level missingness with a user-supplied prior on the correlation between centrality and missingness; (2)~structural-role binning via the E/I~index to recognize brokers as distinct from clustered hubs of equal degree; and (3)~rank-conditional probabilistic imputation of edges involving nominated non-respondents, generalizing the global reciprocity-rate approach used in \citet{SmithMorganMoody2022} (the present author's prior work) to a rank-rank conditional reciprocity matrix. These extensions allow the framework to handle unweighted networks (which the prior framework could not), networks with distance-semantic weights (via a transformation step), and networks whose structure departs from the stylized models used in prior evaluations. This document provides the algorithmic specification in full detail, intended as the basis for Python implementation and subsequent empirical validation.
+This document specifies a bootstrap-based framework for constructing approximate Bayesian credible intervals on network metrics computed from incomplete network observations. The framework extends and addresses limitations of the bootstrap methods in Chapters~3 and~4 of Bellutta's dissertation (\emph{Forensic Analysis of Observed Social Networks}) through three innovations: (1)~explicit modeling of node-level missingness governed by a user-supplied prior on the correlation between centrality and missingness; (2)~structural-role binning via the E/I~index, which separates brokers from clustered hubs of equal degree; and (3)~rank-conditional probabilistic imputation of edges involving nominated non-respondents, generalizing the global reciprocity rate of \citet{SmithMorganMoody2022}---the author's prior work---to a rank-rank conditional reciprocity matrix. Together these extensions let the framework handle unweighted networks (which the prior framework could not), networks with distance-semantic weights (via a transformation step), and networks whose structure departs from the stylized models of earlier evaluations. The specification is given in full as the basis for the Julia implementation and its empirical validation.
 \end{abstract}
 
 \section{Introduction}
@@ -87,8 +87,8 @@ Network analysts routinely work with incomplete observations of an underlying tr
 This framework provides a principled approach to constructing credible intervals on network metrics in this setting. The user supplies:
 \begin{itemize}[leftmargin=*, itemsep=2pt]
   \item An observed network~$\Gobs$
-  \item A prior~$\rho \in [-1, 1]$ on the correlation between node centrality and probability of being missing from observation
-  \item Their best estimate of the magnitude of missingness ($\pitotal$, or the components $\pinode$ and $\piedge$)
+  \item A prior~$\rho \in (-1, 1)$ on the correlation between node centrality and probability of being missing from observation
+  \item Their best estimate of the magnitude of missingness: the node fraction~$\pinode$ and the edge-weight fraction~$\piedge$. Because analysts usually have firmer intuition about missing nodes than missing weight, a convenience interface also accepts a single overall figure~$\pitotal$, treated as~$\pinode$ with~$\piedge$ left to its implied floor.
   \item The network measure(s) of interest
 \end{itemize}
 The framework then generates a posterior sample of plausible true networks consistent with these inputs, computes the requested measures on each, and returns credible intervals derived from the posterior sample.
@@ -97,7 +97,7 @@ The motivating use cases include covert network analysis (where central actors i
 
 \section{Relationship to Bellutta's Prior Work}
 
-The framework builds on the bootstrap methods described in Chapters~3 and~4 of Bellutta's dissertation, but extends them in several important ways. Understanding these extensions requires briefly recapping the prior framework's scope and limitations.
+The framework builds on the bootstrap methods described in Chapters~3 and~4 of Bellutta's dissertation, \emph{Forensic Analysis of Observed Social Networks}, but extends them in several important ways. Understanding these extensions requires briefly recapping the prior framework's scope and limitations.
 
 \subsection{Chapter 3: The Underlying Noise Model}
 
@@ -136,19 +136,19 @@ The Chapter~4 framework has several limitations that motivate this work:
 
 The framework introduced in this document addresses each limitation:
 
-\paragraph{Explicit node-level missingness.} The framework treats missing nodes as a first-class mechanism, separate from edge-weight loss. The parameter $\pinode$ governs the fraction of nodes believed missing, and a synthetic-node augmentation step adds plausible missing nodes to each replicate. The retained edge-weight mechanism ($\piedge$) becomes optional residual error on observed nodes.
+\paragraph{Explicit node-level missingness.} The framework treats missing nodes as a first-class mechanism, separate from edge-weight loss. The parameter $\pinode$ governs the fraction of nodes believed missing, and a synthetic-node augmentation step adds plausible missing nodes to each replicate. Edge-weight missingness ($\piedge$) becomes a secondary, floored dial: node additions and~$\rho$ fix its lower bound, and any weight beyond that floor is spread across observed and imputed edges alike.
 
 \paragraph{Centrality-correlated missingness via a user-supplied prior.} The parameter~$\rho \in (-1, 1)$ encodes the user's domain-knowledge belief about the association between node centrality and probability of being missing from observation. Positive~$\rho$ corresponds to settings where central actors are more likely to be hidden (covert networks, non-response among prominent people); negative~$\rho$ corresponds to settings where central actors are more visible (social media, surveillance prioritizing known figures); zero~$\rho$ recovers MCAR behavior. The framework converts~$\rho$ into a bin-assignment distribution that biases the centrality of added nodes accordingly.
 
-Internally, $\rho$ is interpreted as Kendall's $\tau_b$, the rank-based correlation between the missingness indicator (binary) and node centrality (continuous). This choice matches the user's rank-order intuition about missingness (``low-ranked nodes are likely to be missing'' is a statement about ranks, not raw centrality values), and it avoids an asymmetric-ceiling problem that arose under Pearson correlation in early framework development. On heavy-tailed networks (e.g., Marvel co-appearance, citation networks), Pearson correlation between missingness and centrality saturates at a much lower magnitude on the negative side than the positive side, because the many low-centrality nodes have near-identical values that fail to discriminate missing from observed. Kendall $\tau_b$ on ranks produces symmetric ceilings across networks and across the sign of~$\rho$, making the framework's behavior consistent regardless of network structure. The user-facing parameter $\rho \in (-1, 1)$ is unchanged from a standard correlation interface; the metric switch is internal.
+Internally, $\rho$ is interpreted as Kendall's $\tau_b$, the rank-based correlation between the missingness indicator (binary) and node centrality (continuous). This choice matches the user's rank-order intuition about missingness (``low-ranked nodes are likely to be missing'' is a statement about ranks, not raw centrality values), and it avoids an asymmetric-ceiling problem that arose under Pearson correlation in early framework development. On heavy-tailed networks (e.g., Marvel co-appearance, citation networks), Pearson correlation between missingness and centrality saturates at a much lower magnitude on the negative side than the positive side, because the many low-centrality nodes have near-identical values that fail to discriminate missing from observed. Kendall $\tau_b$ on ranks removes this sign asymmetry, giving comparable ceilings across networks and across the sign of~$\rho$. Two milder limits remain~--- an absolute ceiling that tightens as the missingness rate falls, and slight residual asymmetry at the lowest rates on the most heavy-tailed networks~--- but neither reintroduces the Pearson pathology. The user-facing parameter $\rho \in (-1, 1)$ is unchanged from a standard correlation interface; the metric switch is internal.
 
-\paragraph{Native support for unweighted networks.} Because node-level missingness is independent of edge-weight semantics, the framework operates on unweighted networks by skipping the edge-weight reversal step entirely. This is a substantive extension: the Chapter~4 framework cannot handle unweighted networks at all, but unweighted networks are central to several lines of prior work on missing-data bias in survey-based networks \citep[e.g.,][of which the present author was a co-author]{SmithMorganMoody2022}, and supporting them is one of the primary motivations for treating node missingness explicitly.
+\paragraph{Native support for unweighted networks.} Because node-level missingness is independent of edge-weight semantics, the framework operates on unweighted networks by skipping the weight-addition (Stage~2) step entirely. This is a substantive extension: the Chapter~4 framework cannot handle unweighted networks at all, but unweighted networks are central to several lines of prior work on missing-data bias in survey-based networks \citep[e.g.,][of which the present author was a co-author]{SmithMorganMoody2022}, and supporting them is one of the primary motivations for treating node missingness explicitly.
 
 \paragraph{Distance-semantic weight transformation.} The framework provides automatic transformation of distance-weighted networks to a count-like scale before processing, with three transformation methods (scaled reciprocal, max-minus-distance, exponential decay). Credible intervals returned by the framework apply to the transformed network, with explicit caveats about back-transformation.
 
 \paragraph{Reduced reliance on stylized network models.} Rather than fitting a parametric generative model (e.g., RDPG) to the observed network and bootstrapping from it, the framework uses empirical rank-rank connectivity directly. Each replicate's added-node edges are sampled from the observed network's empirical structure, conditional on the centrality and brokerage bins involved. The framework therefore makes no assumption that the true network follows any particular stylized form~--- it only assumes that the rank-rank structure observed in~$\Gobs$ is representative of the true network's rank-rank structure.
 
-\paragraph{Structural-role binning via the E/I index.} The framework uses two binning dimensions by default: degree centrality rank and the E/I~index. The E/I~index, derived from Louvain community detection on~$\Gobs$, distinguishes brokers (whose ties cross community boundaries) from clustered hubs (whose ties remain within a single community). This addresses a key weakness of degree-only binning: two nodes with identical degree may play fundamentally different structural roles, and treating them as exchangeable miscalibrates credible intervals for measures sensitive to bridging behavior (e.g., betweenness centrality). The framework falls back to degree-only binning automatically when community structure is not meaningful.
+\paragraph{Structural-role binning via the E/I index.} The framework uses two binning dimensions by default: degree centrality rank and the E/I~index. The E/I~index, derived from CHAMP community detection on~$\Gobs$ (a resolution sweep over the Leiden algorithm), distinguishes brokers (whose ties cross community boundaries) from clustered hubs (whose ties remain within a single community). This addresses a key weakness of degree-only binning: two nodes with identical degree may play fundamentally different structural roles, and treating them as exchangeable miscalibrates credible intervals for measures sensitive to bridging behavior (e.g., betweenness centrality). The framework falls back to degree-only binning automatically when community structure is not meaningful.
 
 \paragraph{Rank-conditional probabilistic imputation for nominated non-respondents.} In survey, surveillance, and informant-based settings, the analyst frequently knows that certain unobserved nodes exist because they appear as targets of edges from observed (respondent) nodes. These ``nominated non-respondents'' carry partial information~--- their incoming edges are known~--- but their outgoing behavior must be imputed. \citet{SmithMorganMoody2022}, the present author's prior work on missing-data bias in survey-based networks, found that probabilistic imputation, using the global reciprocity rate to impute reverse-direction edges, worked well across many directed-network settings. The framework generalizes this approach by computing a rank-conditional reciprocity matrix~$\Rmat$ where each cell gives the reciprocity rate for forward edges between specific rank-rank cell pairs, rather than a single global rate. This captures structural variation in reciprocity behavior (e.g., peripheral nodes reciprocate at different rates than central hubs, brokers exhibit characteristic asymmetries) while remaining computationally tractable, in contrast to model-based imputation approaches (e.g., ERGMs) that scale poorly. The framework distinguishes nominated non-respondents (handled via~$\Rmat$-based imputation in a new Stage~0.5) from non-nominated non-respondents (handled via the rank-rank matrix~$\Pmat$ in Stage~1).
 
@@ -163,14 +163,14 @@ This section provides the complete algorithmic specification of the framework. T
 \paragraph{Required inputs.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
   \item $\Gobs$: an observed network with $N$ nodes. The network may be directed or undirected, weighted (with non-negative integer edge weights representing counts) or unweighted. Distance-semantic networks must be transformed (see Section~\ref{sec:weight-semantics}).
-  \item $\rho \in [-1, 1]$: the prior correlation between node centrality and probability of being missing.
+  \item $\rho \in (-1, 1)$: the prior correlation between node centrality and probability of being missing.
   \item One or more network measures $m$ for which credible intervals are desired.
 \end{itemize}
 
 \paragraph{Missingness specification.} The user provides either the simple or advanced interface:
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item Simple: $\pitotal \in [0, 1]$, the overall fraction of the true network believed unobserved. The framework defaults this to $\pinode = \pitotal$, $\piedge = 0$.
-  \item Advanced: $\pinode \in [0, 1]$ and/or $\piedge \in [0, 1]$, the node-level and edge-level missingness fractions respectively. If only one is supplied, the other defaults to~0.
+  \item Simple: $\pitotal \in [0, 1)$, the overall fraction of the true network believed unobserved. The framework defaults this to $\pinode = \pitotal$, $\piedge = 0$.
+  \item Advanced: $\pinode \in [0, 1)$ and/or $\piedge \in [0, 1)$, the node-level and edge-level missingness fractions respectively. If only one is supplied, the other defaults to~0.
 \end{itemize}
 At least one of $\pinode$ or $\piedge$ must be positive. For unweighted networks, $\piedge$ is structurally inapplicable and must be~0; $\pinode > 0$ is required.
 
@@ -208,7 +208,7 @@ Mixed police data & Variable & Variable & User judgment \\
 
 \paragraph{Optional inputs.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item \texttt{community\_labels}: user-supplied community assignments, overriding Louvain detection
+  \item \texttt{community\_labels}: user-supplied community assignments, overriding CHAMP detection
   \item \texttt{weight\_semantics}: \texttt{"count"} (default) or \texttt{"distance"}; selects transformation behavior
   \item \texttt{partially\_observed\_nodes}: a list of node identifiers for nodes that appear in~$\Gobs$ as edge targets (i.e., they have incoming edges from respondents) but did not respond themselves. These are the ``nominated non-respondents'' handled by Stage~0.5. If not supplied, all node-level missingness is assumed to involve non-nominated nodes (handled by Stage~1).
 \end{itemize}
@@ -216,8 +216,8 @@ Mixed police data & Variable & Variable & User judgment \\
 \paragraph{Algorithm hyperparameters with defaults.}
 \begin{itemize}[leftmargin=*, itemsep=2pt]
   \item $B$: number of posterior samples (default 1000)
-  \item $K$: number of degree-rank bins. Default is automatic selection (\texttt{K = :auto}) via the function \texttt{find\_optimal\_K}, which iterates $K$ from a maximum tractable value down to a floor and returns the largest $K$ that satisfies the framework's three algorithmic priors (see Section~\ref{sec:three-priors}). Larger $K$ produces a Kendall $\tau_b$ ceiling closer to the rate-bounded absolute (fewer bin-level ties on the centrality side), at the cost of fewer observed nodes per bin. The default $K_{\max}$ is $\min(20, \lfloor N_{\text{obs}} / 5 \rfloor)$, the default $K_{\min}$ is~4. Users may override with an explicit integer when manual control is desired.
-  \item $J$: number of E/I bins (default 3, with semantic categories internal-leaning [$\EI < -0.33$], balanced [$-0.33 \leq \EI \leq 0.33$], broker-leaning [$\EI > 0.33$])
+  \item $K$: number of degree-rank bins. Default is automatic selection (\texttt{K = :auto}) via the function \texttt{find\_optimal\_K}, which iterates $K$ from a maximum tractable value down to a floor and returns the largest $K$ that satisfies the framework's algorithmic requirements (see Section~\ref{sec:three-priors}). Larger $K$ produces a Kendall $\tau_b$ ceiling closer to the rate-bounded absolute (fewer bin-level ties on the centrality side), at the cost of fewer observed nodes per bin. The default $K_{\max}$ is $\min(20, \lfloor N_{\text{obs}} / 5 \rfloor)$, the default $K_{\min}$ is~4. Users may override with an explicit integer when manual control is desired.
+  \item $J$: number of E/I bins (default 3, with semantic categories internal-leaning [$\EI \leq -0.33$], balanced [$-0.33 < \EI < 0.33$], broker-leaning [$\EI \geq 0.33$])
 \end{itemize}
 
 \subsection{Feasibility of $\rho$}
@@ -233,13 +233,11 @@ where $k$ is the number of missing nodes and $p = k/n$. This bound depends only 
 
 \paragraph{Practical tie-bounded ceiling.} On networks where centrality has many ties (most unweighted networks, where multiple nodes share the same degree), the achievable $|\tau_b|$ is further reduced below the absolute ceiling. Centrality ties contribute to the denominator of Kendall $\tau_b$, lowering the maximum that any sampling configuration can reach. The practical ceiling is network-specific and depends on the centrality distribution's tie structure.
 
-\paragraph{Feasibility check.} The framework provides a public function \texttt{feasible\_rho\_range} that probes the sampling mechanism at extreme configurations to estimate the practical $[\rho_{\min}, \rho_{\max}]$ achievable on a given network at a given rate. The wrapper \texttt{reconstruct\_network} calls this function at startup and emits a warning if the user's $\rho$ falls outside the practical range, with three tiers of warning intensity (silent, note, prompt) depending on the degree of infeasibility.
+\paragraph{Feasibility check.} The framework provides a public function \texttt{feasible\_rho\_range} that probes the sampling mechanism at extreme $\beta$ configurations to estimate the practical $[\rho_{\min}, \rho_{\max}]$ achievable on a given network at a given rate. \texttt{build\_reconstruction\_corpus} calls this function at startup and clamps the user's $\rho$ into the practical range, conditioning the entire sample on the clamped value and recording whether an adjustment occurred.
 
-\paragraph{What happens when $\rho$ exceeds the practical ceiling.} The framework does not silently clip or rescale. Instead, the Phase~1 sampler's bisection on the mixing scalar~$b$ saturates at the extreme value, and the resulting \emph{realized} $\rho$ is whatever the network can structurally produce. Phase~2's bin-distribution solver then honors the realized $\rho$ rather than the user's nominal request. Diagnostic output reports both nominal and realized values, allowing the user to interpret credible intervals appropriately.
+\paragraph{What happens when $\rho$ exceeds the practical ceiling.} The framework clamps the requested $\rho$ to the feasible envelope and conditions the sample on the clamped value. Because a credible interval is meaningful only relative to the prior actually enforced, the clamped (conditioned) $\rho$ becomes the operative prior, and both the requested and conditioned values are recorded. Within the conditioned target, the Step~5 $\beta$-solver may still return \texttt{:ceiling\_hit} if that value exceeds the $K$-dependent bin ceiling, in which case $\beta$ saturates at the bracket endpoint and the realized $\rho$ is the maximum the binning can produce. Diagnostic output reports nominal (requested), conditioned (clamped), and realized $\rho$, so the user can interpret the credible intervals against the prior that was actually applied.
 
 \paragraph{Asymmetry between $+\rho$ and $-\rho$.} Under Kendall $\tau_b$ with rank-based sampling weights (see Step~5), feasibility ceilings are typically symmetric: $|\rho_{\min}| \approx |\rho_{\max}|$. This is a substantive improvement over Pearson correlation, where heavy-tailed networks produced dramatically asymmetric ceilings (e.g., $\rho_{\max} \approx +0.4$ but $\rho_{\min} \approx -0.03$ on Marvel under Pearson). The \texttt{is\_asymmetric} flag in \texttt{feasible\_rho\_range} output retains a diagnostic for unusual cases but rarely fires under Kendall.
-
-
 
 \subsection{Weight Semantics and Transformation}
 \label{sec:weight-semantics}
@@ -270,7 +268,7 @@ The framework always uses the E/I~index as a second binning dimension alongside 
 \]
 where $E_i$ is the count (or weight, for weighted networks) of node~$i$'s external ties (crossing community boundaries) and $I_i$ is the count (or weight) of its internal ties. The index ranges from~$-1$ (purely internal) to~$+1$ (purely external).
 
-\paragraph{Community detection.} If user-supplied community labels are not provided, the framework runs Louvain modularity optimization on~$\Gobs$. For directed networks, the network is symmetrized for community detection only; the directed structure is retained for all other steps. For weighted networks, Louvain uses edge weights directly. Community detection runs once at setup and is held fixed across all replicates.
+\paragraph{Community detection.} If user-supplied community labels are not provided, the framework runs CHAMP community detection (a resolution sweep over the Leiden algorithm) on~$\Gobs$. For directed networks, CHAMP uses its directed modularity; for weighted networks, it uses edge weights directly. Community detection runs once at setup and is held fixed across all replicates.
 
 \paragraph{Fallback behavior.} If community detection returns a single community, or if E/I has insufficient variance to support~$J$ bins with at least three nodes per bin, the framework issues a diagnostic message and falls back to degree-only binning for the remainder of the run. This handles edge cases gracefully: networks with no meaningful community structure, very small networks where community detection is unreliable, and networks where all nodes have similar bridging behavior. The fallback is automatic; no user intervention is required. The binning mode used (2D or fallback to 1D) is reported in diagnostics.
 
@@ -299,15 +297,15 @@ Unlike the unconditional matrix~$\Pmat$, the reciprocity matrix~$\Rmat$ is funda
 
 \paragraph{Bin assignment for nominated non-respondents.} Each nominated non-respondent is placed in degree and E/I bins based on its \emph{observed} incoming edges. This means the bin assignment may under-estimate the node's true centrality (since outgoing edges are missing), but it uses only information actually available in~$\Gobs$. Adjusting for under-observation is left as an advanced extension.
 
-\paragraph{Undirected networks.} The reciprocity matrix~$\Rmat$ is undefined for undirected networks. For undirected~$\Gobs$, the framework treats edges between respondents and nominated non-respondents as fully observed (taking the respondent's report at face value), and uses the unconditional matrix~$\Pmat$ to impute edges between pairs of nominated non-respondents. This is a known limitation: undirected networks dominated by edges that respondents failed to report (measurement error) are less well-handled by the framework.
+\paragraph{Undirected networks.} Nominated non-respondents are a directed notion: their incoming ties are observed while their outgoing ties are missing. Undirected networks have no in/out asymmetry, so a missing undirected node is modeled as a full removal (handled by Stage~1), not as a nomination. Accordingly, the framework rejects \texttt{partially\_observed\_nodes} on undirected~$\Gobs$ rather than imputing them. This is a known limitation: undirected networks dominated by edges that respondents failed to report (measurement error) are less well-handled by the framework.
 
 \subsection{Edge Representation Convention}
 
 The framework operates on networks that may be directed or undirected, weighted or unweighted:
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item Directed networks: centrality combines in-degree and out-degree; rank-rank matrices index ordered pairs; added-node edges are sampled separately for outgoing and incoming directions.
+  \item Directed networks: centrality is in-degree; rank-rank matrices index ordered pairs; added-node edges are sampled separately for outgoing and incoming directions.
   \item Undirected networks: centrality is total degree; rank-rank matrices are symmetric and index unordered pairs; added-node edges are sampled once per pair.
-  \item Weighted networks: edge-weight reversal (Stage~2) is available; added-node edge weights are drawn from Poisson distributions.
+  \item Weighted networks: each imputed tie enters at weight~1 (the floor), with diffuse additional weight redistributed in Stage~2; added-node tie counts are drawn from Poisson tendencies.
   \item Unweighted networks: Stage~2 is skipped; added-node edges have weight~1 by construction; the rank-rank weight matrix is unnecessary.
 \end{itemize}
 Self-loops are ignored throughout. Multigraphs must be collapsed to weighted single-edge form before input.
@@ -318,183 +316,40 @@ Self-loops are ignored throughout. Multigraphs must be collapsed to weighted sin
 If \texttt{weight\_semantics = "distance"}, apply the selected transformation to~$\Gobs$. All subsequent steps operate on the transformed network. Transformation parameters are recorded for output metadata.
 
 \paragraph{Step 0b: Resolve missingness parameters.}
-If~$\Gobs$ (post-transformation, if applicable) is unweighted, set $\piedge = 0$ regardless of user input, issue a warning if the user supplied a non-zero $\piedge$, and require $\pinode > 0$. Otherwise: if $\pinode$ and/or $\piedge$ are explicitly provided, use them as given (defaulting the unspecified one to~0); else if $\pitotal$ is provided, set $\pinode = \pitotal$ and $\piedge = 0$. Validate that $\pinode, \piedge \in [0, 1]$ and at least one is positive.
+If~$\Gobs$ (post-transformation, if applicable) is unweighted, set $\piedge = 0$ regardless of user input, issue a warning if the user supplied a non-zero $\piedge$, and require $\pinode > 0$. Otherwise: if $\pinode$ and/or $\piedge$ are explicitly provided, use them as given (defaulting the unspecified one to~0); else if $\pitotal$ is provided, set $\pinode = \pitotal$ and $\piedge = 0$. Validate that $\pinode, \piedge \in [0, 1)$ and at least one is positive.
 
 \subsection{Setup Phase}
 
 \paragraph{Step 1: Compute observed centrality.}
-For directed~$\Gobs$, set degree centrality as in-degree plus out-degree per node. For undirected~$\Gobs$, set centrality as degree. Rank nodes by centrality; ties broken consistently.
+For directed~$\Gobs$, set centrality as in-degree per node; this is the rho basis against which missingness is correlated, and it is deliberately the destination endpoint only. For undirected~$\Gobs$, set centrality as degree. Rank nodes by centrality; ties broken consistently.
 
 \paragraph{Step 1.5: Detect community structure and compute E/I.}
-If user-supplied community labels are provided, use them. Otherwise, apply Louvain to~$\Gobs$ (symmetrizing first if directed; using weights if weighted). Check whether the community structure is meaningful: more than one community detected, and E/I values supporting~$J$ bins with at least three nodes each. If meaningful, compute~$\EI_i$ for each observed node and rank by~$\EI$. If not, fall back to degree-only binning for the remainder of the run and log a diagnostic.
+If user-supplied community labels are provided, use them. Otherwise, apply CHAMP to~$\Gobs$ (directed modularity if directed; using weights if weighted). Check whether the community structure is meaningful: more than one community detected, and E/I values supporting~$J$ bins with at least three nodes each. If meaningful, compute~$\EI_i$ for each observed node and rank by~$\EI$. If not, fall back to degree-only binning for the remainder of the run and log a diagnostic.
 
 \paragraph{Step 2: Bin observed nodes.}
 Partition observed nodes into~$K$ equally-sized degree bins, with bin~1 the most peripheral and bin~$K$ the most central. If 2D binning is active, additionally partition into~$J$ E/I bins using the semantic thresholds ($-0.33$, $+0.33$) for $J = 3$, or equally-sized rank bins for other~$J$.
 
 \paragraph{Step 3: Compute the rank-rank connectivity matrix $\Pmat$.}
-For each cell pair $(c, c')$ (ordered for directed networks, unordered for undirected), compute
+For each cell pair $(c, c')$ (ordered for directed networks, unordered for undirected), compute the Laplace-smoothed connection probability
 \[
-p_{c, c'} = \frac{\text{count of edges from cell~$c$ to cell~$c'$} + 1}{\text{total ordered pairs between cells} + 2}
+p_{c, c'} = \frac{e_{c, c'} + 1}{n_{c, c'} + 2},
 \]
-(Laplace-smoothed) and, for weighted networks,
-\[
-w_{c, c'} = \text{mean weight of edges from~$c$ to~$c'$, conditional on edge presence}.
-\]
-For unweighted networks, only $P$ is computed. If a cell pair has no observed edges, $w_{c, c'} = 0$ and any sampled edge from that pair is assigned weight~1. The matrix is computed over all respondent-respondent dyads in~$\Gobs$ (excluding any partially observed nodes, which are placed using their own observed edges separately).
-
-\paragraph{Step 3.5: Compute the reciprocity matrix $\Rmat$ (directed networks only).}
-For each ordered cell pair $(c, c')$, compute the Laplace-smoothed conditional reciprocity rate
-\[
-\Rmat_{c, c'} = \frac{|\{(i, j) : i \in c, \, j \in c', \, w(i, j) > 0, \, w(j, i) > 0\}| + 1}{|\{(i, j) : i \in c, \, j \in c', \, w(i, j) > 0\}| + 2}.
-\]
-Computed only over respondent-respondent dyads. The matrix $\Rmat$ is generally asymmetric: $\Rmat_{c, c'} \neq \Rmat_{c', c}$ in most networks. This step is skipped for undirected networks, where $\Rmat$ is undefined.
-
-\paragraph{Step 4: Determine the number of nodes to add (non-nominated case).}
-Let $N_{\text{nom}}$ be the number of partially observed (nominated non-respondent) nodes supplied by the user. The framework adds $\Nadd$ \emph{additional} synthetic nodes representing non-nominated non-respondents:
-\[
-\Nadd = \mathrm{round}\left(\frac{\pinode \cdot (N + N_{\text{nom}})}{1 - \pinode}\right) - N_{\text{nom}}.
-\]
-If $N_{\text{nom}} = 0$, this reduces to $\Nadd = \mathrm{round}(\pinode \cdot N / (1 - \pinode))$ as in the original formulation. If $\pinode = 0$, skip both Stage~0.5 and Stage~1; the framework reduces to Stage~2 only. The total number of nodes in each replicate's true-network estimate is $N + N_{\text{nom}} + \Nadd$.
-
-\paragraph{Step 5: Determine the bin-assignment distribution for added nodes.}
-Find a distribution~$q$ over degree bins $\{1, \ldots, K\}$ such that drawing $\Nadd$ bins from~$q$ yields realized Kendall $\tau_b$ correlation~$\rho$ between the bin index and the missingness indicator across all $N + \Nadd$ nodes. Use the logistic form
-\[
-q_b \propto \exp(\beta \cdot \tilde{b}),
-\]
-where $\tilde{b}$ is the standardized bin index. Solve numerically for~$\beta$ such that the induced Kendall $\tau_b$ matches~$\rho$:
-\begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item $\rho > 0$: $\beta > 0$, $q$ skews toward high bins
-  \item $\rho < 0$: $\beta < 0$, $q$ skews toward low bins
-  \item $\rho = 0$: $\beta = 0$, $q$ uniform across bins
-\end{itemize}
-
-\paragraph{Analytic Kendall $\tau_b$ formula.} Because bins are ordinal and missingness is binary, Kendall $\tau_b$ has a closed-form expression as a function of $\beta$, $K$, $N$, and $\Nadd$. Only cross-pairs (one observed node, one added node) contribute to concordant/discordant counts; same-status pairs are tied on the indicator. With observed nodes uniformly distributed across bins ($N/K$ per bin) and added nodes distributed by $q$:
-\[
-C = \frac{N}{K} \cdot \Nadd \cdot \sum_{k=1}^{K} q_k \cdot (k - 1), \qquad
-D = \frac{N}{K} \cdot \Nadd \cdot \sum_{k=1}^{K} q_k \cdot (K - k),
-\]
-\[
-T_x = \frac{N \cdot \Nadd}{K}, \qquad
-T_y = \frac{N^2 (K - 1)}{2K} + \frac{\Nadd^2}{2}\left(1 - \sum_k q_k^2\right),
-\]
-\[
-\tau_b = \frac{C - D}{\sqrt{(C + D + T_x)(C + D + T_y)}}.
-\]
-This is the function being numerically inverted to solve for~$\beta$. The formula is monotone increasing in~$\beta$, so a straightforward bisection on $\beta \in [-50, 50]$ converges in a small number of iterations to tight tolerance.
-
-\paragraph{$K$-dependent ceiling.} The maximum achievable $|\tau_b|$ from Step~5's mechanism depends on~$K$: larger~$K$ reduces the bin-side ties $T_x$ and lifts the ceiling closer to the rate-bounded absolute $\sqrt{2 p (1 - p)}$. Smaller~$K$ increases bin ties and lowers the ceiling. This is one reason the framework's default $K$ is chosen by \texttt{find\_optimal\_K} (Section~\ref{sec:three-priors}): for a user-specified $\rho$ near the rate-bounded ceiling, only sufficiently large $K$ can avoid \texttt{:ceiling\_hit} in the bisection.
-
-\paragraph{$\beta$-solver status.} The solver returns one of three statuses: \texttt{:converged} (bisection found $\beta$ within tolerance of the target), \texttt{:ceiling\_hit} (target exceeds the $K$-dependent achievable maximum; $\beta$ saturates at the bracket endpoint), or \texttt{:failed\_other} (degenerate case, e.g., $\Nadd = 0$ with nonzero target). The status is recorded in diagnostics.
-
-In 2D binning mode, also compute the empirical conditional distribution of E/I bin given degree bin in~$\Gobs$, for use in Step~6.
-
-\subsection{Replicate Generation Phase}
-
-For each replicate $b \in \{1, \ldots, B\}$:
-
-\paragraph{Step 6: Draw bin assignments for added nodes (if $\pinode > 0$).}
-For each of $\Nadd$ added nodes, draw a degree-bin assignment from~$q$. In 2D binning mode, draw an E/I-bin assignment from the conditional distribution given the assigned degree bin.
-
-\paragraph{Step 6.5: Stage 0.5 --- impute edges for nominated non-respondents (if $N_{\text{nom}} > 0$).}
-This stage processes nominated non-respondents using their observed incoming edges and the reciprocity matrix~$\Rmat$. Each nominated non-respondent~$E$ enters this stage with its known incoming edges from respondents already in place; only the outgoing and additional edges need imputation.
-
-\textit{Directed case.} For each nominated non-respondent~$E$:
-\begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item \textbf{Reverse edges to respondents who nominated $E$.} For each respondent~$A$ with an observed forward edge $A \to E$: draw $\mathrm{Bernoulli}(\Rmat_{c_A, c_E})$ for the reverse edge $E \to A$, where $c_A$ and $c_E$ are the cell assignments of $A$ and $E$. If yes, assign weight~1 (unweighted) or draw weight from $\mathrm{Poisson}(w_{c_E, c_A})$ with minimum~1 (weighted).
-  \item \textbf{Outgoing edges to respondents who did not nominate $E$.} For each respondent~$A$ with no observed edge to or from~$E$: draw $\mathrm{Bernoulli}(p_{c_E, c_A})$ for the edge $E \to A$. If yes, assign weight as above. This uses the unconditional matrix~$\Pmat$ because there is no forward edge to condition on.
-  \item \textbf{Edges between pairs of nominated non-respondents.} For each pair $(E, F)$ of nominated non-respondents: draw both $E \to F$ and $F \to E$ independently via $\mathrm{Bernoulli}(p)$ using the appropriate cells of~$\Pmat$.
-\end{itemize}
-
-\textit{Undirected case.} The reciprocity matrix~$\Rmat$ does not apply. For each nominated non-respondent~$E$:
-\begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item \textbf{Observed edges from respondents to $E$ are taken as given} (no imputation needed).
-  \item \textbf{Edges between pairs of nominated non-respondents.} For each unordered pair $\{E, F\}$: draw $\mathrm{Bernoulli}(p)$ using the appropriate cell of~$\Pmat$; if yes, assign weight as above.
-\end{itemize}
-
-\paragraph{Step 7: Stage 1 --- add edges incident to non-nominated added nodes.}
-
-\textit{Directed case.} For each added node~$v$ (synthetic, non-nominated) with bin assignment(s):
-\begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item \textbf{Outgoing edges from~$v$ to observed and nominated nodes.} For each such target node~$j$: draw $\mathrm{Bernoulli}(p)$ using the appropriate cell pair. If yes, assign weight~1 (unweighted) or draw weight from $\mathrm{Poisson}(w)$ with minimum~1 (weighted).
-  \item \textbf{Incoming edges from observed and nominated nodes to~$v$.} Same logic with reversed direction.
-  \item \textbf{Edges between added nodes.} Same logic, both endpoints added.
-\end{itemize}
-
-\textit{Undirected case.} For each added node~$v$:
-\begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item \textbf{Edges between~$v$ and observed or nominated nodes.} For each such node~$j$: draw $\mathrm{Bernoulli}(p)$ using the appropriate cell pair. If yes, assign weight as above.
-  \item \textbf{Edges between pairs of added nodes.} For each unordered added-node pair: draw $\mathrm{Bernoulli}(p)$; if yes, assign weight as above.
-\end{itemize}
-
-The result is~$\Gaug$: $\Gobs$ (post-transformation if applicable) plus nominated non-respondents with their imputed edges (from Stage~0.5) plus $\Nadd$ synthetic nodes with their sampled edges. No new edges are created between two original respondent nodes. No self-loops are sampled.
-
-\paragraph{Step 8: Stage 2 --- reverse the edge-weight removal process (if $\piedge > 0$).}
-Skipped entirely if~$\Gobs$ is unweighted or $\piedge = 0$. Let $\Waug$ be the total edge weight in~$\Gaug$. Compute
-\[
-\Wadd = \mathrm{round}\left(\frac{\piedge \cdot \Waug}{1 - \piedge}\right).
-\]
-Sample $\Wadd$ weight units, each assigned to an existing edge with probability proportional to current weight, with replacement; increment the corresponding edge weights. This inverts Chapter~3's removal mechanism: where the noise model removed weight units proportional to current weight, we add them back the same way. The result is~$\Gb$.
-
-\paragraph{Step 9: Compute measure(s) on the replicate.}
-For network-level measures, compute $m(\Gb)$. For node-level measures, compute $m_i(\Gb)$ for each respondent node~$i$ in~$\Gobs$ and (optionally) for each nominated non-respondent. Synthetic added nodes are nuisance variables introduced for structural realism; their measure values are not reported. Nominated non-respondents have partial observed data plus imputed edges, so node-level credible intervals for these nodes reflect both observational and imputation uncertainty.
-
-\subsection{The Three-Prior Algorithmic Contract}
-\label{sec:three-priors}
-
-The framework operates as an algorithmic contract that honors three priors on each replicate:
-
-\begin{enumerate}[leftmargin=*, itemsep=4pt]
-  \item \textbf{Prior~1 (proportion missing).} The user supplies $\pinode$. The framework honors this via the arithmetic identity $\Nadd / (N + \Nadd) = \pinode$ (modulo integer rounding). Verified by the inputs to \texttt{\_determine\_n\_add}.
-
-  \item \textbf{Prior~2 (centrality-missingness correlation).} The user supplies $\rho$. The framework honors this via the $\beta$ solver in Step~5, which finds $\beta$ such that the analytic Kendall $\tau_b$ between bin index and missingness equals $\rho$ within tolerance. When $\rho$ exceeds the $K$-dependent ceiling, the solver returns \texttt{:ceiling\_hit}, and the realized $\rho$ is the maximum achievable at the given $K$, $N$, and $\Nadd$. Both \texttt{:converged} and \texttt{:ceiling\_hit} are contract-compliant responses; the framework's job is to tell the user honestly what it could and could not achieve.
-
-  \item \textbf{Prior~3 (E/I distribution conditional on degree).} This prior is \emph{inferred} from $\Gobs$ rather than user-supplied. The framework computes the empirical conditional distribution $P(\text{E/I bin} \mid \text{degree bin})$ from observed nodes and uses it to assign E/I bins to added nodes (with uniform fallback for empty degree bins). The contract is that added nodes' E/I distribution matches $\Gobs$'s empirical conditional row-by-row.
-\end{enumerate}
-
-\paragraph{What the contract guarantees and what it does not.} The contract guarantees the framework will honor each prior \emph{algorithmically}: the realized values across replicates will match the priors within tolerance, or the framework will report exactly where it could not (via \texttt{:ceiling\_hit} status flags). The contract does \emph{not} guarantee that the user's priors are \emph{correct}: a user who specifies $\rho = 0$ when the truth is $\rho = 0.5$ will receive miscalibrated credible intervals, but the framework will honor $\rho = 0$ as requested.
-
-\paragraph{Automatic $K$ selection.} The function \texttt{find\_optimal\_K} searches for the largest $K$ that satisfies all three priors. Because the Phase~2 analytic Kendall ceiling depends on $K$ (larger $K$ permits larger realized $\rho$), users specifying $\rho$ near the rate-bounded ceiling benefit from larger $K$ to avoid \texttt{:ceiling\_hit}. The search is preceded by a feasibility check via \texttt{feasible\_rho\_range}: if $\rho$ is structurally infeasible, the function returns immediately with \texttt{:rho\_infeasible} rather than searching $K$ values that cannot succeed.
-
-\subsection{Aggregation Phase}
-
-\paragraph{Step 10: Summarize the posterior sample.}
-For each network-level measure~$m$, the posterior sample is $\{m(\Gb)\}_{b=1}^{B}$. Default summaries: posterior median and 95\% credible interval $[\text{quantile}(0.025), \text{quantile}(0.975)]$. For each node-level measure and each original observed node~$i$, the posterior sample is $\{m_i(\Gb)\}_{b=1}^{B}$, with per-node default summaries identical in form.
-
-\subsection{Output}
-
-The framework returns:
-\begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item \textbf{Primary output:} the full posterior sample ($B$ values per network-level measure, or $B$ values per observed node per node-level measure)
-  \item \textbf{Default summaries:} posterior median and 95\% credible interval; alternative credible levels and other summaries can be computed from the sample
-  \item \textbf{Reference values:} $m(\Gobs)$ on the observed (post-transformation if applicable) network
-  \item \textbf{Diagnostics:} 
-  \begin{itemize}[leftmargin=*, itemsep=1pt]
-    \item Nominal vs. realized $\rho$ (Kendall $\tau_b$) per replicate, with summary across replicates
-    \item Nominal vs. realized missingness rate per replicate
-    \item $\beta$ solver status distribution (\texttt{:converged}, \texttt{:ceiling\_hit}, \texttt{:failed\_other}) across replicates
-    \item Feasibility output from \texttt{feasible\_rho\_range}: practical $[\rho_{\min}, \rho_{\max}]$ at the user's missingness rate, MC standard errors, asymmetry flag
-    \item $K$ selected by \texttt{find\_optimal\_K} (if \texttt{K = :auto}) and per-$K$ test trace
-    \item Transformation parameters used (if weight semantics required transformation)
-    \item Community structure used and E/I distributions
-    \item Binning mode (2D or fallback to 1D) and any fallback reason
-    \item Per-replicate degeneracy flags (giant-component fraction, empty bins, etc.) for downstream filtering
-  \end{itemize}
-\end{itemize}
+where $e_{c, c'}$ is the number of observed edges from cell~$c$ to cell~$c'$ and $n_{c, c'}$ is the number of ordered node pairs between the two cells. For weighted networks, also compute the conditional mean weight $w_{c, c'}$: the mean weight of edges from cell~$c$ to cell~$c'$ given that an edge is present. For unweighted networks, only $\Pmat$ is computed. The matrices are computed over all respondent-respondent dyads in~$\Gobs$ (excluding any partially observed nodes, which are placed using their own observed edges separately).
 
 \section{Key Assumptions}
 
 The framework makes the following assumptions, which users should consider when interpreting results:
 
 \begin{enumerate}[leftmargin=*, itemsep=4pt]
-  \item \textbf{Edge presence among respondent nodes is fully observed.} Any two respondent nodes (i.e., observed nodes that are not partially observed nominated non-respondents) either interacted (and we recorded it) or did not. For weighted networks, Stage~2 may add weight to existing edges but does not create new edges among respondents. For unweighted networks, no edge modifications among respondents occur at all. Edges involving nominated non-respondents are partially observed and handled by Stage~0.5; edges involving non-nominated added nodes are handled by Stage~1.
+\item \textbf{Edge presence among respondent nodes is fully observed.} Respondents report their own ties accurately: for any two respondent nodes (observed nodes that are not partially observed nominated non-respondents), the recorded presence or absence of an edge is taken as correct, and the framework never creates or deletes an edge between two respondents. For weighted networks, Stage~2 may redistribute weight onto existing edges, but it adds no respondent-respondent edge; for unweighted networks, no respondent-respondent edge is modified at all. The assumption covers respondent-respondent dyads only. A nominated non-respondent is observed solely through the ties respondents reported \emph{to} it~--- its own outgoing ties are unobserved and are imputed in Stage~0.5~--- and non-nominated added nodes are absent entirely and are introduced in Stage~1; neither is assumed fully observed.
 
   \item \textbf{Rank-rank connection structure in~$\Gobs$ is representative of the true network.} The probability that a node in cell~$c$ connects to a node in cell~$c'$ in the truth equals the empirical $p_{c,c'}$ from~$\Gobs$ in expectation.
 
   \item \textbf{Rank-conditional reciprocity behavior is representative.} For directed networks, the empirical reciprocity rate $\Rmat_{c, c'}$ observed among respondent-respondent dyads is representative of reciprocity behavior involving nominated non-respondents at the same rank-rank cell pair. This generalizes the assumption in \citet{SmithMorganMoody2022} that a single global reciprocity rate could be used for imputation; the framework's assumption is that reciprocity varies by rank-rank cell but is otherwise constant.
 
-  \item \textbf{$\rho$ is a genuine prior, not estimated from~$\Gobs$.} Users supply~$\rho$ based on domain knowledge about the observation process, not by looking at the data. The framework interprets~$\rho$ internally as Kendall's $\tau_b$ between the missingness indicator and node centrality. When the user's $\rho$ exceeds the practical feasibility ceiling (Section~\ref{sec:feasibility}), the framework operates at the ceiling and reports both nominal and realized values via diagnostics; the contract is algorithmic compliance with what is structurally achievable, not silent overrides of the user's request.
+  \item \textbf{$\rho$ is a genuine prior, not estimated from~$\Gobs$.} Users supply~$\rho$ based on domain knowledge about the observation process, not by looking at the data. The framework interprets~$\rho$ internally as Kendall's $\tau_b$ between the missingness indicator and node centrality. When the user's $\rho$ exceeds the practical feasibility ceiling (Section~\ref{sec:feasibility}), the framework clamps it to the feasible envelope, conditions the sample on the clamped value, and reports nominal, conditioned, and realized $\rho$ via diagnostics; the contract is algorithmic compliance with what is structurally achievable, not silent overrides of the user's request.
 
-  \item \textbf{Bin membership, not node identity, governs sampling.} All observed nodes in the same cell are treated as exchangeable. This is the framework's central simplifying assumption (see Section on bin exchangeability).
+  \item \textbf{Bin membership, not node identity, governs sampling.} All observed nodes in the same cell are treated as exchangeable. This is the framework's central simplifying assumption.
 
   \item \textbf{Observed-node properties are fixed across replicates.} Degree ranks, E/I ranks, and community labels are computed once on~$\Gobs$ and held constant. Added nodes are assigned bins but do not enter the rankings that define bins. Nominated non-respondents are binned based on their observed incoming edges only.
 
@@ -502,7 +357,7 @@ The framework makes the following assumptions, which users should consider when 
 
   \item \textbf{Default behavior treats missingness as node-level.} Edge-level error on observed nodes ($\piedge$) is opt-in via the advanced interface or non-zero explicit specification, and is unavailable for unweighted networks.
 
-  \item \textbf{Community structure derived from~$\Gobs$ reflects the true community structure.} Louvain output (or user-supplied labels) is treated as fixed and correct. To the extent the true community structure differs from what is detected in~$\Gobs$~--- particularly because missingness may obscure community boundaries~--- the E/I~index becomes a noisier signal of bridging behavior.
+  \item \textbf{Community structure derived from~$\Gobs$ reflects the true community structure.} The detected community structure---CHAMP output, or user-supplied labels---is treated as fixed and correct. To the extent the true community structure differs from what is detected in~$\Gobs$~--- particularly because missingness may obscure community boundaries~--- the E/I~index becomes a noisier signal of bridging behavior.
 
   \item \textbf{Higher-order structural patterns beyond degree and E/I are not directly modeled.} Triadic closure, attribute homophily, and other patterns appear in replicate networks only to the extent that they correlate with the binning variables. Networks dominated by patterns orthogonal to the binning are less faithfully reproduced.
 
@@ -514,31 +369,33 @@ The framework makes the following assumptions, which users should consider when 
 The following are explicitly outside the scope of this framework:
 
 \begin{itemize}[leftmargin=*, itemsep=2pt]
-  \item Creation of edges between two respondent nodes (the framework assumes edge \emph{presence} among respondents is correctly observed; only \emph{weights} are uncertain, and only for weighted networks). Edges involving nominated non-respondents \emph{are} created/imputed by Stage~0.5.
-  \item Respondent measurement error: cases where a respondent failed to report an edge to another respondent that actually exists. The framework treats all respondents as accurate reporters of their own edges.
-  \item Non-uniform edge-weight missingness (Stage~2 is MCAR at the weight-unit level among existing edges)
-  \item Spurious edges in the observed network (the framework assumes observed structure is correct, not over-reported)
-  \item Higher-order structural patterns beyond degree and~$\EI$ (triadic closure, attribute homophily, community structure orthogonal to the bins are captured only incidentally)
-  \item Changes in node ranks or community memberships due to the augmentation process (all are fixed at~$\Gobs$)
-  \item Self-loops in added-node sampling (excluded by convention)
-  \item Multigraphs in input (must be collapsed to weighted single-edge form before running)
-  \item Edge-weight missingness for unweighted networks (structurally impossible)
-  \item Native handling of distance, dissimilarity, or lower-is-stronger weight semantics (must be transformed to count-like scale via the framework's preprocessing step)
-  \item Separate prior on brokerage-missingness correlation ($\rho$ governs degree-missingness; E/I assignment is conditional on degree)
-  \item Uncertainty in the detected community structure (Louvain output is treated as fixed)
-  \item Reciprocity-based imputation for undirected networks (the reciprocity matrix~$\Rmat$ is undefined; nominated non-respondents in undirected networks are handled with the unconditional rank-rank matrix~$\Pmat$ only)
-  \item Silent enforcement of structurally infeasible $\rho$ priors. When the user's $\rho$ exceeds the rate-bounded or tie-bounded ceiling, the framework operates at the achievable ceiling, reports the realized $\rho$ alongside the nominal, and emits a diagnostic. It does not silently rescale or clip the user's input.
+\item Creation of edges between two respondent nodes (the framework assumes edge \emph{presence} among respondents is correctly observed; only \emph{weights} are uncertain, and only for weighted networks). Edges involving nominated non-respondents \emph{are} created/imputed by Stage~0.5.
+\item Respondent measurement error: cases where a respondent failed to report an edge to another respondent that actually exists. The framework treats all respondents as accurate reporters of their own edges.
+\item A user-specified non-uniform edge-weight missingness mechanism. Stage~2 distributes the weight budget across existing and imputed edges in proportion to current weight times an endpoint-survival tilt drawn from the same $\rho$-field that governs node missingness; it reduces to current-weight-proportional allocation (the Bellutta MCAR corner) only at $\rho = 0$. There is no separate dial for edge-weight non-uniformity.
+\item Spurious edges in the observed network (the framework assumes observed structure is correct, not over-reported)
+\item Higher-order structural patterns beyond degree and~$\EI$ (triadic closure, attribute homophily, community structure orthogonal to the bins are captured only incidentally)
+\item Changes in node ranks or community memberships due to the augmentation process (all are fixed at~$\Gobs$)
+\item Self-loops in added-node sampling (excluded by convention)
+\item Multigraphs in input (must be collapsed to weighted single-edge form before running)
+\item Edge-weight missingness for unweighted networks (structurally impossible)
+\item Native handling of distance, dissimilarity, or lower-is-stronger weight semantics (must be transformed to count-like scale via the framework's preprocessing step)
+\item Separate prior on brokerage-missingness correlation ($\rho$ governs degree-missingness; E/I assignment is conditional on degree)
+\item Uncertainty in the detected community structure (CHAMP output, or user-supplied labels, is treated as fixed)
+\item Reciprocity-based imputation for undirected networks. The reciprocity matrix~$\Rmat$ is undefined for undirected input~--- every undirected edge is mutual by construction~--- and Stage~0.5 imputes a non-respondent's missing \emph{outgoing} ties, which has no undirected analogue. The framework therefore rejects undirected input carrying nominated non-respondents rather than imputing them.
+\item Silent enforcement of structurally infeasible $\rho$ priors. When the user's $\rho$ exceeds the rate-bounded or tie-bounded ceiling, the framework clamps it to the feasible envelope, conditions the sample on the clamped value, and emits a diagnostic reporting nominal, conditioned, and realized $\rho$. The clamping is explicit and recorded; the framework does not silently substitute a feasible value for the request or proceed as though the request had been honored.
 \end{itemize}
 
 \section{Next Steps}
 
-This document specifies the algorithm in sufficient detail for Python implementation. Subsequent work will include:
+This document specifies the algorithm as the basis for its Julia implementation and empirical validation. The work ahead spans completing the user-facing layer, building an evaluation harness for the known-ground-truth case, and carrying out the validation program:
 \begin{enumerate}[leftmargin=*, itemsep=2pt]
-  \item Implementation of the framework in Python, with attention to computational efficiency for the $B$~replicates and the rank-rank matrix construction
-  \item Empirical validation on simulated networks with known ground truth, varying network type, missingness mechanism, and~$\rho$
-  \item Validation on real network data, including the covert and survey-based networks used in prior work
-  \item Comparison against the Chapter~4 bootstrap methods to assess whether the framework's intervals are better calibrated under non-random missingness
-  \item Extension to multidimensional (multiplex and/or dynamic) networks, building on the tensor representations developed in Chapter~3
+  \item Completing the orchestration layer that draws the~$B$ replicates from the reconstruction procedure and assembles the requested measures into a credible interval~--- the single entry point that turns an observed network and a prior into an interval.
+  \item Implementing the calibration diagnostics for the known-ground-truth setting: evaluating each measure at the true~$\rho$ as a best-possible-world reference and at bracketing assumed-$\rho$ values, then scoring how far the off-truth intervals depart from the truth-conditioned one.
+  \item Building the distance-semantic weight-transformation module (Section~\ref{sec:weight-semantics}), which maps lower-is-stronger weights onto the count-like scale the framework requires.
+  \item Empirical validation on a designed corpus of networks with known ground truth, spanning weight and degree heterogeneity under both edge- and node-level degradation across a range of~$\rho$.
+  \item Validation on real network data, including the covert and survey-based networks used in prior work.
+  \item Comparison against the Chapter~4 bootstrap methods, to assess whether the framework's intervals are better calibrated under non-random missingness.
+  \item Extension to multidimensional (multiplex and/or dynamic) networks, building on the tensor representations developed in Chapter~3.
 \end{enumerate}
 
 \bibliographystyle{plainnat}
