@@ -318,6 +318,163 @@ module network_statistics
 	  *Social Networks* 68: 148–178.
 	""" rand_index
 
+#	Distance-to-Strength Weight Transformation
+	function transform_distance_weights(edges::DataFrame;
+										 method::Symbol = :scaled_reciprocal,
+										 tau::Union{Nothing, Float64} = nothing,
+										 target_median::Float64 = 10.0,
+										 weight_col::Symbol = :weight)
+		"""
+		Args:
+			edges::DataFrame: edge list with :src, :dst and a distance-semantic
+				weight column (lower = stronger tie).
+			method::Symbol: :scaled_reciprocal (default), :max_minus, or :exp_decay.
+			tau::Union{Nothing,Float64}: decay constant for :exp_decay (required there).
+			target_median::Float64: desired median transformed weight for :exp_decay's
+				default scale c (default 10.0).
+			weight_col::Symbol: name of the distance column to transform (default :weight).
+		Returns:
+			NamedTuple (edges::DataFrame, n_dropped::Int, c::Float64, method::Symbol):
+				edges carries an integer count-like :weight; n_dropped counts edges that
+				mapped to weight 0 and were removed (treated as no edge).
+		Notes:
+			Maps lower-is-stronger distances onto the non-negative integer count scale
+			the reconstruction framework assumes. Intervals from the framework then apply
+			to the TRANSFORMED network, not the original distances — nonlinear maps may
+			distort interval structure, though rank orderings are often preserved.
+
+			:scaled_reciprocal — w' = round(c / w), c = max(w). Strictly-positive
+				distances only; zero-distance edges take the max transformed weight. Never
+				drops edges (min count 1).
+			:max_minus — w' = round(max(w) - w). Linear inversion; max-distance maps to 0
+				(dropped), distance-zero to the max count.
+			:exp_decay — w' = round(c * exp(-w / tau)); c defaults so the median
+				transformed weight ≈ target_median.
+		"""
+
+		#	Validation
+			method in (:scaled_reciprocal, :max_minus, :exp_decay) ||
+				throw(ArgumentError("method must be :scaled_reciprocal, :max_minus, or :exp_decay; got $method"))
+			weight_col in propertynames(edges) ||
+				throw(ArgumentError("edges has no column $weight_col"))
+			w = Float64.(edges[!, weight_col])
+			any(<(0.0), w) &&
+				throw(DomainError(minimum(w), "distance weights must be non-negative"))
+
+		#	Compute Transformed Counts
+			wmax = maximum(w)
+			c = NaN
+			if method === :scaled_reciprocal
+				#	Reciprocal scaled by max distance; zero-distance -> max count
+					c = wmax
+					pos = w[w .> 0.0]
+					max_count = isempty(pos) ? 1 : round(Int, c / minimum(pos))
+					counts = [wi > 0.0 ? round(Int, c / wi) : max_count for wi in w]
+			elseif method === :max_minus
+				#	Linear inversion; max distance -> 0 (no edge)
+					counts = round.(Int, wmax .- w)
+			else
+				#	Exponential decay; default c places the median count at target_median
+					tau === nothing &&
+						throw(ArgumentError(":exp_decay requires a positive tau"))
+					tau > 0.0 ||
+						throw(ArgumentError("tau must be > 0, got $tau"))
+					decay = exp.(-w ./ tau)
+					med = median(decay)
+					c = med > 0.0 ? target_median / med : target_median
+					counts = round.(Int, c .* decay)
+			end
+
+		#	Drop Zero-Weight Edges (treated as no edge)
+			keep = counts .> 0
+			n_dropped = count(!, keep)
+			out = edges[keep, :]
+			out[!, :weight] = counts[keep]
+
+		#	Return
+			return (edges = out, n_dropped = n_dropped, c = c, method = method)
+	end
+	@doc raw"""
+	**Description**
+	Transform a distance-semantic edge weight column (where a *smaller* weight means a
+	*stronger* tie) onto the non-negative integer count scale the reconstruction
+	framework assumes (where a *larger* weight means a stronger tie). Networks whose
+	weights are travel times, transit costs, dissimilarities, or any other
+	"lower = stronger" quantity must be passed through this step before reconstruction;
+	count-semantic networks (interaction counts, co-appearances) need no transformation.
+
+	**Usage**
+	`transform_distance_weights(edges; method=:scaled_reciprocal, tau=nothing, target_median=10.0, weight_col=:weight)`
+
+	**Arguments**
+	- `edges::DataFrame`: Edge list with `:src`, `:dst`, and a distance-semantic weight
+	  column. Weights must be non-negative.
+	- `method::Symbol`: Transformation to apply. One of `:scaled_reciprocal` (default),
+	  `:max_minus`, or `:exp_decay` (see **Details**).
+	- `tau::Union{Nothing,Float64}`: Length scale for `:exp_decay`; required and must be
+	  `> 0` for that method, ignored otherwise (default `nothing`).
+	- `target_median::Float64`: Desired median transformed weight, used only to set the
+	  default scale constant for `:exp_decay` (default `10.0`).
+	- `weight_col::Symbol`: Name of the distance column to transform (default `:weight`).
+	  The transformed counts are always written to a `:weight` column on the output.
+
+	**Details**
+	Let $w$ be the observed distances. The three transforms are:
+
+	- **`:scaled_reciprocal`** (default): $w' = \mathrm{round}(c / w)$ with $c = \max(w)$.
+	  Strictly-positive distances only; any zero-distance edges take the maximum
+	  transformed weight. The longest distance maps to count $1$, so this method never
+	  drops edges.
+	- **`:max_minus`**: $w' = \mathrm{round}(\max(w) - w)$. A linear inversion suited to
+	  distances with a meaningful upper bound. Distance zero maps to the maximum count;
+	  the maximum distance maps to $0$ and is dropped (treated as no edge).
+	- **`:exp_decay`**: $w' = \mathrm{round}(c \cdot \exp(-w / \tau))$, with $c$ chosen so
+	  that the median transformed weight is approximately `target_median`.
+
+	Edges whose transformed weight rounds to $0$ are removed (treated as absent ties);
+	`:scaled_reciprocal` removes none, while `:max_minus` and `:exp_decay` may.
+
+	Credible intervals subsequently returned by the framework apply to the **transformed**
+	network, not to the original distances. Because the transforms are nonlinear, they
+	can distort interval structure; rank-based conclusions (which node is most central)
+	are usually preserved across reasonable transforms, but distance-dependent measures
+	(closeness, betweenness, mean inverse distance) measure something materially different
+	on the transformed scale. Back-transforming interval bounds to the original distance
+	scale must be done with that distortion in mind.
+
+	**Value**
+	A `NamedTuple` with fields:
+	- `edges::DataFrame`: The transformed edge list (`:src`, `:dst`, integer-valued
+	  `:weight`), with zero-weight edges removed.
+	- `n_dropped::Int`: Number of edges removed because they mapped to weight $0$.
+	- `c::Float64`: The scale constant used — $\max(w)$ for `:scaled_reciprocal`, the
+	  median-matching constant for `:exp_decay`, and `NaN` for `:max_minus` (which uses
+	  no multiplicative scale).
+	- `method::Symbol`: The transform that was applied (echoed).
+
+	**Examples**
+	```julia
+		using DataFrames
+
+		#	Travel-time network: smaller weight = stronger tie
+			edges = DataFrame(src = [1, 2, 3], dst = [2, 3, 1], weight = [2.0, 8.0, 4.0])
+
+		#	Default scaled-reciprocal: strongest (shortest) tie gets the largest count
+			out = transform_distance_weights(edges)
+			out.edges.weight        # => [4, 1, 2]
+
+		#	Linear inversion; the longest tie maps to 0 and is dropped
+			transform_distance_weights(edges; method = :max_minus).n_dropped   # => 1
+
+		#	Exponential decay with a chosen length scale
+			transform_distance_weights(edges; method = :exp_decay, tau = 3.0)
+	```
+
+	**See Also**
+	`_transform_weights_for_path_cost`, `closeness_centrality`, `betweenness_centrality`,
+	`mean_inverse_distance`, `reconstruct_network`, `build_reconstruction_corpus`
+	""" transform_distance_weights
+
 ################################
 #   SECTION 2: DEGREE FAMILY   #
 ################################
@@ -7847,6 +8004,7 @@ module network_statistics
     export gini_coefficient,
            centralization,
            rand_index,
+           transform_distance_weights,
            in_degree,
            out_degree,
            total_degree,
