@@ -560,3 +560,19 @@
 		        "  rho match=",  isapprox(row.realized_rho, rec.realized_rho; atol = 1e-9))
 	end
 	println("\n=== END VERIFICATION ===")
+
+    rand_ff = ff[abs.(ff.target_rho) .< 1e-9, :]
+	if !isempty(rand_ff)
+		println("    random anchor realized node-rho by arm x level:")
+		show(sort(combine(groupby(rand_ff, [:arm, :level]),
+		                  :achieved_rho => Statistics.mean => :mean_realized),
+		          [:arm, :level]), allrows = true)
+		println()
+	end
+
+    node_anchor = stimulus[(stimulus.arm .== "node") .& (abs.(stimulus.target_rho) .< 1e-9), :]
+	combine(groupby(node_anchor, :level),
+	        :realized_rho => Statistics.mean => :mean,
+	        :realized_rho => Statistics.std  => :std,
+	        :realized_rho => minimum         => :min,
+	        :realized_rho => maximum         => :max)
