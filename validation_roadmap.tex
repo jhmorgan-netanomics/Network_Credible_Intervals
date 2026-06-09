@@ -516,7 +516,7 @@ The sampler is run ahead of time to build a fixed corpus of degraded networks~--
 
 \section{Degradation Tests}
 
-The degradation half of the pipeline is verified against the current implementation by three groups of tests: a sampler-correctness suite (\texttt{run\_phase1\_sampler\_tests}) on small constructed fixtures and corpus networks, an orchestrator smoke run over the two-dial grid, and a set of emergent-arm tests (\texttt{run\_emergent\_checks}) that pin down the edge arm's distinctive behavior. The sampler tests are fast and seed-deterministic; the orchestrator and emergent runs exercise \texttt{build\_degeneration\_corpus} end to end on a small grid.
+The degradation half of the pipeline is verified against the current implementation by three groups of tests, driven from \texttt{Constructor\_Tests.jl}: a sampler-correctness suite (\texttt{run\_phase1\_sampler\_tests}) on small constructed fixtures and corpus networks, an orchestrator smoke run over the two-dial grid, and a set of emergent-arm tests (\texttt{run\_emergent\_checks}) that pin down the edge arm's distinctive behavior. The sampler tests are fast and seed-deterministic; the orchestrator and emergent runs exercise \texttt{build\_degeneration\_corpus} end to end on a small grid.
 
 \subsection{Sampler correctness}
 
@@ -559,6 +559,8 @@ For each degraded sample in the stimulus the framework is handed the observed ne
 
 Reconstruction runs in two phases, orchestrated by \texttt{build\_reconstruction\_corpus}. \emph{Setup} (\texttt{compute\_setup}) reads the observed network once: it computes observed centrality (in-degree for directed networks, degree for undirected), detects community structure (CHAMP, or supplied labels) and the E/I index, bins the observed nodes into $K$ degree-rank bins by $J$ E/I bins, estimates the Laplace-smoothed rank-rank connectivity matrix~$\Pmat$ and, for directed networks, the rank-conditional reciprocity matrix~$\Rmat$, and solves the propensity field~$\beta$ that realizes the assumed~$\rho$ under the analytic Kendall $\tau_b$ relation. \emph{Replication} (\texttt{generate\_replicate}) then draws $B$ augmented networks from that setup: each draw assigns bins from the setup distribution~$q$, adds the missing nodes, and places their ties through Stage~0.5 (rank-conditional reciprocity imputation for nominated non-respondents, directed networks only), Stage~1 (synthetic nodes whose tie counts and partners are drawn against~$\Pmat$), and Stage~2 (diffuse edge-weight reconstruction, for weighted networks). Each draw is admitted by a three-prior acceptance gate on the realized proportion, edge weight, and~$\rho$, regenerating on a miss and falling back to the closest draw if the attempt budget is exhausted (the E/I structure enters by construction, through the conditional placement of added nodes, rather than through this gate). The requested measures are computed on each admitted replicate, and the $B$ values form the posterior from which a credible interval is read.
 
+Stage~2 reconstructs diffuse edge weight by the \emph{deficit} allocation, the framework's default. It reads the same propensity field that places the missing nodes, but as an edge-level survival tilt: from the assumed~$\rho$ it estimates how much weight each surviving edge is likely to have lost, then distributes the diffuse weight budget toward those per-edge deficits, restoring each edge toward its estimated pre-removal weight rather than reloading weight in proportion to the degraded observation. This aligns the weight reconstruction with the edge-arm degradation it is meant to undo, instead of anchoring the recovered weight to what happened to survive. The earlier current-weight-proportional rule (\texttt{allocation = :observed}) is retained as an option; the two coincide exactly at $\rho = 0$, where the tilt is flat, so the allocation choice is invisible at the MCAR condition and bears on the results only as the assumed~$\rho$ moves away from zero.
+
 \subsection{The assumed prior}
 
 The framework never sees the true~$\rho$; it sees only the analyst's assumed value, and the validation is built around the gap between them. For each degraded sample the framework is run under three assumed priors:
@@ -584,7 +586,7 @@ The three analyses are scoped by cost~--- broad and cheap first, narrow and expe
 
 \section{Reconstruction Tests}
 
-The reconstruction half of the pipeline is verified by a thirty-eight-test suite in five tiers, run against the current implementation. The first two tiers hold the setup phase (\texttt{compute\_setup}) accountable~--- deterministic unit tests on each helper, then a calibration tier checking the three-prior contract on corpus networks~--- and the next two mirror that structure for replicate generation (\texttt{generate\_replicate}). The final tier exercises the acceptance gate, the materialization round-trip, and the corpus orchestrator. The unit tiers are fast and fully deterministic; the calibration tiers run on real networks, reproducible from seeds, with Marvel the long pole at roughly thirty minutes of wall-clock for its CHAMP community detection.
+The reconstruction half of the pipeline is verified by a thirty-eight-test suite in five tiers, also driven from \texttt{Reconstruction\_Tests.jl} and run against the current implementation. The first two tiers hold the setup phase (\texttt{compute\_setup}) accountable~--- deterministic unit tests on each helper, then a calibration tier checking the three-prior contract on corpus networks~--- and the next two mirror that structure for replicate generation (\texttt{generate\_replicate}). The final tier exercises the acceptance gate, the materialization round-trip, and the corpus orchestrator. The unit tiers are fast and fully deterministic; the calibration tiers run on real networks, reproducible from seeds, with Marvel the long pole at roughly thirty minutes of wall-clock for its CHAMP community detection.
 
 \subsection{Setup unit tests (Tests 1--18)}
 
@@ -605,6 +607,105 @@ Tests~29--30 run \texttt{generate\_replicate} end-to-end on small synthetic fixt
 \subsection{Corpus and gate coverage (Tests 35--38)}
 
 The final tier covers the pieces that turn replicates into a corpus. Test~35 unit-checks \texttt{\_passes\_three\_prior\_gate}, the acceptance gate. Test~36 verifies the materialization round-trip~--- \texttt{\_extract\_reconstruction\_delta} followed by \texttt{materialize\_reconstruction} reproduces the augmented network exactly~--- so that storing deltas rather than whole networks is lossless. Test~37 is a regression guard on \texttt{\_aggregate\_duplicate\_dyads}, confirming it preserves the node-identifier type. Test~38 exercises \texttt{build\_reconstruction\_corpus} end-to-end: gate acceptance, $\rho$ conditioning (clamping an infeasible request to the feasible envelope), and reproducibility from a master seed.
+
+\section{Interval Tests}
+\label{sec:interval-tests}
+
+The reconstruction tests hold the setup and replicate machinery to unit and
+calibration contracts; the interval tests sit one level up and score the product
+the framework actually ships~--- the credible interval. They run the user-facing
+constructor \texttt{network\_credible\_intervals} end to end against a known ground
+truth: a stylized network is taken as the truth~$T$, degraded, reconstructed, and
+summarized into an interval, and the interval is checked against the measure's true
+value. These tests are ongoing and live in \texttt{Constructor\_Tests.jl} alongside
+the reconstruction suite; unlike the thirty-eight numbered reconstruction tests they
+are exploratory calibration experiments on small constructed networks rather than a
+fixed pass/fail battery, and they are the proving ground in which the deficit
+allocation was developed and weighed against the proportional baseline.
+
+\subsection{The harness}
+
+A single driver, \texttt{run\_validation}, carries every experiment. Given a
+ground-truth network, a set of measures, a grid of edge-weight missingness fractions
+$\piedge \in \{0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50\}$, a target~$\rho$, and an
+allocation rule, it loops over the grid and, at each level, over $n_{\text{rep}} = 15$
+seeded replications. Each replication degrades the emergent edge arm through
+\texttt{NDG.generate\_missingness\_mask} at the target~$\rho$ (with \texttt{weighted}
+selecting weight removal versus whole-tie removal), then hands the degraded network to
+\texttt{network\_credible\_intervals} with $B = 300$ posterior draws. Because the
+emergent arm sheds nodes incidentally as it removes edges, the nodes that survive only
+as nomination targets are passed back as \texttt{partially\_observed\_nodes}, so each
+run exercises Stage~0.5 and Stage~1 alongside Stage~2 rather than the weight path in
+isolation. For every measure the driver records the uncorrected observed value, the
+posterior median, and the $95\%$ interval; \texttt{plot\_validation} then renders one
+panel per measure showing the interval band, the posterior median, the uncorrected
+observed curve, and the true-value reference line across the grid.
+
+Two design points matter for interpretation. First, the reconstruction is handed the
+\emph{realized} priors from the degradation~--- $\pinode$, $\piedge$, and, by default,
+the realized~$\rho$~--- so these are best-case, correct-prior runs; the cost of a
+misspecified prior is the separate concern of the assumed-prior design and the
+Track~C sensitivity criteria, not of these tests. The exception is the
+\texttt{recon\_rho} lever, which overrides the reconstruction's~$\rho$: setting it to
+zero forces a flat tilt and so reproduces a faithful Bellutta run~--- proportional-to-observed
+Stage~2 with no centrality correction~--- even on data degraded at a signed~$\rho$,
+because \citet{Bellutta2026}'s reconstruction takes no~$\rho$ argument. Second, the
+coverage shown is a calibration read rather than the formal Track~B estimator: the
+band scored at each grid point is the mean of the per-replication intervals over the
+fifteen draws, and ``covers'' marks whether that averaged interval contains the truth,
+which is a smoke test of central behavior rather than the iteration-level coverage
+proportion the corpus-scale grid will compute.
+
+\subsection{MCAR random network: the $\rho = 0$ agreement check}
+
+The first experiment builds an Erd\H{o}s--R\'enyi random weighted network ($N = 50$)
+and degrades it at target~$\rho = 0$, running both the deficit allocation and a faithful Bellutta run (observed allocation,
+\texttt{recon\_rho = 0}) over the same grid. At $\rho = 0$ the endpoint tilt is flat,
+so the deficit gross-up cancels and the two rules should produce the same intervals;
+the experiment is the empirical check of that collapse property on a second topology,
+and because the proportional rule at $\rho = 0$ is exactly \citet{Bellutta2026}'s
+Chapter~4 re-addition, it doubles as a reproduction corner. The measures are the
+maximum in-strength and the Gini coefficient of the in-strength
+distribution~--- one extremal, one inequality.
+
+\subsection{Centrality-tilted hub, weighted: where the allocation rule bites}
+
+The second experiment is the one the allocation rule is built for. A
+Barab\'asi--Albert hub network ($N = 60$, $m = 2$), generated by
+\texttt{make\_hub\_weighted\_network} and oriented so that in-degree concentrates on
+the early hubs, is degraded at target~$\rho = -0.35$~--- central edges shedding weight
+faster than peripheral ones~--- with Stage~2 active. The deficit run (realized~$\rho$)
+and the faithful Bellutta run (observed allocation, \texttt{recon\_rho = 0}) are scored
+on the same two weighted measures. Here the tilt reshapes where recovered weight lands,
+so the experiment is what separates the two rules: it reads whether the deficit
+allocation holds interval coverage on the in-strength Gini, the measure on which
+proportional-to-observed allocation~--- anchored to the starved hub~--- is most at risk
+of drifting below the truth, while both rules track the single dominant hub on the
+maximum.
+
+\subsection{Centrality-tilted hub, binary: node replacement in isolation}
+
+The third experiment binarizes the same hub skeleton with \texttt{binarize} and
+degrades it at target~$\rho = -0.35$ with \texttt{weighted = false}, which makes
+Stage~2 a no-op (the allocation argument is vestigial here). With no edge weight to
+redistribute, recovery rests entirely on the node-replacement machinery~--- Stage~0.5
+and Stage~1 regenerating structure from the rank-rank model~--- so this is the most
+demanding of the three and the one with no Bellutta comparison, since the proportional
+approach has no node-substitution step to test. The measures are the maximum in-degree
+and the in-degree Gini.
+
+\paragraph{Scope and status.} These are internal calibration experiments: stylized
+networks of $N \approx 50$--$60$, two measures apiece, the edge arm only, and oracle
+priors. They establish that the constructor behaves sensibly and that the deficit
+allocation earns its default standing where the proportional rule does not, but they
+are not the corpus-scale evaluation~--- coverage and width across the eighteen networks
+under the assumed-prior grid remain the province of the Track~B and Track~C
+criteria, and the file reserves an import hook for the degenerate-network corpus that
+will bridge these stylized checks to that grid. The same file also carries a standalone
+unit test of the distance-weight preprocessing step,
+\texttt{test\_transform\_distance\_weights}~--- a pure, hand-derived check of the three
+transformation methods and their guards~--- which rides along with the interval
+experiments but is independent of them.
 
 \section{Comparison Baselines}
 

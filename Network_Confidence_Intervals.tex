@@ -77,7 +77,7 @@
 \maketitle
 
 \begin{abstract}
-This document specifies a bootstrap-based framework for constructing approximate Bayesian credible intervals on network metrics computed from incomplete network observations. The framework extends and addresses limitations of the bootstrap methods in Chapters~3 and~4 of Bellutta's dissertation (\emph{Forensic Analysis of Observed Social Networks}) through three innovations: (1)~explicit modeling of node-level missingness governed by a user-supplied prior on the correlation between centrality and missingness; (2)~structural-role binning via the E/I~index, which separates brokers from clustered hubs of equal degree; and (3)~rank-conditional probabilistic imputation of edges involving nominated non-respondents, generalizing the global reciprocity rate of \citet{SmithMorganMoody2022}---the author's prior work---to a rank-rank conditional reciprocity matrix. Together these extensions let the framework handle unweighted networks (which the prior framework could not), networks with distance-semantic weights (via a transformation step), and networks whose structure departs from the stylized models of earlier evaluations. The specification is given in full as the basis for the Julia implementation and its empirical validation.
+This document specifies a bootstrap-based framework for constructing approximate Bayesian credible intervals on network metrics computed from incomplete network observations. The framework extends and addresses limitations of the bootstrap methods in Chapters~3 and~4 of Bellutta's dissertation (\emph{Forensic Analysis of Observed Social Networks}) through four innovations: (1)~explicit modeling of node-level missingness governed by a user-supplied prior on the correlation between centrality and missingness; (2)~structural-role binning via the E/I~index, which separates brokers from clustered hubs of equal degree; (3)~rank-conditional probabilistic imputation of edges involving nominated non-respondents, generalizing the global reciprocity rate of \citet{SmithMorganMoody2022}---the author's prior work---to a rank-rank conditional reciprocity matrix; and (4)~an estimate-based (\emph{deficit}) weight-reconstruction step that inverts the assumed removal model, restoring each edge toward its estimated pre-removal weight rather than redistributing recovered weight in proportion to the degraded observation. Together these extensions let the framework handle unweighted networks (which the prior framework could not), networks with distance-semantic weights (via a transformation step), and networks whose structure departs from the stylized models of earlier evaluations. The specification is given in full as the basis for the Julia implementation and its empirical validation.
 \end{abstract}
 
 \section{Introduction}
@@ -136,7 +136,7 @@ The Chapter~4 framework has several limitations that motivate this work:
 
 The framework introduced in this document addresses each limitation:
 
-\paragraph{Explicit node-level missingness.} The framework treats missing nodes as a first-class mechanism, separate from edge-weight loss. The parameter $\pinode$ governs the fraction of nodes believed missing, and a synthetic-node augmentation step adds plausible missing nodes to each replicate. Edge-weight missingness ($\piedge$) becomes a secondary, floored dial: node additions and~$\rho$ fix its lower bound, and any weight beyond that floor is spread across observed and imputed edges alike.
+\paragraph{Explicit node-level missingness.} The framework treats missing nodes as a first-class mechanism, separate from edge-weight loss. The parameter $\pinode$ governs the fraction of nodes believed missing, and a synthetic-node augmentation step adds plausible missing nodes to each replicate. Edge-weight missingness ($\piedge$) becomes a secondary, floored dial: node additions and~$\rho$ fix its lower bound, and any weight beyond that floor is allocated by Stage~2 across observed and imputed edges, targeting each edge's estimated pre-removal deficit rather than its current (degraded) weight.
 
 \paragraph{Centrality-correlated missingness via a user-supplied prior.} The parameter~$\rho \in (-1, 1)$ encodes the user's domain-knowledge belief about the association between node centrality and probability of being missing from observation. Positive~$\rho$ corresponds to settings where central actors are more likely to be hidden (covert networks, non-response among prominent people); negative~$\rho$ corresponds to settings where central actors are more visible (social media, surveillance prioritizing known figures); zero~$\rho$ recovers MCAR behavior. The framework converts~$\rho$ into a bin-assignment distribution that biases the centrality of added nodes accordingly.
 
@@ -211,6 +211,7 @@ Mixed police data & Variable & Variable & User judgment \\
   \item \texttt{community\_labels}: user-supplied community assignments, overriding CHAMP detection
   \item \texttt{weight\_semantics}: \texttt{"count"} (default) or \texttt{"distance"}; selects transformation behavior
   \item \texttt{partially\_observed\_nodes}: a list of node identifiers for nodes that appear in~$\Gobs$ as edge targets (i.e., they have incoming edges from respondents) but did not respond themselves. These are the ``nominated non-respondents'' handled by Stage~0.5. If not supplied, all node-level missingness is assumed to involve non-nominated nodes (handled by Stage~1).
+  \item \texttt{allocation}: the Stage~2 weight-allocation rule. \texttt{:deficit} (default) inverts the removal model, restoring each edge toward its estimated pre-removal weight; \texttt{:observed} reproduces the earlier current-weight-proportional rule (the Bellutta MCAR corner). The two coincide at $\rho = 0$, and the choice has no effect on unweighted networks, where Stage~2 is skipped.
 \end{itemize}
 
 \paragraph{Algorithm hyperparameters with defaults.}
@@ -336,6 +337,22 @@ p_{c, c'} = \frac{e_{c, c'} + 1}{n_{c, c'} + 2},
 \]
 where $e_{c, c'}$ is the number of observed edges from cell~$c$ to cell~$c'$ and $n_{c, c'}$ is the number of ordered node pairs between the two cells. For weighted networks, also compute the conditional mean weight $w_{c, c'}$: the mean weight of edges from cell~$c$ to cell~$c'$ given that an edge is present. For unweighted networks, only $\Pmat$ is computed. The matrices are computed over all respondent-respondent dyads in~$\Gobs$ (excluding any partially observed nodes, which are placed using their own observed edges separately).
 
+\subsection{Stage 2: Weight Allocation}
+
+Stage~2 returns the diffuse weight budget~$\Wadd$ to the network. The guiding idea is to undo the Chapter~3 removal rather than to pile weight onto whatever survived it. The removal stripped weight from each edge in proportion to a per-edge hazard set by the $\rho$-field; Stage~2 reads that same field, estimates how much each edge is likely to have lost, and returns weight to the edges with the largest estimated shortfall.
+
+Let $w_e$ be the observed (post-removal) weight of edge~$e$, and let $g_e \in [0, 1]$ be its endpoint-survival tilt~--- the edge's exposure to removal, equal to one minus the probability that both of its endpoints escaped removal, with each endpoint's survival probability set by the $\rho$-field. The framework models the surviving fraction of an edge as $\exp(-\lambda g_e)$ for a single rate~$\lambda$ shared across all edges, so the estimated pre-removal weight of~$e$ is $w_e \exp(\lambda g_e)$ and its estimated deficit is
+\[
+  d_e = w_e \left( \exp(\lambda g_e) - 1 \right).
+\]
+The rate~$\lambda$ is fixed by the budget: it is the unique value for which the deficits sum to the weight to be added,
+\[
+  \sum_e w_e \left( \exp(\lambda g_e) - 1 \right) = \Wadd .
+\]
+The left-hand side rises monotonically in~$\lambda$ from zero, so a bisection finds the root in a few iterations ($\lambda$ is capped at a large finite value to guard against degenerate inputs). Stage~2 then draws the~$\Wadd$ units multinomially with probabilities proportional to~$d_e$, restoring each edge to its estimated true weight~$w_e \exp(\lambda g_e)$ in expectation.
+
+Two properties follow directly. When $\rho = 0$ the tilt is flat~--- $g_e$ is the same for every edge~--- so the common factor~$\exp(\lambda g_e)$ cancels and the rule reduces exactly to current-weight-proportional allocation, the Bellutta MCAR corner recovered by \texttt{allocation = :observed}. And an edge driven to zero ($w_e = 0$) has zero deficit and receives nothing: Stage~2 redistributes weight among edges already present in~$\Gobs$ but never resurrects a vanished one, in keeping with the framework's assumption that edge presence among respondents is observed.
+
 \section{Key Assumptions}
 
 The framework makes the following assumptions, which users should consider when interpreting results:
@@ -371,7 +388,7 @@ The following are explicitly outside the scope of this framework:
 \begin{itemize}[leftmargin=*, itemsep=2pt]
 \item Creation of edges between two respondent nodes (the framework assumes edge \emph{presence} among respondents is correctly observed; only \emph{weights} are uncertain, and only for weighted networks). Edges involving nominated non-respondents \emph{are} created/imputed by Stage~0.5.
 \item Respondent measurement error: cases where a respondent failed to report an edge to another respondent that actually exists. The framework treats all respondents as accurate reporters of their own edges.
-\item A user-specified non-uniform edge-weight missingness mechanism. Stage~2 distributes the weight budget across existing and imputed edges in proportion to current weight times an endpoint-survival tilt drawn from the same $\rho$-field that governs node missingness; it reduces to current-weight-proportional allocation (the Bellutta MCAR corner) only at $\rho = 0$. There is no separate dial for edge-weight non-uniformity.
+\item A user-specified non-uniform edge-weight missingness mechanism. The structure of edge-weight loss is governed by the $\rho$-field, not by a separate dial. Stage~2 inverts the Chapter~3 removal model: from the endpoint-survival tilt the $\rho$-field assigns to each edge, it estimates the edge's pre-removal weight and allocates the budget~$\Wadd$ toward the resulting per-edge deficits, so each edge is restored to its estimated true weight in expectation (the \emph{deficit} allocation, used by default). The earlier rule, which distributes~$\Wadd$ in proportion to current weight times that tilt, is retained as an option (\texttt{allocation = :observed}); it reproduces the current-weight-proportional behavior and coincides with the deficit allocation at $\rho = 0$ (the Bellutta MCAR corner), where the tilt is flat. Neither rule exposes a separate dial for edge-weight non-uniformity.
 \item Spurious edges in the observed network (the framework assumes observed structure is correct, not over-reported)
 \item Higher-order structural patterns beyond degree and~$\EI$ (triadic closure, attribute homophily, community structure orthogonal to the bins are captured only incidentally)
 \item Changes in node ranks or community memberships due to the augmentation process (all are fixed at~$\Gobs$)
