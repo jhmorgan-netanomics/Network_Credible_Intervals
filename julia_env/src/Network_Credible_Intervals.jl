@@ -26,6 +26,11 @@ THE SOFTWARE.
 
 module Network_Credible_Intervals
 
+#   Module Packages
+    using DataFrames
+    using Statistics
+    using StatsBase
+
 #   Setting Reconstruction Function Constants
     const DEFAULT_J                 = 3
     const EI_SEMANTIC_THRESHOLDS_J3 = (-0.33, 0.33)
@@ -576,6 +581,7 @@ module Network_Credible_Intervals
 										prob::Real = 0.89,
 										K::Union{Int, Symbol} = :auto,
 										partially_observed_nodes::Vector{Int} = Int[],
+										allocation::Symbol = :observed,
 										seed::Integer = 1,
 										store_raw::Bool = false,
 										verbose::Bool = false)
@@ -609,6 +615,10 @@ module Network_Credible_Intervals
 			K::Union{Int,Symbol}: number of centrality-rank bins, or :auto (default).
 			partially_observed_nodes::Vector{Int}: indices (in nodes order) of nominated
 				non-respondents. Empty when there are none.
+			allocation::Symbol: Stage-2 weight-allocation mode, :observed (default, Bellutta
+				proportional-to-current) or :deficit (estimate-based inverse, re-anchoring recovery
+				to estimated-true weight). Forwarded to build_reconstruction_corpus / compute_setup;
+				identical to :observed at rho = 0. See compute_setup.
 			seed::Integer: master seed; all replicate seeds and the detector derive from it (default 1).
 			store_raw::Bool: also return setup and corpus so the sample can feed compute_bias_score or
 				be re-measured (default false).
@@ -649,6 +659,8 @@ module Network_Credible_Intervals
 				throw(ArgumentError("weight_semantics must be :count or :distance, got $weight_semantics"))
 			community_method in (:champ, :leiden) ||
 				throw(ArgumentError("community_method must be :champ or :leiden, got $community_method"))
+			allocation in (:observed, :deficit) ||
+				throw(ArgumentError("allocation must be :observed or :deficit, got $allocation"))
 			0.0 < prob < 1.0 ||
 				throw(ArgumentError("prob must lie in (0, 1), got $prob"))
 			n_replicates >= 1 ||
@@ -687,6 +699,7 @@ module Network_Credible_Intervals
 												pi_node = pi_node, pi_edge = pi_edge, rho = rho,
 												metrics = metrics, n_replicates = n_replicates, K = K,
 												partially_observed_nodes = partially_observed_nodes,
+												allocation = allocation,
 												seed = seed, verbose = verbose)
 
 		#	Credible Interval per Measure
@@ -711,7 +724,7 @@ module Network_Credible_Intervals
 				corpus            = store_raw ? built.corpus : nothing,
 			)
 	end
-    @doc raw"""
+	@doc raw"""
 	**Description**
 	The package's main entry point. Given an observed network and a prior about what is
 	missing, return credible intervals on user-specified network measures by bootstrapping
@@ -722,7 +735,7 @@ module Network_Credible_Intervals
 	and detects community structure when none is supplied.
 
 	**Usage**
-	`network_credible_intervals(edges, nodes; metrics, directed, weighted, pi_node, pi_edge, rho=0.0, community_labels=nothing, community_method=:champ, weight_semantics=:count, weight_method=:scaled_reciprocal, tau=nothing, n_replicates=1000, prob=0.89, K=:auto, partially_observed_nodes=Int[], seed=1, store_raw=false, verbose=false)`
+	`network_credible_intervals(edges, nodes; metrics, directed, weighted, pi_node, pi_edge, rho=0.0, community_labels=nothing, community_method=:champ, weight_semantics=:count, weight_method=:scaled_reciprocal, tau=nothing, n_replicates=1000, prob=0.89, K=:auto, partially_observed_nodes=Int[], allocation=:observed, seed=1, store_raw=false, verbose=false)`
 
 	**Arguments**
 	- `edges::DataFrame`: Observed-network edges (`:src`, `:dst`, optional `:weight`), treated
@@ -754,6 +767,11 @@ module Network_Credible_Intervals
 	- `K::Union{Int,Symbol}`: Number of centrality-rank bins, or `:auto` (default).
 	- `partially_observed_nodes::Vector{Int}`: Indices (in `nodes` order) of nominated
 	  non-respondents — incoming ties observed, outgoing missing. Empty when none.
+	- `allocation::Symbol`: Stage-2 weight-allocation mode, `:observed` (default) or `:deficit`.
+	  `:observed` is the Bellutta proportional-to-current inverse; `:deficit` re-anchors recovery
+	  to an estimated *true* weight, restoring heavily-depleted high-weight structure that
+	  `:observed` under-serves at $\rho \neq 0$. The two are identical at $\rho = 0$. See
+	  `compute_setup` for the modes.
 	- `seed::Integer`: Master seed; all replicate seeds and the detector derive from it (default `1`).
 	- `store_raw::Bool`: Also return `setup` and `corpus`, so the sample can feed
 	  `compute_bias_score` or be re-measured (default `false`).
@@ -779,6 +797,12 @@ module Network_Credible_Intervals
 	`rho_requested`, `rho_conditioned`, and `rho_adjusted` report what was requested, what was
 	conditioned on, and whether clamping occurred. The run is reproducible in `seed`.
 
+	`allocation` controls only how the missing-weight budget is distributed across edges during
+	reconstruction; it does not affect node addition, gating, or the realized priors, and it
+	leaves the $\rho = 0$ result unchanged. `:deficit` differs from `:observed` only when
+	$\rho \neq 0$, where it allocates by estimated per-edge deficit rather than by current
+	weight. See `compute_setup`.
+
 	**Value**
 	A `NamedTuple` with fields:
 	- `intervals::Dict{Symbol,NamedTuple}`: Per measure, the `construct_credible_interval`
@@ -797,35 +821,42 @@ module Network_Credible_Intervals
 
 	**Examples**
     ```julia
-        using DataFrames
+            using DataFrames
 
-        #	A small directed, weighted observed network
-            edges = DataFrame(src = [1, 1, 2, 3, 4, 4], dst = [2, 3, 3, 4, 1, 2],
-                            weight = [3.0, 1, 2, 1, 4, 1])
-            nodes = DataFrame(id = 1:4)
+            #	A small directed, weighted observed network
+                edges = DataFrame(src = [1, 1, 2, 3, 4, 4], dst = [2, 3, 3, 4, 1, 2],
+                                weight = [3.0, 1, 2, 1, 4, 1])
+                nodes = DataFrame(id = 1:4)
 
-        #	Scalar measures as (edges, nodes) closures around the package's measures
-            metrics = Dict(
-                :indeg_central => (e, n) -> centralization(in_degree(e; nodes = n, weighted = true)),
-                :total_central => (e, n) -> centralization(total_degree(e; nodes = n, weighted = true)),
-            )
+            #	Scalar measures as (edges, nodes) closures around the package's measures
+                metrics = Dict(
+                    :indeg_central => (e, n) -> centralization(in_degree(e; nodes = n, weighted = true)),
+                    :total_central => (e, n) -> centralization(total_degree(e; nodes = n, weighted = true)),
+                )
 
-        #	89% intervals under an assumed MCAR prior with 10% of nodes missing
-            res = network_credible_intervals(edges, nodes;
-                                            metrics = metrics,
-                                            directed = true, weighted = true,
-                                            pi_node = 0.10, pi_edge = 0.05, rho = 0.0)
+            #	89% intervals under an assumed MCAR prior with 10% of nodes missing
+                res = network_credible_intervals(edges, nodes;
+                                                metrics = metrics,
+                                                directed = true, weighted = true,
+                                                pi_node = 0.10, pi_edge = 0.05, rho = 0.0)
 
-            res.intervals[:indeg_central]   # (lower, median, upper, mean, std, prob, n_valid)
-            res.rho_conditioned             # the rho actually enforced after clamping
+                res.intervals[:indeg_central]   # (lower, median, upper, mean, std, prob, n_valid)
+                res.rho_conditioned             # the rho actually enforced after clamping
 
-        #	Distance-semantic weights (smaller = stronger), transformed first; keep the raw
-        #	sample so it can later feed compute_bias_score
-            network_credible_intervals(edges, nodes; metrics = metrics,
-                                    directed = true, weighted = true,
-                                    pi_node = 0.10, pi_edge = 0.05,
-                                    weight_semantics = :distance, weight_method = :scaled_reciprocal,
-                                    store_raw = true)
+            #	Centrality-tilted prior with estimate-based weight allocation (re-anchors
+            #	recovery to estimated-true weight; differs from :observed only when rho != 0)
+                network_credible_intervals(edges, nodes; metrics = metrics,
+                                        directed = true, weighted = true,
+                                        pi_node = 0.10, pi_edge = 0.20, rho = -0.35,
+                                        allocation = :deficit)
+
+            #	Distance-semantic weights (smaller = stronger), transformed first; keep the raw
+            #	sample so it can later feed compute_bias_score
+                network_credible_intervals(edges, nodes; metrics = metrics,
+                                        directed = true, weighted = true,
+                                        pi_node = 0.10, pi_edge = 0.05,
+                                        weight_semantics = :distance, weight_method = :scaled_reciprocal,
+                                        store_raw = true)
     ```
 
 	**See Also**
@@ -860,6 +891,7 @@ module Network_Credible_Intervals
 								prob::Real = 0.89,
 								K::Union{Int, Symbol} = :auto,
 								partially_observed_nodes::Vector{Int} = Int[],
+								allocation::Symbol = :observed,
 								seed::Integer = 1,
 								cor_method::Symbol = :pearson,
 								verbose::Bool = false)
@@ -878,9 +910,10 @@ module Network_Credible_Intervals
 				aligned to nodes.id order; scored by 1 - correlation over respondents. At least one
 				of metrics / node_metrics must be non-empty.
 			directed, weighted, pi_node, pi_edge, rho, community_labels, weight_semantics,
-				weight_method, tau, n_replicates, prob, K, partially_observed_nodes, seed, verbose:
-				reconstruction controls, forwarded unchanged to network_credible_intervals (see its
-				Args).
+				weight_method, tau, n_replicates, prob, K, partially_observed_nodes, allocation, seed,
+				verbose: reconstruction controls, forwarded unchanged to network_credible_intervals
+				(see its Args). allocation selects the Stage-2 weight-allocation mode (:observed or
+				:deficit) and so can shift the bias scores when rho != 0.
 			cor_method::Symbol: :pearson (default, matching SmithMorganMoody2022) or :spearman.
 		Returns:
 			NamedTuple (network, node, reconstruction):
@@ -935,6 +968,7 @@ module Network_Credible_Intervals
 											   weight_method = weight_method, tau = tau,
 											   n_replicates = n_replicates, prob = prob, K = K,
 											   partially_observed_nodes = partially_observed_nodes,
+											   allocation = allocation,
 											   seed = seed, store_raw = true, verbose = verbose)
 			setup  = recon.setup
 			corpus = recon.corpus
@@ -963,7 +997,7 @@ module Network_Credible_Intervals
 		#	Return
 			return (network = network, node = node, reconstruction = recon)
 	end
-    @doc raw"""
+	@doc raw"""
 	**Description**
 	Score the framework's reconstruction of a degraded network against a known
 	ground-truth network, measure by measure. Two bias forms are reported, both taken
@@ -973,7 +1007,7 @@ module Network_Credible_Intervals
 	truth is available, use `network_credible_intervals` alone.
 
 	**Usage**
-	`compute_bias_score(sample_edges, true_edges; sample_nodes=nothing, true_nodes=nothing, metrics=Dict(), node_metrics=Dict(), directed, weighted, pi_node, pi_edge, rho=0.0, community_labels=nothing, weight_semantics=:count, weight_method=:scaled_reciprocal, tau=nothing, n_replicates=1000, prob=0.89, K=:auto, partially_observed_nodes=Int[], seed=1, cor_method=:pearson, verbose=false)`
+	`compute_bias_score(sample_edges, true_edges; sample_nodes=nothing, true_nodes=nothing, metrics=Dict(), node_metrics=Dict(), directed, weighted, pi_node, pi_edge, rho=0.0, community_labels=nothing, weight_semantics=:count, weight_method=:scaled_reciprocal, tau=nothing, n_replicates=1000, prob=0.89, K=:auto, partially_observed_nodes=Int[], allocation=:observed, seed=1, cor_method=:pearson, verbose=false)`
 
 	**Arguments**
 	- `sample_edges::DataFrame`: Degraded/observed network edges (`:src`, `:dst`, optional
@@ -1006,6 +1040,11 @@ module Network_Credible_Intervals
 	- `K::Union{Int,Symbol}`: Number of centrality-rank bins, or `:auto` (default).
 	- `partially_observed_nodes::Vector{Int}`: Indices (in `sample_nodes` order) of nominated
 	  non-respondents. These are excluded from the node-level correlation.
+	- `allocation::Symbol`: Stage-2 weight-allocation mode, `:observed` (default) or `:deficit`,
+	  forwarded to `network_credible_intervals`. `:deficit` re-anchors weight recovery to an
+	  estimated *true* weight and differs from `:observed` only when $\rho \neq 0$, so it can
+	  shift the graph- and node-level bias scores in the centrality-tilted regime. See
+	  `compute_setup`.
 	- `seed::Integer`: Master seed for reproducibility (default `1`).
 	- `cor_method::Symbol`: `:pearson` (default, matching the cited convention) or `:spearman`,
 	  for the node-level correlation.
@@ -1045,28 +1084,28 @@ module Network_Credible_Intervals
 
 	**Examples**
     ```julia
-        using DataFrames
+            using DataFrames
 
-        #	Ground truth, and a degraded version missing one node's out-ties
-            true_edges   = DataFrame(src = [1, 1, 2, 3, 4], dst = [2, 3, 3, 4, 1])
-            sample_edges = DataFrame(src = [1, 1, 2, 3],     dst = [2, 3, 3, 4])
-            nodes        = DataFrame(id = 1:4)
+            #	Ground truth, and a degraded version missing one node's out-ties
+                true_edges   = DataFrame(src = [1, 1, 2, 3, 4], dst = [2, 3, 3, 4, 1])
+                sample_edges = DataFrame(src = [1, 1, 2, 3],     dst = [2, 3, 3, 4])
+                nodes        = DataFrame(id = 1:4)
 
-        #	A scalar measure and a node-level measure, each as an (edges, nodes) closure
-            metrics      = Dict(:deg_central =>
-                                (e, n) -> centralization(total_degree(e; nodes = n, weighted = false)))
-            node_metrics = Dict(:total_degree =>
-                                (e, n) -> total_degree(e; nodes = n, weighted = false))
+            #	A scalar measure and a node-level measure, each as an (edges, nodes) closure
+                metrics      = Dict(:deg_central =>
+                                    (e, n) -> centralization(total_degree(e; nodes = n, weighted = false)))
+                node_metrics = Dict(:total_degree =>
+                                    (e, n) -> total_degree(e; nodes = n, weighted = false))
 
-        #	Score the reconstruction against the truth under an MCAR prior
-            bias = compute_bias_score(sample_edges, true_edges;
-                                    sample_nodes = nodes, true_nodes = nodes,
-                                    metrics = metrics, node_metrics = node_metrics,
-                                    directed = true, weighted = false,
-                                    pi_node = 0.25, pi_edge = 0.0, n_replicates = 200)
+            #	Score the reconstruction against the truth under an MCAR prior
+                bias = compute_bias_score(sample_edges, true_edges;
+                                        sample_nodes = nodes, true_nodes = nodes,
+                                        metrics = metrics, node_metrics = node_metrics,
+                                        directed = true, weighted = false,
+                                        pi_node = 0.25, pi_edge = 0.0, n_replicates = 200)
 
-            bias.network[:deg_central].bias       # standardized absolute bias
-            bias.node[:total_degree].correlation  # true vs. reconstructed, over respondents
+                bias.network[:deg_central].bias       # standardized absolute bias
+                bias.node[:total_degree].correlation  # true vs. reconstructed, over respondents
     ```
 
 	**See Also**

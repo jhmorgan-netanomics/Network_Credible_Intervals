@@ -63,6 +63,8 @@ module network_reconstruction
 	      that floor and records the adjustment in diagnostics when the user's
 	      prior comes in under it. pi_edge is the DEPENDENT weight dial — node
 	      additions plus rho fix its lower bound.
+	  allocation::Symbol
+          weight-allocation mode: :observed (Bellutta proportional-to-current) or :deficit (estimate-based inverse)
 
 	  -- Per-node observed structure --
 	  centrality::Vector{Float64}
@@ -171,6 +173,7 @@ module network_reconstruction
 			pi_node::Float64
 			rho::Float64
 			pi_edge::Float64
+			allocation::Symbol          # weight-allocation mode: :observed (Bellutta proportional-to-current) or :deficit (estimate-based inverse)
 
 		#	Per-node observed structure
 			centrality::Vector{Float64}
@@ -2451,6 +2454,7 @@ module network_reconstruction
 							rho::Float64 = 0.0,
 							partially_observed_nodes::Vector{Int} = Int[],
 							K::Union{Int, Symbol} = :auto,
+							allocation::Symbol = :observed,
 							J::Int = DEFAULT_J,
 							min_nodes_per_ei_bin::Int = 3,
 							min_nodes_per_degree_bin::Int = 5,
@@ -2474,6 +2478,14 @@ module network_reconstruction
 				nomination.
 			K::Union{Int,Symbol}: degree-bin count, or :auto (calls find_optimal_K,
 				except when pi_node = 0; see Notes).
+			allocation::Symbol: Stage-2 weight-allocation mode, :observed or :deficit
+				(default :observed). :observed distributes the additional-weight budget
+				B proportional to (current edge weight * rho-tilt) — the Bellutta
+				proportional-to-current inverse. :deficit distributes B proportional to
+				the estimated per-edge DEFICIT implied by the rho-field and pi_edge, so
+				expected reconstructed weight targets estimated-true rather than
+				observed weight. The two coincide at rho = 0. Stored on the setup and
+				read by _stage_2!; validated here, not used elsewhere in setup.
 			J::Int, min_nodes_per_ei_bin::Int, min_nodes_per_degree_bin::Int: binning.
 			verbose::Bool: print diagnostics (default false).
 		Returns:
@@ -2528,6 +2540,10 @@ module network_reconstruction
 					"(partially_observed_nodes): Stage 0.5 imputes missing outgoing ties, " *
 					"which has no undirected analogue. Pass partially_observed_nodes only " *
 					"when directed = true."))
+
+		#	Checking Weight Allocation Input
+			allocation in (:observed, :deficit) ||
+				throw(ArgumentError("allocation must be :observed or :deficit, got $allocation"))
 
 		#	Canonicalize Duplicate Dyads
 			edges = _aggregate_duplicate_dyads(edges, directed, weighted)
@@ -2683,6 +2699,7 @@ module network_reconstruction
 				diag[:realized_pi_node],
 				rho,
 				floor_result.realized_pi_edge,
+				allocation,
 				centrality,
 				community_labels,
 				ei_values,
@@ -2716,12 +2733,12 @@ module network_reconstruction
 	Build the full `SamplerSetup` for an observed network: per-node centrality and
 	binning, community/EI structure, the shared $\rho$-field ($q$, $d$), the per-bin
 	degree/strength tendencies, the $P$/$w$/$R$ attachment matrices, the added-node
-	and nomination specification, and the weight accounting
-	$W_{\text{obs}} + A + B = W_{\text{true}}$. Computed once per network and reused
-	across replicates.
+	and nomination specification, the chosen weight-allocation mode, and the weight
+	accounting $W_{\text{obs}} + A + B = W_{\text{true}}$. Computed once per network
+	and reused across replicates.
 
 	**Usage**
-	`compute_setup(edges, nodes, community_labels; directed, weighted, pi_node=0, pi_edge=0, rho=0, K=:auto, ...)`
+	`compute_setup(edges, nodes, community_labels; directed, weighted, pi_node=0, pi_edge=0, rho=0, K=:auto, allocation=:observed, ...)`
 
 	**Arguments**
 
@@ -2741,6 +2758,10 @@ module network_reconstruction
 	* `partially_observed_nodes`: nominated non-respondents; directed networks only.
 	* `K`: degree-bin count or `:auto` (selected by `find_optimal_K`, except when
 	  `pi_node = 0`; see Details).
+	* `allocation`: Stage-2 weight-allocation mode, `:observed` (default) or
+	  `:deficit`. Controls how the additional-weight budget is distributed across
+	  edges; see Weight allocation under Details. Validated here and carried on the
+	  returned setup for `_stage_2!`.
 
 	**Details**
 	Edge endpoints and node ids must share a single id type, validated before
@@ -2777,15 +2798,28 @@ module network_reconstruction
 	that floor, it is raised automatically and the adjustment is recorded in
 	`diagnostics[:pi_edge_raised]`.
 
+	*Weight allocation.* `allocation` selects how Stage 2 distributes the additional
+	weight budget $B$. `:observed` (the Bellutta inverse) distributes $B$ in
+	proportion to current edge weight times the $\rho$-tilt, anchoring recovery to
+	where weight is presently observed. `:deficit` estimates each edge's removed
+	fraction from the $\rho$-field and `pi_edge` and distributes $B$ in proportion to
+	the implied per-edge deficit, so the expected reconstructed weight targets an
+	estimated *true* weight rather than the observed weight; this restores
+	heavily-depleted high-weight structure that `:observed` under-serves at
+	$\rho \neq 0$. The two modes coincide exactly at $\rho = 0$, where the flat field
+	makes the per-edge gross-up a global constant. The choice is stored on the setup
+	and applied by `_stage_2!`; it does not affect any other setup quantity.
+
 	Supplying `partially_observed_nodes` on an undirected network is rejected,
 	because undirected missingness is modeled as full node removal rather than
 	missing outgoing nominations.
 
 	**Value**
 	A `SamplerSetup`. The stored `pi_node` and `pi_edge` values are the realized
-	values used by the reconstruction process. The `diagnostics` field records the
-	node and weight floors, realized missing fractions, `beta_status`, binning mode,
-	fallback behavior, and the estimated true-network weight.
+	values used by the reconstruction process, and `allocation` is the mode applied
+	by `_stage_2!`. The `diagnostics` field records the node and weight floors,
+	realized missing fractions, `beta_status`, binning mode, fallback behavior, and
+	the estimated true-network weight.
 
 	**See Also**
 	`SamplerSetup`, `find_optimal_K`, `feasible_rho_range`, `generate_replicate`
@@ -3386,42 +3420,43 @@ module network_reconstruction
 		"""
 		Args:
 			setup::SamplerSetup: weighted == true; supplies additional_weight (B),
-				the per-bin q, and K for the rho-field.
-			augmented_edges::DataFrame: edges after Stages 0.5 and 1 (columns :src,
-				:dst, :weight); mutated in place.
-			augmented_nodes::DataFrame: from _build_augmented_nodes; supplies
-				:degree_bin and :id for every node, including added nodes, so the
-				per-node rho-tilt covers imputed edges too.
+				the per-bin q, K for the rho-field, and the allocation mode.
+			augmented_edges::DataFrame: edges after Stages 0.5 and 1 (:src, :dst,
+				:weight); mutated in place.
+			augmented_nodes::DataFrame: supplies :degree_bin and :id for every node,
+				including added nodes, so the per-node rho-tilt covers imputed edges.
 			rng::AbstractRNG: random source.
 		Returns:
-			Int: number of additional weight units distributed (= round(B)), for
-				diagnostics.
+			Int: number of additional weight units distributed (= round(B)).
 		Notes:
-			Stage 2 — the literal inverse of degeneration's _sample_weight_removal.
-			Removal took W_removed units OFF edges with probability proportional to
-			(current weight * endpoint tilt); Stage 2 ADDS the additional-weight
-			budget B = setup.additional_weight ONTO edges with the SAME per-edge
-			propensity, so the weight degradation would strip from central edges is
-			what reconstruction layers back onto them.
+			Stage 2 -- the inverse of degeneration's _sample_weight_removal. Removal
+			took W_removed units OFF edges by an ITERATIVE draw with per-edge weight
+			(current-available weight * endpoint tilt), clipping at each edge's
+			remaining weight and redistributing overflow -- a proportional-hazard
+			depletion. The budget B = setup.additional_weight (the weight floor) is
+			distributed so W_observed + A + B = W_true closes; round(B) <= 0 is a no-op.
 
-			Budget. B comes straight from setup.additional_weight (the weight floor),
-			NOT recomputed from pi_edge: Stages 0.5/1 already placed the floor A (one
-			unit per imputed tie), and this distributes the diffuse remainder so that
-			W_observed + A + B = W_true closes. round(B) <= 0 (pi_edge at the floor)
-			is a no-op.
+			Per-edge tilt. d_v = K*q[degree_bin_v] (node-mean 1); s_v = d_v/(2*max d)
+			in [0,0.5]; an edge's tilt is 1 - (1-s_i)(1-s_j). At rho = 0 the field is
+			constant and tilt is uniform.
 
-			Per-edge propensity. Each node's tilt is d_v = K * q[degree_bin_v]
-			(node-mean 1), computed here for every augmented node from its drawn bin
-			so added nodes are included. With s_v = d_v / (2*max d) in [0, 0.5], an
-			edge's tilt is the independent-endpoint-survival form
-			1 - (1 - s_i)(1 - s_j), and its sampling weight is (current weight)*tilt.
-			At rho = 0 the field is constant, tilt is uniform, and allocation reduces
-			to current-weight-proportional (the Bellutta MCAR corner). Applies to
-			existing AND imputed edges; stronger ties absorb proportionally more.
+			Allocation modes (setup.allocation):
+			  :observed (default) -- Bellutta: p_e proportional to (current weight *
+				tilt). Mean-unbiased at rho = 0; at rho != 0 it allocates by where
+				weight currently SITS, starving spared-but-drained high-weight edges.
+			  :deficit -- estimate-based: invert the proportional-hazard removal.
+				Survival exp(-lambda*tilt_e) implies deficit_e = w_e*(exp(lambda*
+				tilt_e) - 1) and est_true_e = w_e*exp(lambda*tilt_e); the single
+				lambda is solved so the implied total removed equals B
+				(sum_e w_e*(exp(lambda*tilt_e)-1) = B, monotone, bisection). p_e is
+				proportional to deficit_e, so E[reconstructed_e] = est_true_e --
+				recovery re-anchors to estimated-true, not observed. At rho = 0 the
+				tilt is constant and this reduces exactly to :observed. A fully zeroed
+				edge (w_e = 0) gets zero deficit (no resurrection -- that is the
+				node/imputation path's job).
 
-			Unlike removal there is no per-edge ceiling (weight can always be added),
-			so a single Multinomial(B, probs) draw suffices — no clip-and-redistribute
-			loop. Determinism flows from the passed rng.
+			A single Multinomial(B, probs) suffices (no per-edge ceiling on addition).
+			Determinism flows from the passed rng.
 		"""
 
 		#	Guards
@@ -3448,23 +3483,63 @@ module network_reconstruction
 
 			id_to_idx = Dict(augmented_nodes.id[v] => v for v in 1:n_aug)
 
-		#	Per-Edge Sampling Weights = current weight * endpoint-survival tilt
+		#	Per-Edge Tilt and Current Weight (shared by both allocation modes)
 			n_edges = nrow(augmented_edges)
-			probs = Vector{Float64}(undef, n_edges)
-			total = 0.0
+			tilt = Vector{Float64}(undef, n_edges)
+			wcur = Vector{Float64}(undef, n_edges)
 			@inbounds for e in 1:n_edges
 				i_idx = get(id_to_idx, augmented_edges.src[e], 0)
 				j_idx = get(id_to_idx, augmented_edges.dst[e], 0)
 				si = i_idx > 0 ? s[i_idx] : 0.0
 				sj = j_idx > 0 ? s[j_idx] : 0.0
-				tilt = 1.0 - (1.0 - si) * (1.0 - sj)
-				pe = Float64(augmented_edges.weight[e]) * tilt
-				probs[e] = pe
-				total += pe
+				tilt[e] = 1.0 - (1.0 - si) * (1.0 - sj)
+				wcur[e] = Float64(augmented_edges.weight[e])
+			end
+
+		#	Sampling Weights per Allocation Mode
+			probs = Vector{Float64}(undef, n_edges)
+			if setup.allocation === :deficit
+				#	Solve lambda so the implied total removed matches the budget:
+				#	g(lambda) = sum_e w_e*expm1(lambda*tilt_e) = W_add  (monotone in lambda)
+					gλ = function (λ)
+						acc = 0.0
+						@inbounds for e in 1:n_edges
+							acc += wcur[e] * expm1(λ * tilt[e])
+						end
+						return acc
+					end
+					target = Float64(W_add)
+					λ_lo = 0.0; λ_hi = 1.0
+					while gλ(λ_hi) < target && λ_hi < 64.0
+						λ_hi *= 2.0
+					end
+					λ = λ_hi
+					if gλ(λ_hi) >= target
+						@inbounds for _ in 1:60
+							λm = 0.5 * (λ_lo + λ_hi)
+							if gλ(λm) < target
+								λ_lo = λm
+							else
+								λ_hi = λm
+							end
+						end
+						λ = 0.5 * (λ_lo + λ_hi)
+					end
+					@inbounds for e in 1:n_edges
+						probs[e] = wcur[e] * expm1(λ * tilt[e])
+					end
+			else  # :observed -- Bellutta proportional-to-current (default)
+				@inbounds for e in 1:n_edges
+					probs[e] = wcur[e] * tilt[e]
+				end
+			end
+
+		#	Normalize and Allocate B Units (In-Place Increment)
+			total = 0.0
+			@inbounds for e in 1:n_edges
+				total += probs[e]
 			end
 			total <= 0 && return 0
-
-		#	Multinomial Allocation of B Units and In-Place Increment
 			probs ./= total
 			counts = rand(rng, Multinomial(W_add, probs))
 			augmented_edges.weight .+= counts
@@ -4071,6 +4146,7 @@ module network_reconstruction
 										  rho::Float64,
 										  n_replicates::Int = 1000,
 										  K::Union{Int, Symbol} = :auto,
+										  allocation::Symbol = :observed,
 										  partially_observed_nodes::Vector{Int} = Int[],
 										  seed::Integer = 1,
 										  metrics::Dict{Symbol, <:Function} = Dict{Symbol, Function}(),
@@ -4086,6 +4162,9 @@ module network_reconstruction
 				achievable envelope; the adjusted value is the conditioning prior.
 			n_replicates::Int: number of accepted samples to draw.
 			K, partially_observed_nodes, seed: as in reconstruct_network.
+			allocation::Symbol: Stage-2 weight-allocation mode, :observed (default) or
+				:deficit; forwarded unchanged to compute_setup, which validates it and
+				carries it on the setup for _stage_2!. See compute_setup for the modes.
 			metrics::Dict{Symbol,Function}: OPTIONAL measures on each accepted sample.
 			rho_tol, pi_edge_tol::Float64: 3-prior gate acceptance half-widths.
 			max_attempts::Int: regeneration cap per replicate before fallback.
@@ -4158,7 +4237,7 @@ module network_reconstruction
 								   directed = directed, weighted = weighted,
 								   pi_node = pi_node, rho = rho_conditioned, pi_edge = pi_edge,
 								   partially_observed_nodes = partially_observed_nodes,
-								   K = K, verbose = verbose)
+								   K = K, allocation = allocation, verbose = verbose)
 
 		#	Pre-Allocate Per-Sample Columns
 			id_t = eltype(agg_edges.src)
@@ -4316,7 +4395,7 @@ module network_reconstruction
 		in the same pass.
 
 		**Usage**
-		`build_reconstruction_corpus(edges, nodes, community_labels; directed, weighted, pi_node, pi_edge, rho, n_replicates=1000, K=:auto, metrics=Dict(), rho_tol=0.05, pi_edge_tol=0.02, max_attempts=50, ...)`
+		`build_reconstruction_corpus(edges, nodes, community_labels; directed, weighted, pi_node, pi_edge, rho, n_replicates=1000, K=:auto, allocation=:observed, metrics=Dict(), rho_tol=0.05, pi_edge_tol=0.02, max_attempts=50, ...)`
 
 		**Arguments**
 		- `edges`, `nodes`, `community_labels`: observed network and precomputed labels.
@@ -4326,6 +4405,10 @@ module network_reconstruction
 		clamped value is the prior the corpus is conditioned on.
 		- `n_replicates::Int`: number of ACCEPTED samples to draw.
 		- `K`, `partially_observed_nodes`, `seed`: as in `reconstruct_network`.
+		- `allocation::Symbol`: Stage-2 weight-allocation mode, `:observed` (default) or
+		`:deficit`. Forwarded to `compute_setup` (which validates it) and applied by
+		`_stage_2!`; does not affect gating or any other corpus quantity. See
+		`compute_setup` for the two modes.
 		- `metrics::Dict{Symbol,Function}`: optional measures, each
 		`metric(augmented_edges, augmented_nodes) -> Real`, evaluated on each accepted
 		sample and stored as a column. Empty stores deltas only.
@@ -4351,7 +4434,9 @@ module network_reconstruction
 		edges) against the missing indicator over the full augmented roster; $\pi_{\text{edge}}$
 		as $(\sum w_{\text{aug}} - W_{\text{observed}}) / \sum w_{\text{aug}}$ against
 		`setup.pi_edge`; and $\pi_{\text{node}}$ as the missing fraction against
-		`setup.pi_node`.
+		`setup.pi_node`. The gate is allocation-agnostic: it scores realized $\rho$,
+		$\pi_{\text{node}}$, and $\pi_{\text{edge}}$, none of which depend on how the
+		weight budget was distributed across edges.
 
 		Deltas are always stored even when metrics are supplied, so the held sample can
 		be re-measured without re-drawing. The run is reproducible in `seed`, and any
